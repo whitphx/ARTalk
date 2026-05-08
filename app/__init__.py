@@ -2,3 +2,4 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 from .models import BitwiseARModel
+from .streaming import ARTalkStreamer
