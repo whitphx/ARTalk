@@ -13,6 +13,7 @@ Single-session, single-GPU MVP — see ``docs/realtime.md`` Phase 4.
 """
 
 import asyncio
+import logging
 import queue
 import threading
 
@@ -24,6 +25,8 @@ from aiortc.mediastreams import MediaStreamTrack
 from .rendering import StreamingRenderer
 from .streaming import ARTalkStreamer, CausalSavgolSmoother
 
+
+logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 RENDER_RES = (512, 512)
@@ -54,6 +57,7 @@ class ARTalkPipeline:
         )
         self.video_queue: queue.Queue = queue.Queue(maxsize=200)
         self._lock = threading.Lock()
+        self._dbg_calls = 0
 
     def push_audio_frame(self, frame: av.AudioFrame):
         resampled = self._resampler.resample(frame)
@@ -75,9 +79,29 @@ class ARTalkPipeline:
         # Lock keeps streamer / smoother / renderer state consistent
         # if the audio callback ever runs on multiple threads.
         with self._lock:
+            buf_before = self._streamer._audio_buffer.shape[0]
             motion = self._streamer.feed(samples_t)
+            buf_after = self._streamer._audio_buffer.shape[0]
+            self._dbg_calls += 1
+            if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
+                logger.warning(
+                    "[ARTalkPipeline] call#%d pipeline=%s streamer=%s "
+                    "in_samples=%d buf_before=%d buf_after=%d motion=%s",
+                    self._dbg_calls,
+                    id(self),
+                    id(self._streamer),
+                    samples_int16.size,
+                    buf_before,
+                    buf_after,
+                    tuple(motion.shape),
+                )
             if motion.shape[0] == 0:
                 return
+            logger.warning(
+                "[ARTalkPipeline] motion produced! call#%d motion=%s",
+                self._dbg_calls,
+                tuple(motion.shape),
+            )
             smoothed = self._smoother.feed(motion)
             if smoothed.shape[0] == 0:
                 return
