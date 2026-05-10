@@ -37,7 +37,10 @@ from .streaming import ARTalkStreamer, CausalSavgolSmoother
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+FPS = 25
 RENDER_RES = (512, 512)
+AUDIO_OUT_PTIME = 0.020
+AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 
 
 class ARTalkPipeline:
@@ -59,6 +62,17 @@ class ARTalkPipeline:
         )
         self.video_queue: queue.Queue = queue.Queue(maxsize=200)
         self._audio_in_queue: queue.Queue = queue.Queue()
+        # Output audio buffer: int16 mono samples at SAMPLE_RATE,
+        # produced by the worker as it consumes input audio into the
+        # streamer, drained by audio_source_callback at real-time
+        # pacing so video and audio share the same ~4 s latency.
+        self._audio_out_buffer = np.zeros(0, dtype=np.int16)
+        self._audio_out_lock = threading.Lock()
+        # Worker-only staging for input audio that the streamer has
+        # accumulated but not yet "consumed" (i.e. produced motion
+        # for). When motion fires we move the matching prefix into
+        # _audio_out_buffer.
+        self._pending_audio_for_output: list[np.ndarray] = []
         self._stop_event = threading.Event()
         self._dbg_calls = 0
         h, w = RENDER_RES
@@ -100,9 +114,42 @@ class ARTalkPipeline:
             arr = self._placeholder
         return av.VideoFrame.from_ndarray(arr, format="rgb24")
 
+    def audio_source_callback(
+        self, pts: int, time_base: fractions.Fraction
+    ) -> av.AudioFrame:
+        """Synchronous audio producer paired with the video output so
+        both share the model's ~4 s chunk latency. Drains
+        ``AUDIO_OUT_SAMPLES_PER_FRAME`` samples from
+        ``_audio_out_buffer`` per call, padding with silence when the
+        buffer is short (the gap before the first motion fires, or any
+        underrun) so the outbound track keeps timestamping at the
+        configured ptime.
+        """
+        n = AUDIO_OUT_SAMPLES_PER_FRAME
+        with self._audio_out_lock:
+            available = self._audio_out_buffer.size
+            if available >= n:
+                samples = self._audio_out_buffer[:n].copy()
+                self._audio_out_buffer = self._audio_out_buffer[n:]
+            elif available > 0:
+                samples = np.zeros(n, dtype=np.int16)
+                samples[:available] = self._audio_out_buffer
+                self._audio_out_buffer = np.zeros(0, dtype=np.int16)
+            else:
+                samples = np.zeros(n, dtype=np.int16)
+        # AudioFrame.from_ndarray for s16 mono expects shape (1, N).
+        frame = av.AudioFrame.from_ndarray(
+            samples[np.newaxis, :], format="s16", layout="mono"
+        )
+        frame.sample_rate = SAMPLE_RATE
+        return frame
+
     def stop(self):
         self._stop_event.set()
         self._placeholder = self._initial_placeholder
+        with self._audio_out_lock:
+            self._audio_out_buffer = np.zeros(0, dtype=np.int16)
+        self._pending_audio_for_output = []
 
     def _worker_loop(self):
         while not self._stop_event.is_set():
@@ -116,6 +163,11 @@ class ARTalkPipeline:
                 logger.exception("[ARTalkPipeline] worker error")
 
     def _process_audio_chunk(self, samples_int16: np.ndarray):
+        # Stage the input audio so we can hand the matching prefix to
+        # the output side once the streamer actually consumes it (i.e.
+        # when motion frames are produced).
+        self._pending_audio_for_output.append(samples_int16.copy())
+
         samples_t = torch.from_numpy(
             samples_int16.astype(np.float32) / 32768.0
         ).to(self._device)
@@ -126,7 +178,8 @@ class ARTalkPipeline:
         if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
             logger.warning(
                 "[ARTalkPipeline] call#%d in_samples=%d buf_before=%d "
-                "buf_after=%d motion=%s audio_q=%d video_q=%d",
+                "buf_after=%d motion=%s audio_q=%d video_q=%d "
+                "audio_out_buf=%d",
                 self._dbg_calls,
                 samples_int16.size,
                 buf_before,
@@ -134,14 +187,34 @@ class ARTalkPipeline:
                 tuple(motion.shape),
                 self._audio_in_queue.qsize(),
                 self.video_queue.qsize(),
+                self._audio_out_buffer.size,
             )
         if motion.shape[0] == 0:
             return
+
+        # Couple the matching audio with the produced motion: each
+        # frame corresponds to SAMPLE_RATE / FPS = 640 input samples,
+        # so 100 frames consume 64000 samples (= 4 s @ 16 kHz).
+        n_audio_samples = motion.shape[0] * SAMPLE_RATE // FPS
+        all_pending = np.concatenate(self._pending_audio_for_output)
+        emitted_audio = all_pending[:n_audio_samples]
+        leftover = all_pending[n_audio_samples:]
+        self._pending_audio_for_output = (
+            [leftover] if leftover.size > 0 else []
+        )
+        with self._audio_out_lock:
+            self._audio_out_buffer = np.concatenate(
+                [self._audio_out_buffer, emitted_audio]
+            )
+
         logger.warning(
-            "[ARTalkPipeline] motion produced call#%d motion=%s",
+            "[ARTalkPipeline] motion produced call#%d motion=%s "
+            "audio_emitted=%d",
             self._dbg_calls,
             tuple(motion.shape),
+            emitted_audio.size,
         )
+
         smoothed = self._smoother.feed(motion)
         if smoothed.shape[0] == 0:
             return
@@ -156,9 +229,11 @@ class ARTalkPipeline:
             )
             self._enqueue_frame(arr)
         logger.warning(
-            "[ARTalkPipeline] frames rendered call#%d video_q=%d",
+            "[ARTalkPipeline] frames rendered call#%d video_q=%d "
+            "audio_out_buf=%d",
             self._dbg_calls,
             self.video_queue.qsize(),
+            self._audio_out_buffer.size,
         )
 
     def _enqueue_frame(self, arr):
