@@ -172,9 +172,21 @@ calls for, with the queue absorbing the 100-frame-per-4s bursts.
 python webrtc_app.py       # default: cuda, 0.0.0.0:8000
 ```
 
-Open the FastRTC dev UI in a browser (`http://<host>:8000/`), grant
-microphone permission, start the WebRTC session, speak, and the
-avatar starts moving ~4 seconds later.
+Open the FastRTC dev UI in a browser, grant microphone permission,
+start the WebRTC session, speak, and the avatar starts moving ~4
+seconds later.
+
+Browser microphone access requires a secure context (HTTPS or
+`http://localhost`), so on a remote GPU you have two choices:
+
+* **SSH port forward (recommended for dev):** leave the server on
+  plain HTTP and forward the port —
+  `ssh -L 8000:localhost:8000 <gpu-host>` — then open
+  `http://localhost:8000`. The browser treats localhost as a
+  secure origin.
+* **HTTPS:** pass `--ssl-keyfile` and `--ssl-certfile` to
+  `webrtc_app.py` for shared / reachable deployments. Self-signed
+  certs work for testing but produce browser warnings.
 
 ## Future (deferred / out of branch scope)
 

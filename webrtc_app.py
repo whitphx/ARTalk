@@ -15,6 +15,18 @@ Run on a GPU host that has ``./assets/ARTalk_wav2vec.pt``,
 FastRTC's built-in dev UI is exposed by ``stream.ui.launch``; open
 it in a browser, click the WebRTC start button, and speak — the
 avatar video starts ~4 seconds later (the model's chunk floor).
+
+Browser microphone access requires a secure context (HTTPS or
+``http://localhost``). Two practical setups for this:
+
+* **SSH port forwarding (recommended for dev)**: leave the server
+  on plain HTTP and forward the port from your workstation —
+  ``ssh -L 8000:localhost:8000 <gpu-host>`` — then open
+  ``http://localhost:8000``. The browser treats localhost as
+  secure.
+* **HTTPS** with ``--ssl-keyfile`` / ``--ssl-certfile`` for
+  reachable / shared deployments. Self-signed certs work for
+  testing but produce browser warnings.
 """
 
 import argparse
@@ -58,6 +70,25 @@ def main():
         type=int,
         help="max concurrent browser connections — keep at 1 for a single GPU.",
     )
+    parser.add_argument(
+        "--ssl-keyfile",
+        default=None,
+        type=str,
+        help="path to TLS private key. Required (with --ssl-certfile) for "
+             "HTTPS serving so browser microphone access works on a remote host.",
+    )
+    parser.add_argument(
+        "--ssl-certfile",
+        default=None,
+        type=str,
+        help="path to TLS certificate.",
+    )
+    parser.add_argument(
+        "--ssl-keyfile-password",
+        default=None,
+        type=str,
+        help="optional password for an encrypted --ssl-keyfile.",
+    )
     args = parser.parse_args()
 
     print("Loading model...")
@@ -78,7 +109,13 @@ def main():
         modality="audio-video",
         concurrency_limit=args.concurrency_limit,
     )
-    stream.ui.launch(server_name=args.host, server_port=args.port)
+    stream.ui.launch(
+        server_name=args.host,
+        server_port=args.port,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile_password=args.ssl_keyfile_password,
+    )
 
 
 if __name__ == "__main__":
