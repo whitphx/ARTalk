@@ -57,6 +57,17 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         self._mesh_renderer = mesh_renderer
         self._device = device
         self._style_motion = style_motion
+        # Per-instance state. FastRTC may call video_emit on the
+        # template / pre-startup clone before start_up runs, so the
+        # queues must exist by the time __init__ returns to avoid
+        # AttributeError. Streamer / smoother / renderer are lazy so
+        # the template doesn't allocate GPU state at server startup.
+        self._streamer = None
+        self._smoother = None
+        self._renderer = None
+        self._video_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._audio_in_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task = None
 
     def copy(self):
         return ARTalkHandler(
@@ -68,20 +79,10 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         )
 
     async def start_up(self):
-        self._streamer = ARTalkStreamer(self._model, style_motion=self._style_motion)
-        self._smoother = CausalSavgolSmoother()
-        self._renderer = StreamingRenderer(
-            mode="mesh",
-            basic_vae=self._model.basic_vae,
-            flame_model=self._flame_model,
-            mesh_renderer=self._mesh_renderer,
-            device=self._device,
-        )
-        self._video_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self._audio_in_queue: asyncio.Queue = asyncio.Queue()
-        self._worker_task = asyncio.create_task(self._inference_worker())
+        await self._ensure_worker()
 
     async def receive(self, frame):
+        await self._ensure_worker()
         _, samples = frame
         if samples.size == 0:
             return
@@ -101,6 +102,7 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         return
 
     async def video_emit(self):
+        await self._ensure_worker()
         # FastRTC drives this at the outbound video track's pacing.
         # The 100-frame burst produced per 4 s audio chunk is buffered
         # in _video_queue, so successive video_emit calls drain the
@@ -108,13 +110,30 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         return await self._video_queue.get()
 
     async def shutdown(self):
-        worker = getattr(self, "_worker_task", None)
+        worker = self._worker_task
         if worker and not worker.done():
             worker.cancel()
             try:
                 await worker
             except (asyncio.CancelledError, Exception):
                 pass
+
+    def _ensure_pipeline(self):
+        if self._streamer is None:
+            self._streamer = ARTalkStreamer(self._model, style_motion=self._style_motion)
+            self._smoother = CausalSavgolSmoother()
+            self._renderer = StreamingRenderer(
+                mode="mesh",
+                basic_vae=self._model.basic_vae,
+                flame_model=self._flame_model,
+                mesh_renderer=self._mesh_renderer,
+                device=self._device,
+            )
+
+    async def _ensure_worker(self):
+        if self._worker_task is None or self._worker_task.done():
+            self._ensure_pipeline()
+            self._worker_task = asyncio.create_task(self._inference_worker())
 
     async def _inference_worker(self):
         while True:
