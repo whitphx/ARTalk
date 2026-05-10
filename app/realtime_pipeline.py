@@ -147,11 +147,34 @@ class ARTalkPipeline:
         return frame
 
     def stop(self):
+        # Signal the worker first so any frames it produces past this
+        # point are doomed and we can drop the queues underneath.
         self._stop_event.set()
+        # Reset the visible placeholder so a stop+restart doesn't
+        # show the last frame from the previous session.
         self._placeholder = self._initial_placeholder
+        # Output side state.
         with self._audio_out_lock:
             self._audio_out_buffer = np.zeros(0, dtype=np.int16)
         self._pending_audio_for_output = []
+        # Drain both transit queues. The worker may still write up to
+        # one more chunk between its stop_event check and the queue
+        # put, but the caller replaces session_state.pipeline after
+        # stop() so any tail frames die with the old pipeline. Model
+        # state (_streamer / _smoother internal buffers) is left
+        # alone because mutating it from another thread can race
+        # with an in-flight inference; it's discarded with the
+        # pipeline instance instead.
+        self._drain_queue(self._audio_in_queue)
+        self._drain_queue(self.video_queue)
+
+    @staticmethod
+    def _drain_queue(q: queue.Queue):
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
 
     @property
     def is_stopped(self) -> bool:
