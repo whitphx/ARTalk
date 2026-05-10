@@ -68,27 +68,58 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         self._video_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._audio_in_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task = None
+        # Debug counters — verbose only on first event of each kind.
+        self._dbg_audio_received = 0
+        self._dbg_inference_runs = 0
+        self._dbg_frames_produced = 0
+        self._dbg_video_emit_calls = 0
+        self._dbg_video_emit_timeouts = 0
+        # Black placeholder frame for the gap before the first real
+        # render and whenever the queue is momentarily empty.
+        self._placeholder_frame = np.zeros((512, 512, 3), dtype=np.uint8)
+        print(f"[ARTalkHandler] __init__ id={id(self)}")
 
     def copy(self):
-        return ARTalkHandler(
+        new = ARTalkHandler(
             model=self._model,
             flame_model=self._flame_model,
             mesh_renderer=self._mesh_renderer,
             device=self._device,
             style_motion=self._style_motion,
         )
+        print(f"[ARTalkHandler] copy() src_id={id(self)} new_id={id(new)}")
+        return new
 
     async def start_up(self):
+        print(f"[ARTalkHandler] start_up id={id(self)}")
         await self._ensure_worker()
 
     async def receive(self, frame):
         await self._ensure_worker()
         _, samples = frame
-        if samples.size == 0:
+        if samples is None or samples.size == 0:
             return
-        # FastRTC delivers int16 mono shape (1, N) at input_sample_rate.
-        samples_f32 = samples.astype(np.float32) / 32768.0
-        samples_t = torch.from_numpy(samples_f32[0]).to(self._device)
+        samples_f32 = samples.astype(np.float32).squeeze() / 32768.0
+        if samples_f32.ndim != 1:
+            print(
+                f"[ARTalkHandler] WARN unexpected audio shape "
+                f"after squeeze: {samples_f32.shape}"
+            )
+            return
+        samples_t = torch.from_numpy(samples_f32).to(self._device)
+        self._dbg_audio_received += 1
+        if self._dbg_audio_received == 1:
+            print(
+                f"[ARTalkHandler] first receive id={id(self)} "
+                f"shape={samples.shape} dtype={samples.dtype} "
+                f"samples_in_chunk={samples_t.shape[0]}"
+            )
+        elif self._dbg_audio_received % 200 == 0:
+            print(
+                f"[ARTalkHandler] received {self._dbg_audio_received} chunks "
+                f"audio_q={self._audio_in_queue.qsize()} "
+                f"video_q={self._video_queue.qsize()}"
+            )
         await self._audio_in_queue.put(samples_t)
 
     async def emit(self):
@@ -103,11 +134,25 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
 
     async def video_emit(self):
         await self._ensure_worker()
-        # FastRTC drives this at the outbound video track's pacing.
-        # The 100-frame burst produced per 4 s audio chunk is buffered
-        # in _video_queue, so successive video_emit calls drain the
-        # queue at whatever rate FastRTC requests.
-        return await self._video_queue.get()
+        self._dbg_video_emit_calls += 1
+        if self._dbg_video_emit_calls == 1:
+            print(f"[ARTalkHandler] first video_emit id={id(self)}")
+        try:
+            frame = await asyncio.wait_for(
+                self._video_queue.get(), timeout=0.04
+            )
+        except asyncio.TimeoutError:
+            self._dbg_video_emit_timeouts += 1
+            if self._dbg_video_emit_timeouts in (1, 25, 100, 1000):
+                print(
+                    f"[ARTalkHandler] video_emit timeout #"
+                    f"{self._dbg_video_emit_timeouts} (no frame ready); "
+                    f"audio_q={self._audio_in_queue.qsize()} "
+                    f"audio_received={self._dbg_audio_received} "
+                    f"frames_produced={self._dbg_frames_produced}"
+                )
+            return self._placeholder_frame
+        return frame
 
     async def shutdown(self):
         worker = self._worker_task
@@ -150,12 +195,26 @@ class ARTalkHandler(AsyncAudioVideoStreamHandler):
         motion = self._streamer.feed(audio)
         if motion.shape[0] == 0:
             return []
+        self._dbg_inference_runs += 1
+        if self._dbg_inference_runs == 1:
+            print(
+                f"[ARTalkHandler] first inference run id={id(self)} "
+                f"motion_frames={motion.shape[0]}"
+            )
         smoothed = self._smoother.feed(motion)
         if smoothed.shape[0] == 0:
             return []
         out = []
         for rgb in self._renderer.feed(smoothed):
             out.append(self._to_uint8_hwc(rgb))
+        prev_count = self._dbg_frames_produced
+        self._dbg_frames_produced += len(out)
+        if prev_count == 0 and self._dbg_frames_produced > 0:
+            print(
+                f"[ARTalkHandler] first frames rendered id={id(self)} "
+                f"count={len(out)} shape={out[0].shape} "
+                f"dtype={out[0].dtype}"
+            )
         return out
 
     @staticmethod
