@@ -63,11 +63,44 @@ retraining work since it would not be bit-exact regardless.
 
 ### Phase 3 — Per-frame rendering
 
-Refactor `ARTAvatarInferEngine.rendering` from "collect all frames →
-write_video" into a per-frame iterator. The output channel will be
-abstracted so callers can switch between rendered RGB frames and raw
-106-dim motion params, leaving the door open for future client-side
-rendering (see Future).
+`StreamingRenderer` in `app/rendering.py` mirrors the mesh /
+GAGAvatar branches of `ARTAvatarInferEngine.rendering` as a per-frame
+API: `render_frame(motion_frame) → (3, H, W)` RGB tensor on CPU in
+[0, 1] range. Audio/video muxing is no longer the renderer's
+responsibility — it moves to the transport layer (Phase 4 WebRTC
+sink).
+
+#### Design decisions
+
+- **Single class with mode dispatch**, not separate per-mode classes.
+  Mirrors the existing one-shot `rendering()`'s `shape_id`-based
+  dispatch and lets config-driven callers (Phase 4) construct
+  uniformly.
+- **New file `app/rendering.py`**, not a subsection of
+  `app/streaming.py`. Streaming-specific motion logic
+  (`ARTalkStreamer`, `CausalSavgolSmoother`) stays focused there;
+  rendering is a separate concern with different dependencies (FLAME
+  / GAGAvatar) and was getting unwieldy to colocate.
+- **Existing one-shot `ARTAvatarInferEngine.rendering()` is left
+  untouched.** A small amount of per-frame logic is duplicated
+  between the two paths in exchange for keeping the upstream-facing
+  diff minimal; the original CLI / Gradio app continues to work
+  unchanged.
+- **No "raw motion params" mode on the renderer.** Clients that
+  want to ship motion params instead of rendered video simply skip
+  the renderer stage and consume motion frames directly from
+  `CausalSavgolSmoother` (or `ARTalkStreamer`). Adding a passthrough
+  mode would have been a thin abstraction that doesn't earn its name.
+- **Renderer takes loaded modules as constructor args**, not paths.
+  Typical callers pass the modules `ARTAvatarInferEngine` already
+  loaded; tests can construct the FLAME pieces directly without
+  spinning up a full engine.
+
+`scripts/check_streaming_parity.py` adds a Phase 3 mesh-mode parity
+check (skipped automatically if `assets/FLAME_with_eye.pt` is not
+present). The GAGAvatar path is not covered by automated parity
+because of the asset-download cost; verify it with a smoke test if
+needed.
 
 ### Phase 4 — WebRTC transport
 

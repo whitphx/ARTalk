@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Parity checks for the streaming inference / post-processing pieces.
+"""Parity checks for the streaming inference / post-processing / rendering pieces.
 
 Loads the released ARTalk wav2vec checkpoint and runs:
 
@@ -13,6 +13,12 @@ Loads the released ARTalk wav2vec checkpoint and runs:
      ``CausalSavgolSmoother`` (streaming) to the same motion sequence,
      and asserts the outputs match within ``--atol``.
 
+  3. **Streaming mesh rendering (Phase 3)** — renders motion frames
+     via ``StreamingRenderer`` (per-frame) and via the inline mesh
+     branch of ``ARTAvatarInferEngine.rendering`` (batched), and
+     asserts the RGB outputs match within ``--atol``. Skipped if
+     ``assets/FLAME_with_eye.pt`` is not present.
+
 Run on a GPU host where the model and ``./assets`` are available:
 
     python -m scripts.check_streaming_parity [-a demo/eng1.wav] [--device cuda]
@@ -22,13 +28,17 @@ Run on a GPU host where the model and ``./assets`` are available:
 
 import argparse
 import json
+import os
 
 import torch
 import torchaudio
 from scipy.signal import savgol_filter
 
 from app import BitwiseARModel
+from app.rendering import StreamingRenderer
 from app.streaming import ARTalkStreamer, CausalSavgolSmoother
+
+FLAME_ASSET_PATH = "./assets/FLAME_with_eye.pt"
 
 
 def smooth_motion_savgol_reference(motion_codes):
@@ -63,6 +73,19 @@ def run_smoother(smoother, motion, feed_chunk_frames):
     if tail.shape[0] > 0:
         pieces.append(tail)
     return torch.cat(pieces, dim=0) if pieces else None
+
+
+def render_mesh_oneshot_reference(motion, basic_vae, flame_model, mesh_renderer):
+    """One-shot reference: mesh branch of ``ARTAvatarInferEngine.rendering``."""
+    shape_code = motion.new_zeros(1, 300).expand(motion.shape[0], -1)
+    verts = basic_vae.get_flame_verts(
+        flame_model, shape_code, motion, with_global=True
+    )
+    pred_images = []
+    for v in verts:
+        rgb = mesh_renderer(v[None])[0]
+        pred_images.append(rgb.cpu()[0] / 255.0)
+    return torch.stack(pred_images, dim=0)
 
 
 def assert_match(reference, streamed, atol, label):
@@ -142,6 +165,37 @@ def main():
     )
     assert streamed_smoothed is not None, "smoother produced no output"
     assert_match(one_shot_smoothed, streamed_smoothed, args.atol, "streaming smoother")
+
+    # Phase 3: streaming mesh rendering parity (skipped if FLAME unavailable).
+    if not os.path.exists(FLAME_ASSET_PATH):
+        print(
+            f"[streaming mesh rendering] {FLAME_ASSET_PATH} not found; "
+            "skipping. Run ./build_resources.sh to download FLAME assets."
+        )
+    else:
+        from app.flame_model import FLAMEModel, RenderMesh
+
+        flame_model = FLAMEModel(
+            n_shape=300, n_exp=100, scale=1.0, no_lmks=True
+        ).to(device)
+        mesh_renderer = RenderMesh(
+            image_size=512, faces=flame_model.get_faces(), scale=1.0
+        )
+
+        one_shot_frames = render_mesh_oneshot_reference(
+            one_shot_motion, model.basic_vae, flame_model, mesh_renderer
+        )
+        renderer = StreamingRenderer(
+            mode="mesh",
+            basic_vae=model.basic_vae,
+            flame_model=flame_model,
+            mesh_renderer=mesh_renderer,
+            device=device,
+        )
+        streamed_frames = torch.stack(list(renderer.feed(one_shot_motion)), dim=0)
+        assert_match(
+            one_shot_frames, streamed_frames, args.atol, "streaming mesh rendering"
+        )
 
 
 if __name__ == "__main__":
