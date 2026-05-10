@@ -62,7 +62,8 @@ class ARTalkPipeline:
         self._stop_event = threading.Event()
         self._dbg_calls = 0
         h, w = RENDER_RES
-        self._placeholder = np.zeros((h, w, 3), dtype=np.uint8)
+        self._initial_placeholder = np.zeros((h, w, 3), dtype=np.uint8)
+        self._placeholder = self._initial_placeholder
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="ARTalkPipelineWorker",
@@ -94,12 +95,14 @@ class ARTalkPipeline:
         """
         try:
             arr = self.video_queue.get_nowait()
+            self._placeholder = arr
         except queue.Empty:
             arr = self._placeholder
         return av.VideoFrame.from_ndarray(arr, format="rgb24")
 
     def stop(self):
         self._stop_event.set()
+        self._placeholder = self._initial_placeholder
 
     def _worker_loop(self):
         while not self._stop_event.is_set():

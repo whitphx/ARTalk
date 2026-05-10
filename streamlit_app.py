@@ -96,17 +96,23 @@ video_source_track = create_video_source_track(
 
 
 def on_change():
-    ctx = st.session_state["artalk"]
+    ctx = st.session_state["artalk-render"]
     if not ctx.state.playing and not ctx.state.signalling:
         video_source_track.stop()
 
 
-webrtc_streamer(
-    key="artalk",
+audio_ctx = webrtc_streamer(
+    key="artalk-audio",
     mode=WebRtcMode.SENDRECV,
     audio_frame_callback=audio_frame_callback,
-    source_video_track=video_source_track,
     media_stream_constraints={"audio": True, "video": False},
-    async_processing=True,
     on_change=on_change,
+)
+
+webrtc_streamer(
+    key="artalk-render",
+    mode=WebRtcMode.RECVONLY,
+    source_video_track=video_source_track,
+    media_stream_constraints={"audio": False, "video": True},
+    desired_playing_state=audio_ctx.state.playing,
 )
