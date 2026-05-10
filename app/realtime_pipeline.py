@@ -9,6 +9,14 @@ audio frames pushed in via streamlit-webrtc's ``audio_frame_callback``
 flow through to RGB video frames pulled out by ``ARTalkVideoTrack``
 (an aiortc ``MediaStreamTrack`` subclass) on the outbound side.
 
+The audio callback returns immediately after enqueueing samples; a
+dedicated daemon worker thread drains the queue and runs the heavy
+streamer / smoother / renderer chain. This is required because every
+4 seconds of audio triggers ~100 frames of mesh rendering, which on
+a typical GPU runs for seconds — doing that work inline in the audio
+callback would stall streamlit-webrtc's audio path and the browser
+would see the session "freeze".
+
 Single-session, single-GPU MVP — see ``docs/realtime.md`` Phase 4.
 """
 
@@ -33,13 +41,7 @@ RENDER_RES = (512, 512)
 
 
 class ARTalkPipeline:
-    """Per-session pipeline holding the streaming model state.
-
-    Browser audio is delivered via ``push_audio_frame(av.AudioFrame)``,
-    which resamples to 16 kHz mono int16 and feeds the streamer.
-    Rendered RGB frames land in ``video_queue`` for ``ARTalkVideoTrack``
-    to drain.
-    """
+    """Per-session pipeline holding the streaming model state."""
 
     def __init__(self, *, model, flame_model, mesh_renderer, device, style_motion=None):
         self._device = device
@@ -56,10 +58,18 @@ class ARTalkPipeline:
             format="s16", layout="mono", rate=SAMPLE_RATE
         )
         self.video_queue: queue.Queue = queue.Queue(maxsize=200)
-        self._lock = threading.Lock()
+        self._audio_in_queue: queue.Queue = queue.Queue()
+        self._stop_event = threading.Event()
         self._dbg_calls = 0
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="ARTalkPipelineWorker",
+            daemon=True,
+        )
+        self._worker_thread.start()
 
     def push_audio_frame(self, frame: av.AudioFrame):
+        """Fast: resample, enqueue, return. The heavy lift happens in the worker."""
         resampled = self._resampler.resample(frame)
         # av.AudioResampler.resample returns a list in modern PyAV.
         frames = resampled if isinstance(resampled, list) else [resampled]
@@ -68,53 +78,68 @@ class ARTalkPipeline:
             if arr.ndim == 2:
                 # mono after layout="mono", first row is the channel.
                 arr = arr[0]
-            self._push_audio_samples(arr)
+            if arr.size > 0:
+                self._audio_in_queue.put(arr)
 
-    def _push_audio_samples(self, samples_int16: np.ndarray):
-        if samples_int16.size == 0:
-            return
+    def stop(self):
+        self._stop_event.set()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                samples_int16 = self._audio_in_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._process_audio_chunk(samples_int16)
+            except Exception:
+                logger.exception("[ARTalkPipeline] worker error")
+
+    def _process_audio_chunk(self, samples_int16: np.ndarray):
         samples_t = torch.from_numpy(
             samples_int16.astype(np.float32) / 32768.0
         ).to(self._device)
-        # Lock keeps streamer / smoother / renderer state consistent
-        # if the audio callback ever runs on multiple threads.
-        with self._lock:
-            buf_before = self._streamer._audio_buffer.shape[0]
-            motion = self._streamer.feed(samples_t)
-            buf_after = self._streamer._audio_buffer.shape[0]
-            self._dbg_calls += 1
-            if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
-                logger.warning(
-                    "[ARTalkPipeline] call#%d pipeline=%s streamer=%s "
-                    "in_samples=%d buf_before=%d buf_after=%d motion=%s",
-                    self._dbg_calls,
-                    id(self),
-                    id(self._streamer),
-                    samples_int16.size,
-                    buf_before,
-                    buf_after,
-                    tuple(motion.shape),
-                )
-            if motion.shape[0] == 0:
-                return
+        buf_before = self._streamer._audio_buffer.shape[0]
+        motion = self._streamer.feed(samples_t)
+        buf_after = self._streamer._audio_buffer.shape[0]
+        self._dbg_calls += 1
+        if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
             logger.warning(
-                "[ARTalkPipeline] motion produced! call#%d motion=%s",
+                "[ARTalkPipeline] call#%d in_samples=%d buf_before=%d "
+                "buf_after=%d motion=%s audio_q=%d video_q=%d",
                 self._dbg_calls,
+                samples_int16.size,
+                buf_before,
+                buf_after,
                 tuple(motion.shape),
+                self._audio_in_queue.qsize(),
+                self.video_queue.qsize(),
             )
-            smoothed = self._smoother.feed(motion)
-            if smoothed.shape[0] == 0:
-                return
-            for rgb in self._renderer.feed(smoothed):
-                arr = (
-                    (rgb * 255.0)
-                    .clamp_(0, 255)
-                    .to(torch.uint8)
-                    .permute(1, 2, 0)
-                    .contiguous()
-                    .numpy()
-                )
-                self._enqueue_frame(arr)
+        if motion.shape[0] == 0:
+            return
+        logger.warning(
+            "[ARTalkPipeline] motion produced call#%d motion=%s",
+            self._dbg_calls,
+            tuple(motion.shape),
+        )
+        smoothed = self._smoother.feed(motion)
+        if smoothed.shape[0] == 0:
+            return
+        for rgb in self._renderer.feed(smoothed):
+            arr = (
+                (rgb * 255.0)
+                .clamp_(0, 255)
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .contiguous()
+                .numpy()
+            )
+            self._enqueue_frame(arr)
+        logger.warning(
+            "[ARTalkPipeline] frames rendered call#%d video_q=%d",
+            self._dbg_calls,
+            self.video_queue.qsize(),
+        )
 
     def _enqueue_frame(self, arr):
         try:
