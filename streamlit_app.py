@@ -97,7 +97,7 @@ video_source_track = create_video_source_track(
 audio_source_track = create_audio_source_track(
     pipeline.audio_source_callback,
     key="artalk_audio_source",
-    sample_rate=16000,
+    sample_rate=48000,
     ptime=0.020,
 )
 

@@ -39,8 +39,14 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 FPS = 25
 RENDER_RES = (512, 512)
+# streamlit-webrtc's AudioSourceTrack hard-codes the AudioFrame time_base
+# at 1/48000, so emitting at any other sample rate makes the receiver
+# misinterpret frame durations and play the audio at the wrong speed
+# (e.g. 16 kHz output plays 3x faster). We resample our captured input
+# audio to 48 kHz on the way out to sidestep that.
+AUDIO_OUT_SAMPLE_RATE = 48000
 AUDIO_OUT_PTIME = 0.020
-AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
+AUDIO_OUT_SAMPLES_PER_FRAME = int(AUDIO_OUT_SAMPLE_RATE * AUDIO_OUT_PTIME)
 
 
 class ARTalkPipeline:
@@ -57,8 +63,11 @@ class ARTalkPipeline:
             mesh_renderer=mesh_renderer,
             device=device,
         )
-        self._resampler = av.AudioResampler(
+        self._resampler_for_model = av.AudioResampler(
             format="s16", layout="mono", rate=SAMPLE_RATE
+        )
+        self._resampler_for_output = av.AudioResampler(
+            format="s16", layout="mono", rate=AUDIO_OUT_SAMPLE_RATE
         )
         self.video_queue: queue.Queue = queue.Queue(maxsize=200)
         self._audio_in_queue: queue.Queue = queue.Queue()
@@ -86,17 +95,10 @@ class ARTalkPipeline:
         self._worker_thread.start()
 
     def push_audio_frame(self, frame: av.AudioFrame):
-        """Fast: resample, enqueue, return. The heavy lift happens in the worker."""
-        resampled = self._resampler.resample(frame)
-        # av.AudioResampler.resample returns a list in modern PyAV.
-        frames = resampled if isinstance(resampled, list) else [resampled]
-        for rf in frames:
-            arr = rf.to_ndarray()
-            if arr.ndim == 2:
-                # mono after layout="mono", first row is the channel.
-                arr = arr[0]
-            if arr.size > 0:
-                self._audio_in_queue.put(arr)
+        """Fast: enqueue the raw frame, return. The worker handles
+        resampling (parallel to 16 kHz for the model and 48 kHz for
+        outbound audio) and the heavy inference / render."""
+        self._audio_in_queue.put(frame)
 
     def video_source_callback(
         self, pts: int, time_base: fractions.Fraction
@@ -141,7 +143,7 @@ class ARTalkPipeline:
         frame = av.AudioFrame.from_ndarray(
             samples[np.newaxis, :], format="s16", layout="mono"
         )
-        frame.sample_rate = SAMPLE_RATE
+        frame.sample_rate = AUDIO_OUT_SAMPLE_RATE
         return frame
 
     def stop(self):
@@ -154,20 +156,41 @@ class ARTalkPipeline:
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                samples_int16 = self._audio_in_queue.get(timeout=0.1)
+                frame = self._audio_in_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
-                self._process_audio_chunk(samples_int16)
+                self._process_input_frame(frame)
             except Exception:
                 logger.exception("[ARTalkPipeline] worker error")
 
-    def _process_audio_chunk(self, samples_int16: np.ndarray):
-        # Stage the input audio so we can hand the matching prefix to
-        # the output side once the streamer actually consumes it (i.e.
-        # when motion frames are produced).
-        self._pending_audio_for_output.append(samples_int16.copy())
+    def _process_input_frame(self, frame: av.AudioFrame):
+        # Stage the same audio at 48 kHz mono int16 for outbound use
+        # (delayed-emit, paired with rendered video below).
+        out_frames = self._resampler_for_output.resample(frame)
+        if not isinstance(out_frames, list):
+            out_frames = [out_frames]
+        for of in out_frames:
+            arr = of.to_ndarray()
+            if arr.ndim == 2:
+                arr = arr[0]
+            if arr.size > 0:
+                self._pending_audio_for_output.append(arr.astype(np.int16, copy=True))
 
+        # Resample to 16 kHz mono int16 and feed each chunk into the
+        # streamer; on motion fire we move the matching prefix of
+        # output-staged audio (at 48 kHz) into _audio_out_buffer.
+        model_frames = self._resampler_for_model.resample(frame)
+        if not isinstance(model_frames, list):
+            model_frames = [model_frames]
+        for mf in model_frames:
+            arr = mf.to_ndarray()
+            if arr.ndim == 2:
+                arr = arr[0]
+            if arr.size > 0:
+                self._process_audio_chunk(arr.astype(np.int16, copy=False))
+
+    def _process_audio_chunk(self, samples_int16: np.ndarray):
         samples_t = torch.from_numpy(
             samples_int16.astype(np.float32) / 32768.0
         ).to(self._device)
@@ -175,11 +198,12 @@ class ARTalkPipeline:
         motion = self._streamer.feed(samples_t)
         buf_after = self._streamer._audio_buffer.shape[0]
         self._dbg_calls += 1
+        pending_out_total = sum(p.size for p in self._pending_audio_for_output)
         if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
             logger.warning(
                 "[ARTalkPipeline] call#%d in_samples=%d buf_before=%d "
                 "buf_after=%d motion=%s audio_q=%d video_q=%d "
-                "audio_out_buf=%d",
+                "audio_out_buf=%d pending_out=%d",
                 self._dbg_calls,
                 samples_int16.size,
                 buf_before,
@@ -188,17 +212,23 @@ class ARTalkPipeline:
                 self._audio_in_queue.qsize(),
                 self.video_queue.qsize(),
                 self._audio_out_buffer.size,
+                pending_out_total,
             )
         if motion.shape[0] == 0:
             return
 
-        # Couple the matching audio with the produced motion: each
-        # frame corresponds to SAMPLE_RATE / FPS = 640 input samples,
-        # so 100 frames consume 64000 samples (= 4 s @ 16 kHz).
-        n_audio_samples = motion.shape[0] * SAMPLE_RATE // FPS
-        all_pending = np.concatenate(self._pending_audio_for_output)
-        emitted_audio = all_pending[:n_audio_samples]
-        leftover = all_pending[n_audio_samples:]
+        # Couple the matching audio (at the 48 kHz output rate) with
+        # the produced motion: each motion frame corresponds to
+        # AUDIO_OUT_SAMPLE_RATE / FPS = 1920 output samples, so 100
+        # frames consume 192000 samples (= 4 s @ 48 kHz).
+        n_audio_samples_out = motion.shape[0] * AUDIO_OUT_SAMPLE_RATE // FPS
+        all_pending = (
+            np.concatenate(self._pending_audio_for_output)
+            if self._pending_audio_for_output
+            else np.zeros(0, dtype=np.int16)
+        )
+        emitted_audio = all_pending[:n_audio_samples_out]
+        leftover = all_pending[n_audio_samples_out:]
         self._pending_audio_for_output = (
             [leftover] if leftover.size > 0 else []
         )
@@ -209,10 +239,11 @@ class ARTalkPipeline:
 
         logger.warning(
             "[ARTalkPipeline] motion produced call#%d motion=%s "
-            "audio_emitted=%d",
+            "audio_emitted_48k=%d expected=%d",
             self._dbg_calls,
             tuple(motion.shape),
             emitted_audio.size,
+            n_audio_samples_out,
         )
 
         smoothed = self._smoother.feed(motion)
