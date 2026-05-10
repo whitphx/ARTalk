@@ -125,9 +125,56 @@ that is the right notion of equivalence for this stage.
 
 ### Phase 4 — WebRTC transport
 
-Wire the streaming pipeline to a browser-side audio source and video
-sink. Candidate libraries are FastRTC (Gradio team), streamlit-webrtc,
-and raw aiortc. Selection is deferred to the start of Phase 4.
+`webrtc_app.py` (root) loads the model + FLAME pieces once, builds a
+shared-state `ARTalkHandler` (in `app/webrtc.py`) that subclasses
+FastRTC's `AsyncAudioVideoStreamHandler`, and serves the FastRTC dev
+UI. Each browser connection gets its own per-connection state
+(streamer / smoother / renderer / queues / worker task) via
+`copy()` + `start_up()`.
+
+Inside each connection, audio frames received by FastRTC are pushed
+to an `asyncio.Queue`; a single per-connection worker drains the
+queue and offloads each step (`streamer.feed → smoother.feed →
+renderer.feed`) to a thread via `asyncio.to_thread`, so streaming
+state stays serialized while the event loop remains responsive for
+inbound audio. Rendered RGB frames are pushed to a video queue;
+`video_emit()` drains it at whatever rate FastRTC's outbound track
+calls for, with the queue absorbing the 100-frame-per-4s bursts.
+
+#### Design decisions
+
+- **Library: FastRTC** (Gradio team), chosen over `streamlit-webrtc`
+  and raw `aiortc`. The project already depends on Gradio, FastRTC
+  is built specifically for AI streaming use cases, and HF Spaces
+  deployment is direct.
+- **Single per-connection inference worker** rather than spawning a
+  task per audio frame: keeps the streamer / smoother / renderer
+  state strictly ordered without locks. Per-frame inference is
+  offloaded to a thread so the event loop never blocks on GPU work.
+- **Video track only**, no outbound audio. Mixing audio at a 4 s
+  lag to match the avatar video is non-trivial and is left for a
+  future iteration; users can monitor their own mic via system
+  sidetone for lip reference if needed.
+- **No startup-pad frames.** The first 4 s of a session has no
+  outbound video — FastRTC and the browser handle this naturally
+  (the video element starts when the first frame arrives).
+- **MVP scope**: mesh mode, no style motion, no UI configurability.
+  GAGAvatar mode, style selection, TTS input, and audio echo come
+  in later iterations.
+- **`fastrtc` is not added to `environment.yml`** to keep the
+  upstream-facing dep list unchanged; install with `pip install
+  fastrtc` after activating the conda env.
+
+#### Running
+
+```bash
+pip install fastrtc        # one-time, after activating the env
+python webrtc_app.py       # default: cuda, 0.0.0.0:8000
+```
+
+Open the FastRTC dev UI in a browser (`http://<host>:8000/`), grant
+microphone permission, start the WebRTC session, speak, and the
+avatar starts moving ~4 seconds later.
 
 ## Future (deferred / out of branch scope)
 
