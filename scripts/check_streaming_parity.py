@@ -1,14 +1,23 @@
 #!/usr/bin/env python
-"""Parity check for ARTalkStreamer.
+"""Parity checks for the streaming inference / post-processing pieces.
 
-Loads the released ARTalk wav2vec checkpoint, runs both the original
-one-shot ``BitwiseARModel.inference`` and the streaming
-``ARTalkStreamer`` over the same audio fed in arbitrary-sized
-sub-chunks, and asserts the outputs match within a tight tolerance.
+Loads the released ARTalk wav2vec checkpoint and runs:
+
+  1. **Streaming inference (Phase 1)** — feeds the same audio to
+     ``BitwiseARModel.inference`` (one-shot) and to ``ARTalkStreamer``
+     (chunked, arbitrary feed sizes), and asserts the motion outputs
+     match within ``--atol``.
+
+  2. **Streaming smoother (Phase 2)** — applies
+     ``ARTAvatarInferEngine.smooth_motion_savgol`` (one-shot) and
+     ``CausalSavgolSmoother`` (streaming) to the same motion sequence,
+     and asserts the outputs match within ``--atol``.
 
 Run on a GPU host where the model and ``./assets`` are available:
 
-    python scripts/check_streaming_parity.py [-a demo/eng1.wav] [--device cuda]
+    python -m scripts.check_streaming_parity [-a demo/eng1.wav] [--device cuda]
+
+(or ``PYTHONPATH=. python scripts/check_streaming_parity.py ...``)
 """
 
 import argparse
@@ -16,9 +25,55 @@ import json
 
 import torch
 import torchaudio
+from scipy.signal import savgol_filter
 
 from app import BitwiseARModel
-from app.streaming import ARTalkStreamer
+from app.streaming import ARTalkStreamer, CausalSavgolSmoother
+
+
+def smooth_motion_savgol_reference(motion_codes):
+    """One-shot reference: mirror of ``ARTAvatarInferEngine.smooth_motion_savgol``."""
+    motion_np = motion_codes.clone().detach().cpu().numpy()
+    motion_np_smoothed = savgol_filter(motion_np, window_length=5, polyorder=2, axis=0)
+    motion_np_smoothed[..., 100:103] = savgol_filter(
+        motion_np[..., 100:103], window_length=9, polyorder=3, axis=0
+    )
+    return torch.tensor(motion_np_smoothed).type_as(motion_codes)
+
+
+def run_streamer(streamer, audio, feed_chunk_samples):
+    pieces = []
+    for i in range(0, audio.shape[0], feed_chunk_samples):
+        out = streamer.feed(audio[i : i + feed_chunk_samples])
+        if out.shape[0] > 0:
+            pieces.append(out)
+    tail = streamer.finish()
+    if tail.shape[0] > 0:
+        pieces.append(tail)
+    return torch.cat(pieces, dim=0) if pieces else None
+
+
+def run_smoother(smoother, motion, feed_chunk_frames):
+    pieces = []
+    for i in range(0, motion.shape[0], feed_chunk_frames):
+        out = smoother.feed(motion[i : i + feed_chunk_frames])
+        if out.shape[0] > 0:
+            pieces.append(out)
+    tail = smoother.finish()
+    if tail.shape[0] > 0:
+        pieces.append(tail)
+    return torch.cat(pieces, dim=0) if pieces else None
+
+
+def assert_match(reference, streamed, atol, label):
+    print(f"[{label}] one_shot: {tuple(reference.shape)}, streamed: {tuple(streamed.shape)}")
+    assert reference.shape == streamed.shape, f"[{label}] shape mismatch"
+    diff = (reference - streamed).abs()
+    print(f"[{label}] max abs diff:  {diff.max().item():.3e}")
+    print(f"[{label}] mean abs diff: {diff.mean().item():.3e}")
+    if not torch.allclose(reference, streamed, atol=atol):
+        raise SystemExit(f"[{label}] diverges beyond atol={atol}")
+    print(f"[{label}] OK")
 
 
 def main():
@@ -29,12 +84,21 @@ def main():
         "--feed-chunk-samples",
         type=int,
         default=4000,
-        help="size of chunks fed to ARTalkStreamer.feed (samples @16kHz). "
-             "Choose != patch_audio_length so buffering is exercised.",
+        help="audio chunk size fed to ARTalkStreamer (samples @16kHz). "
+             "Choose != patch_audio_length so audio buffering is exercised.",
+    )
+    parser.add_argument(
+        "--smoother-feed-chunk-frames",
+        type=int,
+        default=7,
+        help="motion chunk size fed to CausalSavgolSmoother (frames @25fps). "
+             "Choose a small odd number to exercise sub-window feeds.",
     )
     parser.add_argument("--atol", type=float, default=1e-5)
-    parser.add_argument("--style", default=None, type=str,
-                        help="optional style id under assets/style_motion (e.g. natural_0)")
+    parser.add_argument(
+        "--style", default=None, type=str,
+        help="optional style id under assets/style_motion (e.g. natural_0)",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -62,33 +126,22 @@ def main():
     batch = {"audio": audio[None]}
     if style_motion is not None:
         batch["style_motion"] = style_motion[None].to(device)
-    one_shot = model.inference(batch)[0]
+    one_shot_motion = model.inference(batch)[0]
 
+    # Phase 1: streaming inference parity.
     streamer = ARTalkStreamer(model, style_motion=style_motion)
-    pieces = []
-    for i in range(0, audio.shape[0], args.feed_chunk_samples):
-        out = streamer.feed(audio[i : i + args.feed_chunk_samples])
-        if out.shape[0] > 0:
-            pieces.append(out)
-    tail = streamer.finish()
-    if tail.shape[0] > 0:
-        pieces.append(tail)
-    streamed = torch.cat(pieces, dim=0) if pieces else torch.zeros(
-        0, model.basic_vae.motion_dim, device=device
+    streamed_motion = run_streamer(streamer, audio, args.feed_chunk_samples)
+    assert streamed_motion is not None, "streamer produced no output"
+    assert_match(one_shot_motion, streamed_motion, args.atol, "streaming inference")
+
+    # Phase 2: streaming smoother parity (against one-shot smoother).
+    one_shot_smoothed = smooth_motion_savgol_reference(one_shot_motion)
+    smoother = CausalSavgolSmoother()
+    streamed_smoothed = run_smoother(
+        smoother, one_shot_motion, args.smoother_feed_chunk_frames
     )
-
-    print(f"one_shot: {tuple(one_shot.shape)}")
-    print(f"streamed: {tuple(streamed.shape)}")
-    assert one_shot.shape == streamed.shape, "shape mismatch"
-
-    diff = (one_shot - streamed).abs()
-    print(f"max abs diff:  {diff.max().item():.3e}")
-    print(f"mean abs diff: {diff.mean().item():.3e}")
-    if not torch.allclose(one_shot, streamed, atol=args.atol):
-        raise SystemExit(
-            f"streaming output diverges from one-shot beyond atol={args.atol}"
-        )
-    print("OK: streaming output matches one-shot inference.")
+    assert streamed_smoothed is not None, "smoother produced no output"
+    assert_match(one_shot_smoothed, streamed_smoothed, args.atol, "streaming smoother")
 
 
 if __name__ == "__main__":

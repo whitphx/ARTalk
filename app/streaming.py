@@ -1,30 +1,38 @@
 #!/usr/bin/env python
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
-"""Streaming wrapper around BitwiseARModel inference.
+"""Streaming pieces for ARTalk inference.
 
-The released model processes audio in fixed 4-second / 100-frame chunks,
-and chunk-to-chunk state (previous code bits and the rolling
-attention-feature buffer) is the only thing that crosses chunk
-boundaries. ARTalkStreamer exposes that chunked computation as a
-stateful ``feed`` / ``finish`` API so callers can drive inference from
-an audio source that arrives incrementally (e.g. a WebRTC microphone
-track).
+This module hosts two streaming-friendly counterparts to the one-shot
+inference pipeline; see ``docs/realtime.md`` for the broader phase plan
+and design rationale.
 
-Streaming output is bit-exact with one-shot
-``BitwiseARModel.inference`` for the same audio at the same chunk
-boundaries; ``scripts/check_streaming_parity.py`` asserts this.
+* :class:`ARTalkStreamer` (Phase 1) — streaming wrapper around
+  ``BitwiseARModel.inference``. The released model processes audio in
+  fixed 4-second / 100-frame chunks, and chunk-to-chunk state (previous
+  code bits and the rolling attention-feature buffer) is the only thing
+  that crosses chunk boundaries; this class exposes that chunked
+  computation as a stateful ``feed`` / ``finish`` API. Output is
+  bit-exact with one-shot ``BitwiseARModel.inference``.
 
-Post-processing performed by the engine (savgol smoothing, eye-channel
-zeroing, fix_pose) is NOT applied here — those operate on full
-sequences and are out of scope for Phase 1. Apply equivalent causal
-post-processing one layer up.
+* :class:`CausalSavgolSmoother` (Phase 2) — streaming counterpart to
+  ``ARTAvatarInferEngine.smooth_motion_savgol``. Adds a 4-frame
+  (160 ms at 25 fps) emission delay in exchange for output that is
+  bit-exact with the one-shot smoother.
+
+``scripts/check_streaming_parity.py`` asserts both parity properties.
+
+Other engine post-processing (eye-channel zeroing, ``fix_pose``,
+``clip_length`` truncation) is not yet streaming-aware and lives at
+the engine layer; it will be folded into a streaming engine wrapper
+in Phase 3.
 """
 
 import math
 
 import torch
 import torch.nn.functional as F
+from scipy.signal import savgol_filter
 
 
 SAMPLE_RATE = 16000
@@ -172,3 +180,100 @@ class ARTalkStreamer:
         self._prev_attn_feat = new_prev_attn_feat
 
         return this_pred_motion[0]
+
+
+class CausalSavgolSmoother:
+    """Streaming counterpart of ``ARTAvatarInferEngine.smooth_motion_savgol``.
+
+    The one-shot smoother applies ``scipy.signal.savgol_filter`` over
+    the full motion sequence in two passes:
+
+      * all 106 channels: ``window_length=5``, ``polyorder=2``
+      * pose channels (``[100:103]``) override: ``window_length=9``,
+        ``polyorder=3``
+
+    Savgol with the default ``mode='interp'`` is symmetric and
+    deterministic, so re-applying it to a growing buffer yields output
+    that is **bit-exact** with the one-shot path: interior frames
+    depend only on a fixed-size neighborhood that becomes
+    context-independent once both halves of the window are buffered,
+    and left/right boundary frames are reproduced by ``finish()``
+    re-running savgol on the full final buffer.
+
+    Each emitted frame is delayed by ``(POSE_WINDOW - 1) // 2 = 4``
+    frames (160 ms at 25 fps), on top of the AR model's 4-second chunk
+    lag.
+
+    See ``docs/realtime.md`` (Phase 2) for the alternative approaches
+    that were considered (causal IIR/EMA, no smoothing) and why this
+    one was chosen.
+    """
+
+    POSE_SLICE = slice(100, 103)
+    DEFAULT_WINDOW = 5
+    DEFAULT_POLY = 2
+    POSE_WINDOW = 9
+    POSE_POLY = 3
+    DELAY = (POSE_WINDOW - 1) // 2
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._buffer = None
+        self._n_emitted = 0
+
+    def feed(self, motion_frames):
+        if motion_frames.dim() != 2:
+            raise ValueError(
+                f"motion_frames must be 2-D (T, C), got shape {tuple(motion_frames.shape)}"
+            )
+        if motion_frames.shape[0] == 0:
+            return motion_frames
+        if self._buffer is None:
+            self._buffer = motion_frames
+        else:
+            self._buffer = torch.cat([self._buffer, motion_frames], dim=0)
+        n = self._buffer.shape[0]
+        empty = motion_frames.new_zeros(0, motion_frames.shape[1])
+        if n < self.POSE_WINDOW:
+            return empty
+        n_stable = n - self.DELAY
+        if n_stable <= self._n_emitted:
+            return empty
+        smoothed = self._apply_savgol(self._buffer)
+        out = smoothed[self._n_emitted:n_stable]
+        self._n_emitted = n_stable
+        return out
+
+    def finish(self):
+        if self._buffer is None:
+            raise RuntimeError(
+                "CausalSavgolSmoother.finish called before any feed; "
+                "no motion_dim known."
+            )
+        n = self._buffer.shape[0]
+        if self._n_emitted >= n:
+            out = self._buffer.new_zeros(0, self._buffer.shape[1])
+        elif n < self.POSE_WINDOW:
+            # Buffer too short to apply the 9-tap pose filter.
+            # Fall back to raw frames; one-shot inference would also
+            # fail on inputs this short.
+            out = self._buffer[self._n_emitted:]
+        else:
+            smoothed = self._apply_savgol(self._buffer)
+            out = smoothed[self._n_emitted:]
+        self._n_emitted = n
+        return out
+
+    @classmethod
+    def _apply_savgol(cls, buffer):
+        motion_np = buffer.detach().cpu().numpy()
+        smoothed = savgol_filter(
+            motion_np, cls.DEFAULT_WINDOW, cls.DEFAULT_POLY, axis=0,
+        )
+        smoothed[..., cls.POSE_SLICE] = savgol_filter(
+            motion_np[..., cls.POSE_SLICE],
+            cls.POSE_WINDOW, cls.POSE_POLY, axis=0,
+        )
+        return torch.from_numpy(smoothed).to(device=buffer.device, dtype=buffer.dtype)
