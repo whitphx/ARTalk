@@ -26,11 +26,15 @@ import json
 
 import streamlit as st
 import torch
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+from streamlit_webrtc import (
+    WebRtcMode,
+    create_video_source_track,
+    webrtc_streamer,
+)
 
 from app import BitwiseARModel
 from app.flame_model import FLAMEModel, RenderMesh
-from app.realtime_pipeline import ARTalkPipeline, ARTalkVideoTrack
+from app.realtime_pipeline import ARTalkPipeline
 
 
 @st.cache_resource
@@ -66,20 +70,17 @@ st.caption(
 
 model, flame_model, mesh_renderer = load_model_and_renderer(args.device)
 
-# Per-session pipeline + paired video track. Persisted across
-# Streamlit reruns via session_state so the streamer / smoother /
-# queues stay alive between widget interactions.
+# Per-session pipeline; persisted across Streamlit reruns via
+# session_state so the streamer / smoother / queues / worker thread
+# stay alive between widget interactions.
 if "pipeline" not in st.session_state:
-    pipeline = ARTalkPipeline(
+    st.session_state.pipeline = ARTalkPipeline(
         model=model,
         flame_model=flame_model,
         mesh_renderer=mesh_renderer,
         device=args.device,
     )
-    st.session_state.pipeline = pipeline
-    st.session_state.video_track = ARTalkVideoTrack(pipeline)
 pipeline = st.session_state.pipeline
-video_track = st.session_state.video_track
 
 
 def audio_frame_callback(frame):
@@ -87,11 +88,25 @@ def audio_frame_callback(frame):
     return frame
 
 
+video_source_track = create_video_source_track(
+    pipeline.video_source_callback,
+    key="artalk_video_source",
+    fps=25,
+)
+
+
+def on_change():
+    ctx = st.session_state["artalk"]
+    if not ctx.state.playing and not ctx.state.signalling:
+        video_source_track.stop()
+
+
 webrtc_streamer(
     key="artalk",
     mode=WebRtcMode.SENDRECV,
     audio_frame_callback=audio_frame_callback,
-    source_video_track=video_track,
+    source_video_track=video_source_track,
     media_stream_constraints={"audio": True, "video": False},
     async_processing=True,
+    on_change=on_change,
 )

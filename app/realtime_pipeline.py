@@ -6,8 +6,9 @@
 Wires the streaming pieces from Phases 1-3 (``ARTalkStreamer`` →
 ``CausalSavgolSmoother`` → ``StreamingRenderer`` mesh mode) so that
 audio frames pushed in via streamlit-webrtc's ``audio_frame_callback``
-flow through to RGB video frames pulled out by ``ARTalkVideoTrack``
-(an aiortc ``MediaStreamTrack`` subclass) on the outbound side.
+flow through to RGB video frames pulled out by
+``video_source_callback`` (the callback streamlit-webrtc's
+``create_video_source_track`` invokes at the configured fps).
 
 The audio callback returns immediately after enqueueing samples; a
 dedicated daemon worker thread drains the queue and runs the heavy
@@ -20,7 +21,7 @@ would see the session "freeze".
 Single-session, single-GPU MVP — see ``docs/realtime.md`` Phase 4.
 """
 
-import asyncio
+import fractions
 import logging
 import queue
 import threading
@@ -28,7 +29,6 @@ import threading
 import av
 import numpy as np
 import torch
-from aiortc.mediastreams import MediaStreamTrack
 
 from .rendering import StreamingRenderer
 from .streaming import ARTalkStreamer, CausalSavgolSmoother
@@ -61,6 +61,8 @@ class ARTalkPipeline:
         self._audio_in_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
         self._dbg_calls = 0
+        h, w = RENDER_RES
+        self._placeholder = np.zeros((h, w, 3), dtype=np.uint8)
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="ARTalkPipelineWorker",
@@ -80,6 +82,21 @@ class ARTalkPipeline:
                 arr = arr[0]
             if arr.size > 0:
                 self._audio_in_queue.put(arr)
+
+    def video_source_callback(
+        self, pts: int, time_base: fractions.Fraction
+    ) -> av.VideoFrame:
+        """Synchronous frame producer for streamlit-webrtc's
+        ``create_video_source_track``. Drains one frame from
+        ``video_queue`` if available, falls back to a black placeholder
+        otherwise — the call must return promptly so the outbound
+        track keeps firing at its configured fps.
+        """
+        try:
+            arr = self.video_queue.get_nowait()
+        except queue.Empty:
+            arr = self._placeholder
+        return av.VideoFrame.from_ndarray(arr, format="rgb24")
 
     def stop(self):
         self._stop_event.set()
@@ -155,36 +172,3 @@ class ARTalkPipeline:
                 self.video_queue.put_nowait(arr)
             except queue.Full:
                 pass
-
-
-class ARTalkVideoTrack(MediaStreamTrack):
-    """aiortc video track that drains ``ARTalkPipeline.video_queue``.
-
-    When no real frame is ready (the first 4 seconds of a session,
-    or transient gaps), falls back to a black placeholder so the
-    outbound track keeps producing frames at the timestamp pace
-    aiortc expects.
-    """
-
-    kind = "video"
-
-    def __init__(self, pipeline: ARTalkPipeline, placeholder_hw=RENDER_RES):
-        super().__init__()
-        self._pipeline = pipeline
-        h, w = placeholder_hw
-        self._placeholder = np.zeros((h, w, 3), dtype=np.uint8)
-
-    async def recv(self):
-        loop = asyncio.get_event_loop()
-        try:
-            arr = await loop.run_in_executor(
-                None,
-                lambda: self._pipeline.video_queue.get(timeout=0.04),
-            )
-        except queue.Empty:
-            arr = self._placeholder
-        video_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
-        pts, time_base = await self.next_timestamp()
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
