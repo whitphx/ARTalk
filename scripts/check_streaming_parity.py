@@ -99,6 +99,55 @@ def assert_match(reference, streamed, atol, label):
     print(f"[{label}] OK")
 
 
+def assert_match_render(
+    reference,
+    streamed,
+    label,
+    mean_atol=1e-5,
+    sparse_pixel_atol=1e-2,
+    sparse_pixel_max_fraction=1e-3,
+):
+    """Image-tolerant parity check for mesh rendering.
+
+    Mesh rendering is not bit-exact between one-shot (FLAME LBS over
+    a batch of T) and streaming (T calls over batch 1): float32 add
+    non-associativity at ~1e-7 in vertex coordinates feeds discrete
+    rasterizer coverage decisions, flipping a 1-2 pixel silhouette
+    outline. The mean is expected to be near zero; a small fraction
+    of silhouette pixels may diverge significantly. See
+    ``docs/realtime.md`` Phase 3.
+    """
+    print(f"[{label}] one_shot: {tuple(reference.shape)}, streamed: {tuple(streamed.shape)}")
+    assert reference.shape == streamed.shape, f"[{label}] shape mismatch"
+    diff = (reference - streamed).abs()
+    mean_diff = diff.mean().item()
+    max_diff = diff.max().item()
+    print(f"[{label}] max abs diff:  {max_diff:.3e}")
+    print(f"[{label}] mean abs diff: {mean_diff:.3e}")
+
+    n_total = diff.numel()
+    n_sparse = int((diff > sparse_pixel_atol).sum().item())
+    sparse_fraction = n_sparse / n_total
+    print(
+        f"[{label}] pixels with diff > {sparse_pixel_atol:.0e}: "
+        f"{n_sparse}/{n_total} ({sparse_fraction*100:.4f}%)"
+    )
+
+    if mean_diff > mean_atol:
+        raise SystemExit(
+            f"[{label}] mean diff {mean_diff:.3e} exceeds {mean_atol:.0e}"
+        )
+    if sparse_fraction > sparse_pixel_max_fraction:
+        raise SystemExit(
+            f"[{label}] {sparse_fraction*100:.4f}% of pixels diverge beyond "
+            f"{sparse_pixel_atol:.0e}, exceeds {sparse_pixel_max_fraction*100:.4f}%"
+        )
+    print(
+        f"[{label}] OK (mean<{mean_atol:.0e}, "
+        f"sparse pixel divergence within tolerance)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", "-a", default="./demo/eng1.wav", type=str)
@@ -193,8 +242,8 @@ def main():
             device=device,
         )
         streamed_frames = torch.stack(list(renderer.feed(one_shot_motion)), dim=0)
-        assert_match(
-            one_shot_frames, streamed_frames, args.atol, "streaming mesh rendering"
+        assert_match_render(
+            one_shot_frames, streamed_frames, "streaming mesh rendering"
         )
 
 

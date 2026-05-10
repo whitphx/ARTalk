@@ -102,6 +102,27 @@ present). The GAGAvatar path is not covered by automated parity
 because of the asset-download cost; verify it with a smoke test if
 needed.
 
+#### Parity criterion (mesh)
+
+Phases 1 and 2 produce **bit-exact** output between streaming and
+one-shot. Phase 3 mesh rendering does not, and cannot:
+
+- `get_flame_verts` runs FLAME's linear-blend-skinning either over
+  the full batch `T` (one-shot) or `T` times over batch `1`
+  (streaming). Float32 add non-associativity makes vertex
+  coordinates diverge at the ~1e-7 level depending on reduction
+  order.
+- Those tiny vertex deltas feed a discrete rasterizer, which makes
+  binary coverage decisions at silhouette edges. A 1–2 pixel
+  silhouette outline can flip individual pixels.
+
+In practice this manifests as `mean abs diff ~ 2e-8` with
+`max abs diff ~ 6e-1` on a 13-second clip. The parity test therefore
+asserts **mean abs diff < 1e-5 AND <0.1% of pixels diverge by more
+than 1e-2**, instead of strict element-wise equality. Streaming
+output is "visually identical" to one-shot, not bit-identical, and
+that is the right notion of equivalence for this stage.
+
 ### Phase 4 — WebRTC transport
 
 Wire the streaming pipeline to a browser-side audio source and video
