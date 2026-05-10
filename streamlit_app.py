@@ -89,6 +89,17 @@ def audio_frame_callback(frame):
     return frame
 
 
+def on_audio_ended():
+    """Inbound audio track ended (browser stopped sending) → user
+    has ended the session. Tear down the pipeline (worker thread,
+    queues, model state) and drop it from session_state so the next
+    Start creates a fresh one.
+    """
+    pipeline.stop()
+    if "pipeline" in st.session_state:
+        del st.session_state["pipeline"]
+
+
 video_source_track = create_video_source_track(
     pipeline.video_source_callback,
     key="artalk_video_source",
@@ -116,6 +127,7 @@ audio_ctx = webrtc_streamer(
     key="artalk-audio",
     mode=WebRtcMode.SENDONLY,
     audio_frame_callback=audio_frame_callback,
+    on_audio_ended=on_audio_ended,
     media_stream_constraints={"audio": True, "video": False},
     on_change=on_change,
 )

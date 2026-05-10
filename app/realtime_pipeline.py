@@ -153,6 +153,10 @@ class ARTalkPipeline:
             self._audio_out_buffer = np.zeros(0, dtype=np.int16)
         self._pending_audio_for_output = []
 
+    @property
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
