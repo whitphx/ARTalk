@@ -161,14 +161,14 @@ calls for, with the queue absorbing the 100-frame-per-4s bursts.
 - **MVP scope**: mesh mode, no style motion, no UI configurability.
   GAGAvatar mode, style selection, TTS input, and audio echo come
   in later iterations.
-- **`fastrtc` is not added to `environment.yml`** to keep the
-  upstream-facing dep list unchanged; install with `pip install
-  fastrtc` after activating the conda env.
+- **`fastrtc` is declared in `environment.yml`** (pip section,
+  `>=0.0.34`). Pre-1.0 fastrtc may break API compatibility between
+  minor releases; bump the floor as needed when validating new
+  releases.
 
 #### Running
 
 ```bash
-pip install fastrtc        # one-time, after activating the env
 python webrtc_app.py       # default: cuda, 0.0.0.0:8000
 ```
 

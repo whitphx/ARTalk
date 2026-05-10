@@ -7,11 +7,6 @@ Browser microphone → ARTalk streaming inference → mesh-rendered
 avatar video → browser, over WebRTC. Phase 4 of the realtime work;
 see ``docs/realtime.md`` Phase 4 for the design rationale.
 
-Requires ``fastrtc`` (not in environment.yml to keep the
-upstream-facing dep list unchanged); install separately::
-
-    pip install fastrtc
-
 Run on a GPU host that has ``./assets/ARTalk_wav2vec.pt``,
 ``./assets/config.json``, and ``./assets/FLAME_with_eye.pt``::
 
