@@ -37,6 +37,11 @@
 **/depth-diff-gaussian-rasterization
 **/diff-gaussian-rasterization
 
+!frontend/package.json
+!frontend/tsconfig.json
+!frontend/tsconfig.app.json
+!frontend/tsconfig.node.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
