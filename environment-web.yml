@@ -1,0 +1,20 @@
+name: artalk-web
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - ffmpeg
+  - pip:
+      - einops
+      - fastapi
+      - gtts
+      - numpy
+      - python-multipart
+      - scipy
+      - torch
+      - torchaudio
+      - torchcodec
+      - torchvision
+      - transformers
+      - uvicorn

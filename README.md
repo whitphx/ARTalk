@@ -76,6 +76,43 @@ You can generate videos by **uploading audio**, **recording audio**, or **enteri
 python inference.py --run_app
 ```
 
+### Using the web renderer app
+
+The web app is the macOS-oriented demo path. Python runs ARTalk inference and
+FLAME vertex generation, while the browser renders the animated mesh with
+Three.js. This avoids PyTorch3D and the CUDA Gaussian rasterizer in the default
+mesh path.
+
+Create the web app environment:
+```
+micromamba create -f environment-web.yml
+```
+
+Run the API:
+```
+micromamba run -n artalk-web uvicorn web_app:app --host 0.0.0.0 --port 8961
+```
+
+Run the frontend in another terminal:
+```
+cd frontend
+pnpm install
+pnpm dev
+```
+
+Then open the Vite URL, usually `http://localhost:5173`.
+
+For a production-style local run, build the frontend and let FastAPI serve it:
+```
+cd frontend
+pnpm build
+cd ..
+micromamba run -n artalk-web uvicorn web_app:app --host 0.0.0.0 --port 8961
+```
+
+The initial web renderer supports the `mesh` appearance. GAGAvatar remains on
+the existing CUDA server-rendered path.
+
 ### Command Line Usage
 
 ARTalk can be used via command line:
