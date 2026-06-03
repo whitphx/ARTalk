@@ -13,10 +13,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from gtts import gTTS
 
+from app.avatar_registry import UPLOADED_AVATAR_ROOT, available_avatars
+from app.gagavatar_tracking import check_tracker_environment, track_uploaded_avatar
 from app.web_inference import available_styles, get_web_inference_service, write_web_result
 
 
 JOB_ROOT = Path("render_results/web_jobs")
+AVATAR_JOB_ROOT = UPLOADED_AVATAR_ROOT
 FRONTEND_DIST = Path("frontend/dist")
 GTTS_LANG = {
     "English": "en",
@@ -44,6 +47,15 @@ def job_dir(job_id):
     return path
 
 
+def avatar_job_dir(avatar_id):
+    if not avatar_id or any(char not in "0123456789abcdef" for char in avatar_id):
+        raise HTTPException(status_code=404, detail="Avatar job not found")
+    path = AVATAR_JOB_ROOT / avatar_id
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Avatar job not found")
+    return path
+
+
 def write_state(path, state):
     path.mkdir(parents=True, exist_ok=True)
     with open(path / "state.json", "w") as f:
@@ -55,13 +67,18 @@ def read_state(path):
         return json.load(f)
 
 
-def run_job(job_id, *, input_path, style_id, clip_length, device):
+def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id):
     path = JOB_ROOT / job_id
     try:
         write_state(path, {"id": job_id, "status": "running", "stage": "loading model"})
         service = get_web_inference_service(device)
         write_state(path, {"id": job_id, "status": "running", "stage": "generating motion"})
-        result = service.generate(input_path, style_id=style_id, clip_length=clip_length)
+        result = service.generate(
+            input_path,
+            style_id=style_id,
+            clip_length=clip_length,
+            avatar_id=avatar_id,
+        )
         write_state(path, {"id": job_id, "status": "running", "stage": "writing mesh"})
         metadata = write_web_result(result, path)
         write_state(
@@ -87,13 +104,89 @@ def run_job(job_id, *, input_path, style_id, clip_length, device):
         )
 
 
+def run_avatar_job(avatar_id, *, input_path, device):
+    path = AVATAR_JOB_ROOT / avatar_id
+    try:
+        write_state(path, {"id": avatar_id, "status": "running", "stage": "tracking face"})
+        track_uploaded_avatar(input_path, path, device=device)
+        write_state(
+            path,
+            {
+                "id": avatar_id,
+                "avatarId": f"uploaded:{avatar_id}",
+                "status": "complete",
+                "stage": "complete",
+            },
+        )
+    except Exception as exc:
+        write_state(
+            path,
+            {
+                "id": avatar_id,
+                "status": "failed",
+                "stage": "failed",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+
+
 @app.get("/api/config")
 def config():
     return {
         "styles": ["default"] + available_styles(),
+        "avatars": available_avatars(),
         "languages": list(GTTS_LANG.keys()),
         "defaultStyle": "natural_0" if "natural_0" in available_styles() else "default",
+        "defaultAvatar": "mesh",
     }
+
+
+@app.get("/api/avatars")
+def list_avatars():
+    return {"avatars": available_avatars()}
+
+
+@app.post("/api/avatar-jobs")
+async def create_avatar_job(
+    background_tasks: BackgroundTasks,
+    device: str = Form("auto"),
+    image_file: UploadFile = File(...),
+):
+    suffix = Path(image_file.filename or "avatar.jpg").suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png"}:
+        raise HTTPException(status_code=400, detail="Avatar image must be a JPG or PNG")
+    try:
+        check_tracker_environment()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    avatar_id = uuid.uuid4().hex
+    path = AVATAR_JOB_ROOT / avatar_id
+    path.mkdir(parents=True, exist_ok=True)
+    input_path = path / f"upload{suffix}"
+    with open(input_path, "wb") as f:
+        f.write(await image_file.read())
+    write_state(path, {"id": avatar_id, "status": "queued", "stage": "queued"})
+    background_tasks.add_task(
+        run_avatar_job,
+        avatar_id,
+        input_path=str(input_path),
+        device=device,
+    )
+    return read_state(path)
+
+
+@app.get("/api/avatar-jobs/{avatar_id}")
+def get_avatar_job(avatar_id: str):
+    return read_state(avatar_job_dir(avatar_id))
+
+
+@app.get("/api/avatar-jobs/{avatar_id}/preview.jpg")
+def get_avatar_preview(avatar_id: str):
+    file_path = avatar_job_dir(avatar_id) / "preview.jpg"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Avatar preview not ready")
+    return FileResponse(file_path)
 
 
 @app.post("/api/jobs")
@@ -103,6 +196,7 @@ async def create_job(
     style_id: str = Form("default"),
     clip_length: int = Form(750),
     device: str = Form("auto"),
+    avatar_id: str = Form("mesh"),
     text: str | None = Form(None),
     text_language: str = Form("English"),
     audio_file: UploadFile | None = File(None),
@@ -132,6 +226,7 @@ async def create_job(
         style_id=style_id,
         clip_length=clip_length,
         device=device,
+        avatar_id=avatar_id,
     )
     return read_state(path)
 

@@ -12,6 +12,7 @@ import torch
 import torchaudio
 from scipy.signal import savgol_filter
 
+from app.avatar_registry import get_avatar_shape_code
 from app.models import BitwiseARModel
 from app.flame_model.FLAME import FLAMEModel
 
@@ -55,6 +56,7 @@ class WebInferenceResult:
     faces: np.ndarray
     sample_rate: int
     fps: int
+    avatar_id: str
 
 
 class WebInferenceService:
@@ -93,7 +95,7 @@ class WebInferenceService:
         self.style_motion = style_motion[None].to(self.device)
 
     @torch.no_grad()
-    def generate(self, audio_path, *, style_id="default", clip_length=750):
+    def generate(self, audio_path, *, style_id="default", clip_length=750, avatar_id="mesh"):
         with self._lock:
             audio, sr = torchaudio.load(audio_path)
             audio = torchaudio.transforms.Resample(sr, 16000)(audio).mean(dim=0)
@@ -105,7 +107,10 @@ class WebInferenceService:
             pred_motions = self.model.inference(audio_batch, with_gtmotion=False)[0]
             pred_motions = smooth_motion_savgol(pred_motions)[:clip_length]
             pred_motions[..., 104:] *= 0.0
-            shape_code = audio.new_zeros(1, 300).to(self.device).expand(
+            shape_code = get_avatar_shape_code(avatar_id)
+            if shape_code is None:
+                shape_code = audio.new_zeros(1, 300)
+            shape_code = shape_code.to(self.device).expand(
                 pred_motions.shape[0],
                 -1,
             )
@@ -123,6 +128,7 @@ class WebInferenceService:
                 faces=self.flame_model.get_faces().cpu().numpy().astype(np.int32, copy=False),
                 sample_rate=16000,
                 fps=25,
+                avatar_id=avatar_id,
             )
 
 
@@ -159,6 +165,7 @@ def write_web_result(result, output_dir):
         "facesUrl": "faces.i32",
         "audioUrl": "audio.wav",
         "motionsUrl": "motions.pt",
+        "avatarId": result.avatar_id,
     }
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f)

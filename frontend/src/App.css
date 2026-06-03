@@ -162,6 +162,17 @@ input[type="range"] {
   gap: 12px;
 }
 
+.avatar-uploader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 124px;
+  gap: 12px;
+  align-items: end;
+}
+
+.avatar-uploader button {
+  min-height: 48px;
+}
+
 .primary {
   min-height: 48px;
   color: #fffaf0;
@@ -175,6 +186,7 @@ input[type="range"] {
 }
 
 .primary svg,
+.avatar-uploader button svg.lucide-loader-2,
 .loading-state svg {
   animation: spin 1s linear infinite;
 }
@@ -205,14 +217,55 @@ input[type="range"] {
   font: 650 15px/1.3 "Avenir Next", "Helvetica Neue", sans-serif;
 }
 
+.status-panel small {
+  color: #3d473f;
+  font: 600 13px/1.35 "Avenir Next", "Helvetica Neue", sans-serif;
+}
+
+.error-panel {
+  border: 1px solid rgba(163, 61, 50, 0.28);
+  background: #fff8ef;
+}
+
+.error-toolbar {
+  min-height: 38px;
+  padding: 7px 8px 7px 10px;
+  border-bottom: 1px solid rgba(163, 61, 50, 0.18);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.error-toolbar span {
+  color: #a33d32;
+}
+
+.copy-error {
+  min-height: 30px;
+  padding: 0 10px;
+  color: #a33d32;
+  background: #fffdf8;
+  border-color: rgba(163, 61, 50, 0.38);
+  font-size: 12px;
+}
+
+.copy-error svg {
+  width: 15px;
+  height: 15px;
+}
+
+.copy-error:hover,
+.copy-error:focus-visible {
+  background: #ffece4;
+}
+
 .error {
   margin: 0;
   max-height: 180px;
   overflow: auto;
   padding: 10px;
   color: #a33d32;
-  background: #fff8ef;
-  border: 1px solid rgba(163, 61, 50, 0.28);
   font-size: 14px;
   line-height: 1.4;
   overflow-wrap: anywhere;
@@ -308,6 +361,10 @@ audio {
   }
 
   .transport {
+    grid-template-columns: 1fr;
+  }
+
+  .avatar-uploader {
     grid-template-columns: 1fr;
   }
 

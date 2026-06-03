@@ -1,9 +1,18 @@
 export type InputMode = 'audio' | 'text'
 
+export type AvatarInfo = {
+  id: string
+  label: string
+  source: string
+  previewUrl: string | null
+}
+
 export type Config = {
   styles: string[]
+  avatars: AvatarInfo[]
   languages: string[]
   defaultStyle: string
+  defaultAvatar: string
 }
 
 export type JobState = {
@@ -12,6 +21,7 @@ export type JobState = {
   stage: string
   metadata?: string
   frameCount?: number
+  avatarId?: string
   error?: string
 }
 
@@ -25,4 +35,5 @@ export type AnimationMetadata = {
   facesUrl: string
   audioUrl: string
   motionsUrl: string
+  avatarId: string
 }

@@ -110,8 +110,28 @@ cd ..
 micromamba run -n artalk-web uvicorn web_app:app --host 0.0.0.0 --port 8961
 ```
 
-The initial web renderer supports the `mesh` appearance. GAGAvatar remains on
-the existing CUDA server-rendered path.
+The web renderer uses a hybrid avatar path:
+
+- Browser rendering is still the lightweight FLAME mesh renderer.
+- The avatar picker can use the neutral mesh or built-in GAGAvatar tracked
+  identities from `assets/GAGAvatar/tracked.pt`; their `shapecode` drives the
+  browser mesh geometry.
+- Single-image avatar registration is exposed as a server-side API. Configure a
+  separate GAGAvatar tracking environment before using it:
+
+```
+export GAGAVATAR_REPO=/path/to/GAGAvatar
+export GAGAVATAR_PYTHON=/path/to/gagavatar-env/bin/python
+```
+
+The registration device selector supports `auto`; it resolves to CUDA when the
+GAGAvatar Python environment has CUDA available, otherwise CPU.
+
+The registration endpoint follows the tracking flow in
+<a href="https://github.com/xg-chu/GAGAvatar/blob/main/inference.py">`GAGAvatar/inference.py`</a>
+and writes uploaded avatar records under `render_results/web_avatars`. Note
+that GAGAvatar's bundled `GAGAvatar_track` dependency is licensed CC BY-NC 4.0,
+so production or commercial use needs separate license review.
 
 ### Command Line Usage
 
