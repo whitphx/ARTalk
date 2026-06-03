@@ -7,12 +7,19 @@ export type AvatarInfo = {
   previewUrl: string | null
 }
 
+export type RenderModeInfo = {
+  id: 'mesh' | 'gagavatar'
+  label: string
+}
+
 export type Config = {
   styles: string[]
   avatars: AvatarInfo[]
+  renderModes: RenderModeInfo[]
   languages: string[]
   defaultStyle: string
   defaultAvatar: string
+  defaultRenderMode: 'mesh' | 'gagavatar'
 }
 
 export type JobState = {
@@ -26,6 +33,7 @@ export type JobState = {
 }
 
 export type AnimationMetadata = {
+  renderMode: 'mesh' | 'gagavatar'
   fps: number
   sampleRate: number
   frameCount: number
@@ -35,5 +43,6 @@ export type AnimationMetadata = {
   facesUrl: string
   audioUrl: string
   motionsUrl: string
+  videoUrl: string | null
   avatarId: string
 }

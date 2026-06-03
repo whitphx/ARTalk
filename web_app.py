@@ -14,8 +14,19 @@ from fastapi.staticfiles import StaticFiles
 from gtts import gTTS
 
 from app.avatar_registry import UPLOADED_AVATAR_ROOT, available_avatars
+from app.gagavatar_video import (
+    GAGAVATAR_RENDER_MODE,
+    MESH_RENDER_MODE,
+    check_gagavatar_render_environment,
+    get_gagavatar_video_renderer,
+)
 from app.gagavatar_tracking import check_tracker_environment, track_uploaded_avatar
-from app.web_inference import available_styles, get_web_inference_service, write_web_result
+from app.web_inference import (
+    available_styles,
+    get_web_inference_service,
+    write_web_metadata,
+    write_web_result,
+)
 
 
 JOB_ROOT = Path("render_results/web_jobs")
@@ -67,7 +78,7 @@ def read_state(path):
         return json.load(f)
 
 
-def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id):
+def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id, render_mode):
     path = JOB_ROOT / job_id
     try:
         write_state(path, {"id": job_id, "status": "running", "stage": "loading model"})
@@ -81,6 +92,13 @@ def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id):
         )
         write_state(path, {"id": job_id, "status": "running", "stage": "writing mesh"})
         metadata = write_web_result(result, path)
+        if render_mode == GAGAVATAR_RENDER_MODE:
+            write_state(path, {"id": job_id, "status": "running", "stage": "rendering colored video"})
+            renderer = get_gagavatar_video_renderer(device)
+            video_path = renderer.render_video(result, path, avatar_id=avatar_id)
+            metadata["renderMode"] = GAGAVATAR_RENDER_MODE
+            metadata["videoUrl"] = video_path.name
+            write_web_metadata(metadata, path)
         write_state(
             path,
             {
@@ -139,6 +157,11 @@ def config():
         "languages": list(GTTS_LANG.keys()),
         "defaultStyle": "natural_0" if "natural_0" in available_styles() else "default",
         "defaultAvatar": "mesh",
+        "renderModes": [
+            {"id": MESH_RENDER_MODE, "label": "Browser mesh"},
+            {"id": GAGAVATAR_RENDER_MODE, "label": "Colored video (server)"},
+        ],
+        "defaultRenderMode": MESH_RENDER_MODE,
     }
 
 
@@ -197,10 +220,21 @@ async def create_job(
     clip_length: int = Form(750),
     device: str = Form("auto"),
     avatar_id: str = Form("mesh"),
+    render_mode: Literal["mesh", "gagavatar"] = Form(MESH_RENDER_MODE),
     text: str | None = Form(None),
     text_language: str = Form("English"),
     audio_file: UploadFile | None = File(None),
 ):
+    if render_mode == GAGAVATAR_RENDER_MODE:
+        if avatar_id == "mesh":
+            raise HTTPException(
+                status_code=400,
+                detail="Choose a registered or built-in GAGAvatar avatar for colored video output",
+            )
+        try:
+            check_gagavatar_render_environment(device)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = uuid.uuid4().hex
     path = JOB_ROOT / job_id
     path.mkdir(parents=True, exist_ok=True)
@@ -227,6 +261,7 @@ async def create_job(
         clip_length=clip_length,
         device=device,
         avatar_id=avatar_id,
+        render_mode=render_mode,
     )
     return read_state(path)
 
@@ -250,12 +285,13 @@ def get_metadata(job_id: str):
         "facesUrl": f"/api/jobs/{job_id}/faces.i32",
         "audioUrl": f"/api/jobs/{job_id}/audio.wav",
         "motionsUrl": f"/api/jobs/{job_id}/motions.pt",
+        "videoUrl": f"/api/jobs/{job_id}/{metadata['videoUrl']}" if metadata.get("videoUrl") else None,
     }
 
 
 @app.get("/api/jobs/{job_id}/{name}")
 def get_job_file(job_id: str, name: str):
-    if name not in {"vertices.f32", "faces.i32", "audio.wav", "motions.pt"}:
+    if name not in {"vertices.f32", "faces.i32", "audio.wav", "motions.pt", "gagavatar.mp4"}:
         raise HTTPException(status_code=404, detail="File not found")
     file_path = job_dir(job_id) / name
     if not file_path.exists():

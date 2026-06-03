@@ -14,7 +14,7 @@ export function Renderer({ metadata }: RendererProps) {
   const [loadState, setLoadState] = useState('Waiting for animation data')
 
   useEffect(() => {
-    if (!metadata || !canvasRef.current) return
+    if (!metadata || metadata.videoUrl || !canvasRef.current) return
 
     const animation = metadata
     let disposed = false
@@ -142,7 +142,11 @@ export function Renderer({ metadata }: RendererProps) {
   return (
     <section className="stage" aria-label="Generated avatar preview">
       <div className="viewport">
-        <canvas ref={canvasRef} aria-label="3D avatar renderer" />
+        {metadata?.videoUrl ? (
+          <video className="rendered-video" src={metadata.videoUrl} controls playsInline />
+        ) : (
+          <canvas ref={canvasRef} aria-label="3D avatar renderer" />
+        )}
         {!metadata && (
           <div className="empty-state">
             <Radio aria-hidden="true" />
@@ -157,10 +161,10 @@ export function Renderer({ metadata }: RendererProps) {
         )}
       </div>
       <div className="transport">
-        <audio ref={audioRef} src={metadata?.audioUrl} controls />
+        {!metadata?.videoUrl && <audio ref={audioRef} src={metadata?.audioUrl} controls />}
         <div className="readout" aria-live="polite">
           {metadata
-            ? `${metadata.frameCount} frames · ${metadata.vertexCount} vertices · ${metadata.fps} fps`
+            ? `${metadata.frameCount} frames · ${metadata.renderMode === 'gagavatar' ? 'colored video' : `${metadata.vertexCount} vertices`} · ${metadata.fps} fps`
             : 'No render loaded'}
         </div>
       </div>

@@ -288,10 +288,16 @@ input[type="range"] {
   min-height: 420px;
 }
 
-.viewport canvas {
+.viewport canvas,
+.rendered-video {
   width: 100%;
   height: 100%;
   display: block;
+}
+
+.rendered-video {
+  object-fit: contain;
+  background: #101715;
 }
 
 .empty-state,
@@ -337,6 +343,10 @@ audio {
 .readout {
   color: #d7d1c1;
   text-align: right;
+}
+
+.readout:only-child {
+  text-align: left;
 }
 
 @keyframes spin {

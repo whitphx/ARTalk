@@ -7,14 +7,20 @@ import type { AnimationMetadata, Config, InputMode, JobState } from './types'
 import './App.css'
 
 const DEFAULT_AVATARS = [{ id: 'mesh', label: 'Neutral mesh', source: 'mesh', previewUrl: null }]
+const DEFAULT_RENDER_MODES = [
+  { id: 'mesh' as const, label: 'Browser mesh' },
+  { id: 'gagavatar' as const, label: 'Colored video (server)' },
+]
 
 function normalizeConfig(nextConfig: Config): Config {
   return {
     styles: nextConfig.styles ?? ['default'],
     avatars: nextConfig.avatars ?? DEFAULT_AVATARS,
+    renderModes: nextConfig.renderModes ?? DEFAULT_RENDER_MODES,
     languages: nextConfig.languages ?? ['English'],
     defaultStyle: nextConfig.defaultStyle ?? 'default',
     defaultAvatar: nextConfig.defaultAvatar ?? 'mesh',
+    defaultRenderMode: nextConfig.defaultRenderMode ?? 'mesh',
   }
 }
 
@@ -22,9 +28,11 @@ function App() {
   const [config, setConfig] = useState<Config>({
     styles: ['default'],
     avatars: DEFAULT_AVATARS,
+    renderModes: DEFAULT_RENDER_MODES,
     languages: ['English'],
     defaultStyle: 'default',
     defaultAvatar: 'mesh',
+    defaultRenderMode: 'mesh',
   })
   const [mode, setMode] = useState<InputMode>('audio')
   const [audioFile, setAudioFile] = useState<File | null>(null)
@@ -33,6 +41,7 @@ function App() {
   const [language, setLanguage] = useState('English')
   const [style, setStyle] = useState('default')
   const [avatar, setAvatar] = useState('mesh')
+  const [renderMode, setRenderMode] = useState<'mesh' | 'gagavatar'>('mesh')
   const [clipLength, setClipLength] = useState(300)
   const [device, setDevice] = useState('auto')
   const [job, setJob] = useState<JobState | null>(null)
@@ -58,6 +67,7 @@ function App() {
         setConfig(normalized)
         setStyle(normalized.defaultStyle)
         setAvatar(normalized.defaultAvatar)
+        setRenderMode(normalized.defaultRenderMode)
         setLanguage(normalized.languages[0] ?? 'English')
       })
       .catch((err: unknown) => {
@@ -140,6 +150,7 @@ function App() {
     body.set('clip_length', String(clipLength))
     body.set('device', device)
     body.set('avatar_id', avatar)
+    body.set('render_mode', renderMode)
     body.set('text_language', language)
     if (mode === 'audio' && audioFile) body.set('audio_file', audioFile)
     if (mode === 'text') body.set('text', text)
@@ -253,6 +264,20 @@ function App() {
             <span>Avatar</span>
             <select value={avatar} onChange={(event) => setAvatar(event.target.value)}>
               {config.avatars.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Output</span>
+            <select
+              value={renderMode}
+              onChange={(event) => setRenderMode(event.target.value as 'mesh' | 'gagavatar')}
+            >
+              {config.renderModes.map((item) => (
                 <option key={item.id} value={item.id}>
                   {item.label}
                 </option>

@@ -156,6 +156,7 @@ def write_web_result(result, output_dir):
         result.sample_rate,
     )
     metadata = {
+        "renderMode": "mesh",
         "fps": result.fps,
         "sampleRate": result.sample_rate,
         "frameCount": int(result.vertices.shape[0]),
@@ -165,8 +166,13 @@ def write_web_result(result, output_dir):
         "facesUrl": "faces.i32",
         "audioUrl": "audio.wav",
         "motionsUrl": "motions.pt",
+        "videoUrl": None,
         "avatarId": result.avatar_id,
     }
-    with open(output_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f)
+    write_web_metadata(metadata, output_dir)
     return metadata
+
+
+def write_web_metadata(metadata, output_dir):
+    with open(Path(output_dir) / "metadata.json", "w") as f:
+        json.dump(metadata, f)
