@@ -13,9 +13,14 @@ def write_video(video_frames, output_path, fps, audio_samples=None, sample_rate=
         video_frames = video_frames.cpu().numpy()
     if video_frames.dtype != np.uint8:
         video_frames = video_frames.astype(np.uint8)
+    fps_rate = Fraction(fps).limit_denominator(1000)
+    if fps_rate <= 0:
+        raise ValueError(f"FPS must be positive: {fps}")
+    if audio_samples is not None and sample_rate is None:
+        raise ValueError("sample_rate is required when audio_samples is provided")
     _, _, height, width = video_frames.shape
     container = av.open(output_path, mode="w")
-    stream = container.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
+    stream = container.add_stream("h264", rate=fps_rate)
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
@@ -40,7 +45,7 @@ def write_video(video_frames, output_path, fps, audio_samples=None, sample_rate=
         if isinstance(audio_samples, torch.Tensor):
             audio_samples = audio_samples.cpu().numpy()
         assert audio_samples.ndim == 1, "Input audio samples should be a 1D array."
-        num_samples_per_frame = int(sample_rate // fps)
+        num_samples_per_frame = int(sample_rate / fps_rate)
         for i in range(0, audio_samples.shape[0], num_samples_per_frame):
             # audio_frame = av.AudioFrame.from_ndarray(audio_samples[:, i:i + num_samples_per_frame], format="fltp", layout="mono")
             chunk = audio_samples[i:i + num_samples_per_frame]
