@@ -41,6 +41,10 @@ export type AnimationMetadata = {
   faceCount: number
   verticesUrl: string
   facesUrl: string
+  regionLabelsUrl?: string | null
+  regionLabelFormat?: 'uint8-vertex'
+  regionLabels?: Record<string, number>
+  regionSource?: string
   audioUrl: string
   motionsUrl: string
   videoUrl: string | null

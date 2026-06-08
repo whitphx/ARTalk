@@ -167,6 +167,7 @@ Allows:
 
 - `vertices.f32`
 - `faces.i32`
+- `regions.u8`
 - `audio.wav`
 - `motions.pt`
 - `gagavatar.mp4`
@@ -285,6 +286,10 @@ micromamba run -n artalk-web scripts/check_web_backend_env.py --full
 ```
 
 ## Validation
+
+Browser-side renderer design notes live in
+[`docs/browser-face-renderer.md`](browser-face-renderer.md). That document
+also captures the intended future path for browser-side Gaussian Splatting.
 
 Backend import check:
 

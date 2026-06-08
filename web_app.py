@@ -327,6 +327,11 @@ def get_metadata(job_id: str):
         **metadata,
         "verticesUrl": f"/api/jobs/{job_id}/vertices.f32",
         "facesUrl": f"/api/jobs/{job_id}/faces.i32",
+        "regionLabelsUrl": (
+            f"/api/jobs/{job_id}/{metadata['regionLabelsUrl']}"
+            if metadata.get("regionLabelsUrl")
+            else None
+        ),
         "audioUrl": f"/api/jobs/{job_id}/audio.wav",
         "motionsUrl": f"/api/jobs/{job_id}/motions.pt",
         "videoUrl": f"/api/jobs/{job_id}/{metadata['videoUrl']}" if metadata.get("videoUrl") else None,
@@ -335,7 +340,7 @@ def get_metadata(job_id: str):
 
 @app.get("/api/jobs/{job_id}/{name}")
 def get_job_file(job_id: str, name: str):
-    if name not in {"vertices.f32", "faces.i32", "audio.wav", "motions.pt", "gagavatar.mp4"}:
+    if name not in {"vertices.f32", "faces.i32", "regions.u8", "audio.wav", "motions.pt", "gagavatar.mp4"}:
         raise HTTPException(status_code=404, detail="File not found")
     file_path = job_dir(job_id) / name
     if not file_path.exists():
