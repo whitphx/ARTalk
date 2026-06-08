@@ -91,6 +91,12 @@ needs a more complete per-frame contract for local Gaussian deformation,
 feature-channel rendering, camera sorting, and the upsampler-equivalent color
 path.
 
+The shader preview sorts its instanced splats back-to-front on the CPU when the
+camera changes, and on each animated head-frame update in `head` preview mode.
+This improves ordinary alpha blending for inspection, but it is still a
+preview approximation. A production Gaussian renderer should move sorting and
+screen-space covariance handling to a purpose-built WebGL/WebGPU path.
+
 Before implementing `browser-gaussian`, inspect and define the data contract
 for `GAGAvatar.forward_expression(...)`:
 

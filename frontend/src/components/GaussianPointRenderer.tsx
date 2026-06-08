@@ -14,6 +14,8 @@ type GaussianPointRendererProps = {
 export type GaussianPreviewMode = 'head' | 'planes' | 'all'
 
 const GAGAVATAR_HEAD_GAUSSIAN_COUNT = 5023
+const TEMP_VECTOR_A = new THREE.Vector3()
+const TEMP_VECTOR_B = new THREE.Vector3()
 
 const SPLAT_VERTEX_SHADER = `
 attribute vec3 center;
@@ -146,6 +148,13 @@ export function GaussianPointRenderer({
       const previewOpacities = new Float32Array(previewCount)
       const previewScales = new Float32Array(previewCount * 3)
       const previewRotations = new Float32Array(previewCount * 4)
+      const sortedCenters = new Float32Array(previewCount * 3)
+      const sortedColors = new Float32Array(previewCount * 3)
+      const sortedOpacities = new Float32Array(previewCount)
+      const sortedScales = new Float32Array(previewCount * 3)
+      const sortedRotations = new Float32Array(previewCount * 4)
+      const sortOrder = Array.from({ length: previewCount }, (_, index) => index)
+      const depthValues = new Float32Array(previewCount)
       for (let index = 0; index < previewCount; index += 1) {
         const sourceIndex = range.start + index
         const sourceOffset = sourceIndex * 3
@@ -174,11 +183,20 @@ export function GaussianPointRenderer({
       const geometry = new THREE.InstancedBufferGeometry()
       geometry.instanceCount = previewCount
       geometry.setAttribute('position', new THREE.BufferAttribute(buildUnitQuadVertices(), 3))
-      geometry.setAttribute('center', new THREE.InstancedBufferAttribute(centers, 3))
-      geometry.setAttribute('gaussianColor', new THREE.InstancedBufferAttribute(previewColors, 3))
-      geometry.setAttribute('gaussianOpacity', new THREE.InstancedBufferAttribute(previewOpacities, 1))
-      geometry.setAttribute('gaussianScale', new THREE.InstancedBufferAttribute(previewScales, 3))
-      geometry.setAttribute('gaussianRotation', new THREE.InstancedBufferAttribute(previewRotations, 4))
+      geometry.setAttribute('center', new THREE.InstancedBufferAttribute(sortedCenters, 3).setUsage(THREE.DynamicDrawUsage))
+      geometry.setAttribute(
+        'gaussianColor',
+        new THREE.InstancedBufferAttribute(sortedColors, 3).setUsage(THREE.DynamicDrawUsage),
+      )
+      geometry.setAttribute(
+        'gaussianOpacity',
+        new THREE.InstancedBufferAttribute(sortedOpacities, 1).setUsage(THREE.DynamicDrawUsage),
+      )
+      geometry.setAttribute('gaussianScale', new THREE.InstancedBufferAttribute(sortedScales, 3).setUsage(THREE.DynamicDrawUsage))
+      geometry.setAttribute(
+        'gaussianRotation',
+        new THREE.InstancedBufferAttribute(sortedRotations, 4).setUsage(THREE.DynamicDrawUsage),
+      )
       geometry.boundingSphere = boundingSphereForCenters(centers)
 
       const material = new THREE.ShaderMaterial({
@@ -190,6 +208,7 @@ export function GaussianPointRenderer({
         depthTest: false,
       })
       const points = new THREE.Mesh(geometry, material)
+      points.frustumCulled = false
       scene.add(points)
 
       const sphere = geometry.boundingSphere
@@ -215,11 +234,11 @@ export function GaussianPointRenderer({
         resizeFrame = window.requestAnimationFrame(resize)
       }
 
+      let sortRequested = true
       function renderLoop() {
         if (disposed) return
-        updateAnimatedHeadCenters(
+        const headFrameChanged = updateAnimatedHeadCenters(
           centers,
-          geometry.attributes.center,
           animatedHeadPositions,
           audioRef.current?.currentTime ?? 0,
           metadata.fps,
@@ -229,7 +248,19 @@ export function GaussianPointRenderer({
             activeHeadFrame = frame
           },
         )
-        controls.update()
+        sortRequested = sortRequested || headFrameChanged || controls.update()
+        if (sortRequested) {
+          sortGaussianInstances(
+            { centers, colors: previewColors, opacities: previewOpacities, scales: previewScales, rotations: previewRotations },
+            { centers: sortedCenters, colors: sortedColors, opacities: sortedOpacities, scales: sortedScales, rotations: sortedRotations },
+            geometry,
+            sortOrder,
+            depthValues,
+            camera,
+            points.position,
+          )
+          sortRequested = false
+        }
         renderer.render(scene, camera)
         animationId = window.requestAnimationFrame(renderLoop)
       }
@@ -301,7 +332,6 @@ function boundingSphereForCenters(centers: Float32Array) {
 
 function updateAnimatedHeadCenters(
   centers: Float32Array,
-  centerAttribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute,
   animatedHeadPositions: Float32Array | null,
   currentTime: number,
   fps: number,
@@ -309,12 +339,85 @@ function updateAnimatedHeadCenters(
   activeFrame: number,
   setActiveFrame: (frame: number) => void,
 ) {
-  if (!animatedHeadPositions) return
+  if (!animatedHeadPositions) return false
   const frameSize = headCount * 3
   const frameCount = animatedHeadPositions.length / frameSize
   const frame = Math.min(frameCount - 1, Math.max(0, Math.floor(currentTime * fps)))
-  if (frame === activeFrame) return
+  if (frame === activeFrame) return false
   centers.set(animatedHeadPositions.subarray(frame * frameSize, (frame + 1) * frameSize))
-  centerAttribute.needsUpdate = true
   setActiveFrame(frame)
+  return true
+}
+
+type GaussianInstanceAttributes = {
+  centers: Float32Array
+  colors: Float32Array
+  opacities: Float32Array
+  scales: Float32Array
+  rotations: Float32Array
+}
+
+function sortGaussianInstances(
+  source: GaussianInstanceAttributes,
+  target: GaussianInstanceAttributes,
+  geometry: THREE.InstancedBufferGeometry,
+  sortOrder: number[],
+  depthValues: Float32Array,
+  camera: THREE.Camera,
+  objectOffset: THREE.Vector3,
+) {
+  const cameraPosition = TEMP_VECTOR_A
+  const cameraDirection = TEMP_VECTOR_B
+  camera.getWorldPosition(cameraPosition)
+  camera.getWorldDirection(cameraDirection)
+
+  for (let index = 0; index < sortOrder.length; index += 1) {
+    sortOrder[index] = index
+    const offset = index * 3
+    const worldX = source.centers[offset] + objectOffset.x
+    const worldY = source.centers[offset + 1] + objectOffset.y
+    const worldZ = source.centers[offset + 2] + objectOffset.z
+    depthValues[index] =
+      (worldX - cameraPosition.x) * cameraDirection.x +
+      (worldY - cameraPosition.y) * cameraDirection.y +
+      (worldZ - cameraPosition.z) * cameraDirection.z
+  }
+  sortOrder.sort((left, right) => depthValues[right] - depthValues[left])
+
+  for (let targetIndex = 0; targetIndex < sortOrder.length; targetIndex += 1) {
+    const sourceIndex = sortOrder[targetIndex]
+    copyVector3(source.centers, target.centers, sourceIndex, targetIndex)
+    copyVector3(source.colors, target.colors, sourceIndex, targetIndex)
+    target.opacities[targetIndex] = source.opacities[sourceIndex]
+    copyVector3(source.scales, target.scales, sourceIndex, targetIndex)
+    copyVector4(source.rotations, target.rotations, sourceIndex, targetIndex)
+  }
+
+  markAttributeUpdated(geometry, 'center')
+  markAttributeUpdated(geometry, 'gaussianColor')
+  markAttributeUpdated(geometry, 'gaussianOpacity')
+  markAttributeUpdated(geometry, 'gaussianScale')
+  markAttributeUpdated(geometry, 'gaussianRotation')
+}
+
+function copyVector3(source: Float32Array, target: Float32Array, sourceIndex: number, targetIndex: number) {
+  const sourceOffset = sourceIndex * 3
+  const targetOffset = targetIndex * 3
+  target[targetOffset] = source[sourceOffset]
+  target[targetOffset + 1] = source[sourceOffset + 1]
+  target[targetOffset + 2] = source[sourceOffset + 2]
+}
+
+function copyVector4(source: Float32Array, target: Float32Array, sourceIndex: number, targetIndex: number) {
+  const sourceOffset = sourceIndex * 4
+  const targetOffset = targetIndex * 4
+  target[targetOffset] = source[sourceOffset]
+  target[targetOffset + 1] = source[sourceOffset + 1]
+  target[targetOffset + 2] = source[sourceOffset + 2]
+  target[targetOffset + 3] = source[sourceOffset + 3]
+}
+
+function markAttributeUpdated(geometry: THREE.BufferGeometry, name: string) {
+  const attribute = geometry.getAttribute(name)
+  if (attribute) attribute.needsUpdate = true
 }
