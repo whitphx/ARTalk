@@ -41,6 +41,10 @@ The important contract is now in place: a future backend can replace
 renderer. Older jobs without `regionLabelsUrl` still fall back to the
 browser-side normalized-position heuristic.
 
+The default `skin` material also consumes the region labels, but with a subdued
+palette intended for presentation rather than inspection. The explicit `region`
+material keeps the higher-contrast diagnostic colors.
+
 ## Future Gaussian Splatting Extension
 
 GAGAvatar's server-side colored renderer is based on a learned Gaussian avatar,

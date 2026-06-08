@@ -12,6 +12,12 @@ const REGION_COLORS = [
   new THREE.Color(0x2a1717),
   new THREE.Color(0xe8e0d4),
 ]
+const SKIN_COLORS = [
+  new THREE.Color(0xd9a38a),
+  new THREE.Color(0xbf6566),
+  new THREE.Color(0x4a2223),
+  new THREE.Color(0xeadbcf),
+]
 
 type MeshFaceRendererProps = {
   metadata: AnimationMetadata | null
@@ -46,6 +52,7 @@ export function MeshFaceRenderer({
     const mesh = meshRef.current
     if (!mesh) return
     const previousMaterial = mesh.material
+    applyColorAttribute(mesh, materialMode)
     mesh.material = createFaceMaterial(materialMode, wireframe)
     disposeMaterial(previousMaterial)
   }, [materialMode, wireframe])
@@ -147,12 +154,15 @@ export function MeshFaceRenderer({
       const positionAttribute = new THREE.BufferAttribute(positions, 3)
       positionAttribute.setUsage(THREE.DynamicDrawUsage)
       geometry.setAttribute('position', positionAttribute)
-      geometry.setAttribute('color', buildRegionColors(positions, regionLabels))
+      geometry.userData.skinColors = buildMeshColors(positions, regionLabels, 'skin')
+      geometry.userData.regionColors = buildMeshColors(positions, regionLabels, 'region')
+      geometry.setAttribute('color', geometry.userData.skinColors)
       geometry.computeVertexNormals()
       geometry.computeBoundingSphere()
 
       const material = createFaceMaterial(materialModeRef.current, wireframeRef.current)
       const mesh = new THREE.Mesh(geometry, material)
+      applyColorAttribute(mesh, materialModeRef.current)
       meshRef.current = mesh
       group.add(mesh)
 
@@ -256,7 +266,7 @@ function createFaceMaterial(materialMode: MeshMaterialMode, wireframe: boolean) 
     })
   }
   return new THREE.MeshPhysicalMaterial({
-    color: 0xd8a58d,
+    vertexColors: true,
     roughness: 0.58,
     metalness: 0.0,
     sheen: 0.25,
@@ -278,12 +288,16 @@ function resetCameraFrame(
   controls.update()
 }
 
-function buildRegionColors(positions: Float32Array, regionLabels: Uint8Array | null) {
+function buildMeshColors(
+  positions: Float32Array,
+  regionLabels: Uint8Array | null,
+  palette: 'skin' | 'region',
+) {
   const vertexCount = positions.length / 3
+  const colors = new Float32Array(vertexCount * 3)
   if (regionLabels) {
-    const colors = new Float32Array(vertexCount * 3)
     for (let index = 0; index < vertexCount; index += 1) {
-      writeRegionColor(colors, index, regionLabels[index])
+      writeRegionColor(colors, index, regionLabels[index], palette)
     }
     return new THREE.BufferAttribute(colors, 3)
   }
@@ -303,7 +317,6 @@ function buildRegionColors(positions: Float32Array, regionLabels: Uint8Array | n
   }
 
   const size = max.sub(min)
-  const colors = new Float32Array(vertexCount * 3)
   for (let index = 0; index < vertexCount; index += 1) {
     const x = positions[index * 3]
     const y = positions[index * 3 + 1]
@@ -311,7 +324,7 @@ function buildRegionColors(positions: Float32Array, regionLabels: Uint8Array | n
     const nx = normalizeAxis(x, min.x, size.x)
     const ny = normalizeAxis(y, min.y, size.y)
     const nz = normalizeAxis(z, min.z, size.z)
-    const color = classifyApproximateFaceRegion(nx, ny, nz)
+    const color = colorForRegionLabel(classifyApproximateFaceRegion(nx, ny, nz), palette)
     const base = index * 3
     colors[base] = color.r
     colors[base + 1] = color.g
@@ -320,25 +333,43 @@ function buildRegionColors(positions: Float32Array, regionLabels: Uint8Array | n
 
   function classifyApproximateFaceRegion(nx: number, ny: number, nz: number) {
     const centeredX = Math.abs(nx - 0.5)
-    if (nz > 0.54 && ny > 0.36 && ny < 0.5 && centeredX < 0.18) return REGION_COLORS[1]
-    if (nz > 0.56 && ny > 0.31 && ny <= 0.38 && centeredX < 0.1) return REGION_COLORS[2]
-    if (nz > 0.5 && ny > 0.56 && ny < 0.68 && centeredX > 0.13 && centeredX < 0.29) return REGION_COLORS[3]
-    return REGION_COLORS[0]
+    if (nz > 0.54 && ny > 0.36 && ny < 0.5 && centeredX < 0.18) return 1
+    if (nz > 0.56 && ny > 0.31 && ny <= 0.38 && centeredX < 0.1) return 2
+    if (nz > 0.5 && ny > 0.56 && ny < 0.68 && centeredX > 0.13 && centeredX < 0.29) return 3
+    return 0
   }
 
   return new THREE.BufferAttribute(colors, 3)
 }
 
-function writeRegionColor(colors: Float32Array, index: number, label: number) {
-  const color = colorForRegionLabel(label)
+function writeRegionColor(
+  colors: Float32Array,
+  index: number,
+  label: number,
+  palette: 'skin' | 'region',
+) {
+  const color = colorForRegionLabel(label, palette)
   const base = index * 3
   colors[base] = color.r
   colors[base + 1] = color.g
   colors[base + 2] = color.b
 }
 
-function colorForRegionLabel(label: number) {
-  return REGION_COLORS[label] ?? REGION_COLORS[0]
+function colorForRegionLabel(label: number, palette: 'skin' | 'region') {
+  const colors = palette === 'skin' ? SKIN_COLORS : REGION_COLORS
+  return colors[label] ?? colors[0]
+}
+
+function applyColorAttribute(mesh: THREE.Mesh, materialMode: MeshMaterialMode) {
+  const geometry = mesh.geometry
+  const colors =
+    materialMode === 'region'
+      ? geometry.userData.regionColors
+      : geometry.userData.skinColors
+  if (colors instanceof THREE.BufferAttribute) {
+    geometry.setAttribute('color', colors)
+    colors.needsUpdate = true
+  }
 }
 
 function normalizeAxis(value: number, min: number, size: number) {
