@@ -27,6 +27,20 @@ browser. Near-term improvements should stay focused on:
 - playback controls that keep audio and frame selection synchronized
 - renderer controls for material mode, wireframe, and camera reset
 
+The current `region` material mode consumes `regions.u8` when generated job
+metadata provides it. That file is a per-vertex `uint8` label buffer using the
+metadata `regionLabels` map. The backend source is currently
+`mediapipe-landmark-adjacency-v1`: it seeds eye and mouth regions from the
+Mediapipe landmark embeddings stored in the FLAME checkpoint, then grows those
+seeds over mesh adjacency. The FLAME checkpoint does not include a UV map or
+semantic face-region masks, so these labels are topology-guided visualization
+regions rather than production segmentation.
+
+The important contract is now in place: a future backend can replace
+`regions.u8` with stronger semantic labels without changing the browser
+renderer. Older jobs without `regionLabelsUrl` still fall back to the
+browser-side normalized-position heuristic.
+
 ## Future Gaussian Splatting Extension
 
 GAGAvatar's server-side colored renderer is based on a learned Gaussian avatar,

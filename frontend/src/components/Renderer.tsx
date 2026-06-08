@@ -54,6 +54,7 @@ export function Renderer({ metadata }: RendererProps) {
                 onChange={(event) => setMaterialMode(event.target.value as MeshMaterialMode)}
               >
                 <option value="skin">skin</option>
+                <option value="region">region</option>
                 <option value="debug">debug</option>
                 <option value="normal">normal</option>
               </select>

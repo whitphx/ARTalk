@@ -167,6 +167,7 @@ Allows:
 
 - `vertices.f32`
 - `faces.i32`
+- `regions.u8`
 - `audio.wav`
 - `motions.pt`
 - `gagavatar.mp4`

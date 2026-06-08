@@ -4,7 +4,14 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { AnimationMetadata } from '../types'
 
-export type MeshMaterialMode = 'skin' | 'debug' | 'normal'
+export type MeshMaterialMode = 'skin' | 'region' | 'debug' | 'normal'
+
+const REGION_COLORS = [
+  new THREE.Color(0xd8a58d),
+  new THREE.Color(0xa85858),
+  new THREE.Color(0x2a1717),
+  new THREE.Color(0xe8e0d4),
+]
 
 type MeshFaceRendererProps = {
   metadata: AnimationMetadata | null
@@ -100,27 +107,36 @@ export function MeshFaceRenderer({
 
     async function load() {
       onLoadState('Loading mesh buffers')
-      const [vertexResponse, faceResponse] = await Promise.all([
+      const [vertexResponse, faceResponse, regionResponse] = await Promise.all([
         fetch(animation.verticesUrl),
         fetch(animation.facesUrl),
+        animation.regionLabelsUrl ? fetch(animation.regionLabelsUrl) : Promise.resolve(null),
       ])
       if (!vertexResponse.ok) throw new Error(`Failed to load vertices: ${vertexResponse.status}`)
       if (!faceResponse.ok) throw new Error(`Failed to load faces: ${faceResponse.status}`)
+      if (regionResponse && !regionResponse.ok) {
+        throw new Error(`Failed to load region labels: ${regionResponse.status}`)
+      }
 
-      const [vertexBuffer, faceBuffer] = await Promise.all([
+      const [vertexBuffer, faceBuffer, regionBuffer] = await Promise.all([
         vertexResponse.arrayBuffer(),
         faceResponse.arrayBuffer(),
+        regionResponse ? regionResponse.arrayBuffer() : Promise.resolve(null),
       ])
       if (disposed) return
 
       const allVertices = new Float32Array(vertexBuffer)
       const faces = new Uint32Array(faceBuffer)
+      const regionLabels = regionBuffer ? new Uint8Array(regionBuffer) : null
       const frameSize = animation.vertexCount * 3
       if (allVertices.length < frameSize || allVertices.length % frameSize !== 0) {
         throw new Error('Invalid vertex buffer size')
       }
       if (faces.length !== animation.faceCount * 3) {
         throw new Error('Invalid face buffer size')
+      }
+      if (regionLabels && regionLabels.length !== animation.vertexCount) {
+        throw new Error('Invalid region label buffer size')
       }
 
       const positions = new Float32Array(frameSize)
@@ -131,6 +147,7 @@ export function MeshFaceRenderer({
       const positionAttribute = new THREE.BufferAttribute(positions, 3)
       positionAttribute.setUsage(THREE.DynamicDrawUsage)
       geometry.setAttribute('position', positionAttribute)
+      geometry.setAttribute('color', buildRegionColors(positions, regionLabels))
       geometry.computeVertexNormals()
       geometry.computeBoundingSphere()
 
@@ -230,6 +247,14 @@ function createFaceMaterial(materialMode: MeshMaterialMode, wireframe: boolean) 
       wireframe,
     })
   }
+  if (materialMode === 'region') {
+    return new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.54,
+      metalness: 0.0,
+      wireframe,
+    })
+  }
   return new THREE.MeshPhysicalMaterial({
     color: 0xd8a58d,
     roughness: 0.58,
@@ -251,4 +276,71 @@ function resetCameraFrame(
   camera.position.set(0, 0.02, Math.max(sphere.radius * 4.1, 0.7))
   controls.target.set(0, 0.01, 0)
   controls.update()
+}
+
+function buildRegionColors(positions: Float32Array, regionLabels: Uint8Array | null) {
+  const vertexCount = positions.length / 3
+  if (regionLabels) {
+    const colors = new Float32Array(vertexCount * 3)
+    for (let index = 0; index < vertexCount; index += 1) {
+      writeRegionColor(colors, index, regionLabels[index])
+    }
+    return new THREE.BufferAttribute(colors, 3)
+  }
+
+  const min = new THREE.Vector3(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY)
+  const max = new THREE.Vector3(Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY)
+  for (let index = 0; index < vertexCount; index += 1) {
+    const x = positions[index * 3]
+    const y = positions[index * 3 + 1]
+    const z = positions[index * 3 + 2]
+    min.x = Math.min(min.x, x)
+    min.y = Math.min(min.y, y)
+    min.z = Math.min(min.z, z)
+    max.x = Math.max(max.x, x)
+    max.y = Math.max(max.y, y)
+    max.z = Math.max(max.z, z)
+  }
+
+  const size = max.sub(min)
+  const colors = new Float32Array(vertexCount * 3)
+  for (let index = 0; index < vertexCount; index += 1) {
+    const x = positions[index * 3]
+    const y = positions[index * 3 + 1]
+    const z = positions[index * 3 + 2]
+    const nx = normalizeAxis(x, min.x, size.x)
+    const ny = normalizeAxis(y, min.y, size.y)
+    const nz = normalizeAxis(z, min.z, size.z)
+    const color = classifyApproximateFaceRegion(nx, ny, nz)
+    const base = index * 3
+    colors[base] = color.r
+    colors[base + 1] = color.g
+    colors[base + 2] = color.b
+  }
+
+  function classifyApproximateFaceRegion(nx: number, ny: number, nz: number) {
+    const centeredX = Math.abs(nx - 0.5)
+    if (nz > 0.54 && ny > 0.36 && ny < 0.5 && centeredX < 0.18) return REGION_COLORS[1]
+    if (nz > 0.56 && ny > 0.31 && ny <= 0.38 && centeredX < 0.1) return REGION_COLORS[2]
+    if (nz > 0.5 && ny > 0.56 && ny < 0.68 && centeredX > 0.13 && centeredX < 0.29) return REGION_COLORS[3]
+    return REGION_COLORS[0]
+  }
+
+  return new THREE.BufferAttribute(colors, 3)
+}
+
+function writeRegionColor(colors: Float32Array, index: number, label: number) {
+  const color = colorForRegionLabel(label)
+  const base = index * 3
+  colors[base] = color.r
+  colors[base + 1] = color.g
+  colors[base + 2] = color.b
+}
+
+function colorForRegionLabel(label: number) {
+  return REGION_COLORS[label] ?? REGION_COLORS[0]
+}
+
+function normalizeAxis(value: number, min: number, size: number) {
+  return size > 0 ? (value - min) / size : 0.5
 }
