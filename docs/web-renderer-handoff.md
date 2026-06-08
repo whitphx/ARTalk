@@ -200,9 +200,13 @@ cd ..
 Run the backend:
 
 ```bash
-micromamba run -n artalk-web \
-  uvicorn web_app:app --host 0.0.0.0 --port 8961
+micromamba run -n artalk-web scripts/run_web_backend.sh
 ```
+
+The launcher prepends `$CONDA_PREFIX/lib` to `LD_LIBRARY_PATH` so Linux uses
+the FFmpeg and C++ runtime libraries from the `artalk-web` environment before
+older system copies. Override the backend URL used by Vite with
+`ARTALK_API_TARGET` if you do not run the API on `http://127.0.0.1:8961`.
 
 Run the frontend:
 

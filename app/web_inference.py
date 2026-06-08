@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torchaudio
+from scipy.io import wavfile
 from scipy.signal import savgol_filter
 
 from app.avatar_registry import get_avatar_shape_code
@@ -46,6 +47,51 @@ def smooth_motion_savgol(motion_codes):
         motion_np[..., 100:103], window_length=9, polyorder=3, axis=0
     )
     return torch.tensor(motion_np_smoothed).type_as(motion_codes)
+
+
+def load_audio(audio_path):
+    path = Path(audio_path)
+    try:
+        return torchaudio.load(str(path))
+    except RuntimeError as exc:
+        if path.suffix.lower() != ".wav":
+            raise RuntimeError(
+                "Could not decode audio with torchaudio. Install an audio backend "
+                "such as ffmpeg/soundfile in the web backend environment, or upload a WAV file."
+            ) from exc
+        try:
+            sr, data = wavfile.read(path)
+        except Exception as wav_exc:
+            raise exc from wav_exc
+        if data.ndim == 1:
+            data = data[None, :]
+        else:
+            data = data.T
+        audio_np = data.astype(np.float32, copy=False)
+        if np.issubdtype(data.dtype, np.unsignedinteger):
+            info = np.iinfo(data.dtype)
+            midpoint = float(info.max + 1) / 2.0
+            audio_np = (audio_np - midpoint) / midpoint
+        elif np.issubdtype(data.dtype, np.signedinteger):
+            info = np.iinfo(data.dtype)
+            scale = float(max(abs(info.min), info.max))
+            audio_np = audio_np / scale
+        return torch.from_numpy(audio_np), sr
+
+
+def save_audio(audio_path, audio, sample_rate):
+    path = Path(audio_path)
+    try:
+        torchaudio.save(str(path), audio, sample_rate)
+        return
+    except RuntimeError as exc:
+        if path.suffix.lower() != ".wav":
+            raise exc
+    audio_np = audio.detach().cpu().numpy()
+    if audio_np.ndim == 2:
+        audio_np = audio_np.T
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+    wavfile.write(path, sample_rate, (audio_np * 32767.0).astype(np.int16))
 
 
 @dataclass
@@ -97,7 +143,7 @@ class WebInferenceService:
     @torch.no_grad()
     def generate(self, audio_path, *, style_id="default", clip_length=750, avatar_id="mesh"):
         with self._lock:
-            audio, sr = torchaudio.load(audio_path)
+            audio, sr = load_audio(audio_path)
             audio = torchaudio.transforms.Resample(sr, 16000)(audio).mean(dim=0)
             self.set_style_motion(style_id)
             audio_batch = {
@@ -150,11 +196,7 @@ def write_web_result(result, output_dir):
     result.vertices.tofile(output_dir / "vertices.f32")
     result.faces.tofile(output_dir / "faces.i32")
     torch.save(result.motions, output_dir / "motions.pt")
-    torchaudio.save(
-        str(output_dir / "audio.wav"),
-        result.audio[None],
-        result.sample_rate,
-    )
+    save_audio(output_dir / "audio.wav", result.audio[None], result.sample_rate)
     metadata = {
         "renderMode": "mesh",
         "fps": result.fps,

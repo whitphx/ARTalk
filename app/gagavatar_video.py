@@ -16,10 +16,18 @@ MESH_RENDER_MODE = "mesh"
 
 
 def check_gagavatar_render_environment(device="auto"):
-    if _select_render_device(device).type != "cuda":
+    selected_device = _select_render_device(device)
+    if selected_device.type != "cuda":
         raise RuntimeError(
             "Server-side GAGAvatar rendering requires a CUDA device. "
-            "Use mesh output on macOS, or run the backend on a CUDA server."
+            "Use mesh output on macOS, or run the backend on a CUDA server. "
+            f"CUDA diagnostics: {_cuda_diagnostics()}"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Server-side GAGAvatar rendering requires CUDA, but CUDA is not "
+            "available to this backend process. "
+            f"CUDA diagnostics: {_cuda_diagnostics()}"
         )
     if importlib.util.find_spec("diff_gaussian_rasterization_32d") is None:
         raise RuntimeError(
@@ -64,7 +72,7 @@ class GAGAvatarVideoRenderer:
             write_video(
                 video_frames,
                 str(video_path),
-                float(result.fps),
+                result.fps,
                 audio,
                 result.sample_rate,
                 "aac",
@@ -90,3 +98,12 @@ def _select_render_device(device):
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _cuda_diagnostics():
+    return (
+        f"torch={torch.__version__}, "
+        f"torch_cuda={torch.version.cuda}, "
+        f"cuda_available={torch.cuda.is_available()}, "
+        f"device_count={torch.cuda.device_count()}"
+    )

@@ -2,12 +2,14 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import json
+import subprocess
+import threading
 import traceback
 import uuid
 from pathlib import Path
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,7 +31,7 @@ from app.web_inference import (
 )
 
 
-JOB_ROOT = Path("render_results/web_jobs")
+JOB_ROOT = Path("render_results/web_jobs").resolve()
 AVATAR_JOB_ROOT = UPLOADED_AVATAR_ROOT
 FRONTEND_DIST = Path("frontend/dist")
 GTTS_LANG = {
@@ -69,13 +71,56 @@ def avatar_job_dir(avatar_id):
 
 def write_state(path, state):
     path.mkdir(parents=True, exist_ok=True)
-    with open(path / "state.json", "w") as f:
+    tmp_path = path / f".state.{uuid.uuid4().hex}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(state, f)
+    tmp_path.replace(path / "state.json")
 
 
 def read_state(path):
     with open(path / "state.json") as f:
         return json.load(f)
+
+
+def start_thread(target, **kwargs):
+    thread = threading.Thread(target=target, kwargs=kwargs, daemon=True)
+    thread.start()
+    return thread
+
+
+def write_text_audio(text, language, output_dir):
+    mp3_path = output_dir / "input.mp3"
+    wav_path = output_dir / "input.wav"
+    gTTS(text=text, lang=GTTS_LANG[language]).save(str(mp3_path))
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(mp3_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(wav_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Text input requires ffmpeg to convert generated speech to WAV.",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to convert generated speech to WAV: {exc.stderr.strip()}",
+        ) from exc
+    return wav_path
 
 
 def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id, render_mode):
@@ -172,7 +217,6 @@ def list_avatars():
 
 @app.post("/api/avatar-jobs")
 async def create_avatar_job(
-    background_tasks: BackgroundTasks,
     device: str = Form("auto"),
     image_file: UploadFile = File(...),
 ):
@@ -189,14 +233,15 @@ async def create_avatar_job(
     input_path = path / f"upload{suffix}"
     with open(input_path, "wb") as f:
         f.write(await image_file.read())
-    write_state(path, {"id": avatar_id, "status": "queued", "stage": "queued"})
-    background_tasks.add_task(
+    state = {"id": avatar_id, "status": "queued", "stage": "queued"}
+    write_state(path, state)
+    start_thread(
         run_avatar_job,
-        avatar_id,
+        avatar_id=avatar_id,
         input_path=str(input_path),
         device=device,
     )
-    return read_state(path)
+    return state
 
 
 @app.get("/api/avatar-jobs/{avatar_id}")
@@ -214,7 +259,6 @@ def get_avatar_preview(avatar_id: str):
 
 @app.post("/api/jobs")
 async def create_job(
-    background_tasks: BackgroundTasks,
     input_type: Literal["audio", "text"] = Form("audio"),
     style_id: str = Form("default"),
     clip_length: int = Form(750),
@@ -243,8 +287,7 @@ async def create_job(
             raise HTTPException(status_code=400, detail="Text input is required")
         if text_language not in GTTS_LANG:
             raise HTTPException(status_code=400, detail="Unsupported text language")
-        input_path = path / "input.mp3"
-        gTTS(text=text, lang=GTTS_LANG[text_language]).save(str(input_path))
+        input_path = write_text_audio(text, text_language, path)
     else:
         if audio_file is None:
             raise HTTPException(status_code=400, detail="Audio file is required")
@@ -252,10 +295,11 @@ async def create_job(
         input_path = path / f"input{suffix}"
         with open(input_path, "wb") as f:
             f.write(await audio_file.read())
-    write_state(path, {"id": job_id, "status": "queued", "stage": "queued"})
-    background_tasks.add_task(
+    state = {"id": job_id, "status": "queued", "stage": "queued"}
+    write_state(path, state)
+    start_thread(
         run_job,
-        job_id,
+        job_id=job_id,
         input_path=str(input_path),
         style_id=style_id,
         clip_length=clip_length,
@@ -263,7 +307,7 @@ async def create_job(
         avatar_id=avatar_id,
         render_mode=render_mode,
     )
-    return read_state(path)
+    return state
 
 
 @app.get("/api/jobs/{job_id}")

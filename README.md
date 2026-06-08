@@ -90,7 +90,7 @@ micromamba create -f environment-web.yml
 
 Run the API:
 ```
-micromamba run -n artalk-web uvicorn web_app:app --host 0.0.0.0 --port 8961
+micromamba run -n artalk-web scripts/run_web_backend.sh
 ```
 
 Run the frontend in another terminal:
@@ -101,13 +101,15 @@ pnpm dev
 ```
 
 Then open the Vite URL, usually `http://localhost:5173`.
+The dev server proxies `/api` to `http://127.0.0.1:8961` by default; set
+`ARTALK_API_TARGET` when running the backend on a different port.
 
 For a production-style local run, build the frontend and let FastAPI serve it:
 ```
 cd frontend
 pnpm build
 cd ..
-micromamba run -n artalk-web uvicorn web_app:app --host 0.0.0.0 --port 8961
+micromamba run -n artalk-web scripts/run_web_backend.sh
 ```
 
 The web renderer uses a hybrid avatar path:
@@ -124,14 +126,27 @@ export GAGAVATAR_REPO=/path/to/GAGAvatar
 export GAGAVATAR_PYTHON=/path/to/gagavatar-env/bin/python
 ```
 
-The registration device selector supports `auto`; it resolves to CUDA when the
-GAGAvatar Python environment has CUDA available, otherwise CPU.
+The registration device selector supports `auto`; it resolves to CUDA only
+when the GAGAvatar Python environment can run PyTorch3D's CUDA rasterizer,
+otherwise CPU.
 
 The registration endpoint follows the tracking flow in
 <a href="https://github.com/xg-chu/GAGAvatar/blob/main/inference.py">`GAGAvatar/inference.py`</a>
 and writes uploaded avatar records under `render_results/web_avatars`. Note
 that GAGAvatar's bundled `GAGAvatar_track` dependency is licensed CC BY-NC 4.0,
 so production or commercial use needs separate license review.
+
+Server-side colored video mode also requires CUDA and GAGAvatar's Gaussian
+rasterizer in the backend environment:
+
+```
+CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+  micromamba run -n artalk-web pip install --no-build-isolation --no-deps \
+  /path/to/diff-gaussian-rasterization
+```
+
+If `device=auto` selects CPU, check that the backend process can initialize
+CUDA with `torch.cuda.is_available()`.
 
 ### Command Line Usage
 

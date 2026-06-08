@@ -14,6 +14,14 @@ export function Renderer({ metadata }: RendererProps) {
   const [loadState, setLoadState] = useState('Waiting for animation data')
 
   useEffect(() => {
+    if (!metadata) {
+      setLoadState('Waiting for animation data')
+    } else if (metadata.videoUrl) {
+      setLoadState('Loading colored video')
+    }
+  }, [metadata])
+
+  useEffect(() => {
     if (!metadata || metadata.videoUrl || !canvasRef.current) return
 
     const animation = metadata
@@ -143,7 +151,15 @@ export function Renderer({ metadata }: RendererProps) {
     <section className="stage" aria-label="Generated avatar preview">
       <div className="viewport">
         {metadata?.videoUrl ? (
-          <video className="rendered-video" src={metadata.videoUrl} controls playsInline />
+          <video
+            key={metadata.videoUrl}
+            className="rendered-video"
+            src={metadata.videoUrl}
+            controls
+            playsInline
+            onCanPlay={() => setLoadState('Ready')}
+            onError={() => setLoadState('Failed to load colored video')}
+          />
         ) : (
           <canvas ref={canvasRef} aria-label="3D avatar renderer" />
         )}

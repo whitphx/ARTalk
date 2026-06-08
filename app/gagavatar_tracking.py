@@ -46,13 +46,51 @@ import torch._dynamo
 import torchvision
 from core.libs.GAGAvatar_track.engines import CoreEngine as TrackEngine
 
+
+def _can_track_on_cuda():
+    try:
+        _check_pytorch3d_cuda_rasterizer()
+        return True
+    except Exception:
+        return False
+
+
+def _check_pytorch3d_cuda_rasterizer():
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA is not available (python={sys.executable}, torch={torch.__version__}, "
+            f"torch_cuda={torch.version.cuda}, device_count={torch.cuda.device_count()})"
+        )
+
+    from pytorch3d.renderer.mesh.rasterize_meshes import rasterize_meshes
+    from pytorch3d.structures import Meshes
+
+    verts = torch.tensor(
+        [[[-0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.0, 0.5, 1.0]]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    faces = torch.tensor([[[0, 1, 2]]], device="cuda", dtype=torch.int64)
+    rasterize_meshes(Meshes(verts=verts, faces=faces), image_size=4)
+
+
 torch._dynamo.config.suppress_errors = True
 image_path = sys.argv[1]
 output_pt = Path(sys.argv[2])
 output_preview = Path(sys.argv[3])
 device = sys.argv[4]
 if device == "auto":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if _can_track_on_cuda() else "cpu"
+elif device.startswith("cuda"):
+    try:
+        _check_pytorch3d_cuda_rasterizer()
+    except Exception as exc:
+        raise RuntimeError(
+            "GAGAvatar tracking was requested on CUDA, but the configured "
+            "GAGAvatar Python environment cannot run PyTorch3D CUDA rasterization. "
+            "Use device=auto/cpu, or install CUDA-enabled PyTorch and PyTorch3D "
+            f"in GAGAVATAR_PYTHON. Details: {exc}"
+        ) from exc
 
 track_engine = TrackEngine(focal_length=12.0, device=device)
 image = torchvision.io.read_image(image_path, mode=torchvision.io.ImageReadMode.RGB).float()

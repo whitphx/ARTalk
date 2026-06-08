@@ -36,6 +36,8 @@
 **/render_results
 **/depth-diff-gaussian-rasterization
 **/diff-gaussian-rasterization
+/.local-build/
+/GAGAvatar/
 
 !frontend/package.json
 !frontend/tsconfig.json
