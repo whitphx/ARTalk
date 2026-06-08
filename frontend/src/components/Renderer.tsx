@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Loader2, Pause, Play, Radio, RotateCcw } from 'lucide-react'
 import type { AnimationMetadata } from '../types'
-import { GaussianPointRenderer, type GaussianPreviewMode } from './GaussianPointRenderer'
+import { GaussianPointRenderer, type GaussianPreviewMode, type GaussianViewMode } from './GaussianPointRenderer'
 import { MeshFaceRenderer, type MeshMaterialMode } from './MeshFaceRenderer'
 import { VideoRenderer } from './VideoRenderer'
 
@@ -16,10 +16,13 @@ export function Renderer({ metadata }: RendererProps) {
   const [wireframe, setWireframe] = useState(false)
   const [cameraResetSignal, setCameraResetSignal] = useState(0)
   const [gaussianPreviewMode, setGaussianPreviewMode] = useState<GaussianPreviewMode>('head')
+  const [gaussianViewMode, setGaussianViewMode] = useState<GaussianViewMode>('orbit')
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const isMeshRender = metadata?.renderMode === 'mesh'
   const isGaussianRender = metadata?.renderMode === 'browser-gaussian'
+  const gaussianEffectiveViewMode =
+    isGaussianRender && metadata?.gaussianUrls?.transforms ? gaussianViewMode : 'orbit'
   const duration = metadata ? metadata.frameCount / metadata.fps : 0
   const currentFrame = metadata
     ? Math.min(metadata.frameCount, Math.floor(currentTime * metadata.fps) + 1)
@@ -63,6 +66,7 @@ export function Renderer({ metadata }: RendererProps) {
             metadata={metadata}
             audioRef={audioRef}
             previewMode={gaussianPreviewMode}
+            viewMode={gaussianEffectiveViewMode}
             onLoadState={setLoadState}
           />
         ) : (
@@ -174,6 +178,17 @@ export function Renderer({ metadata }: RendererProps) {
                 <option value="head">head</option>
                 <option value="planes">planes</option>
                 <option value="all">all</option>
+              </select>
+            </label>
+            <label>
+              <span>View</span>
+              <select
+                value={gaussianViewMode}
+                onChange={(event) => setGaussianViewMode(event.target.value as GaussianViewMode)}
+                disabled={!metadata.gaussianUrls?.transforms}
+              >
+                <option value="orbit">orbit</option>
+                <option value="gagavatar">GAGAvatar</option>
               </select>
             </label>
           </div>

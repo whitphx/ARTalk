@@ -93,8 +93,10 @@ camera sorting, and the upsampler-equivalent color path.
 
 The backend also exports `gaussians.transforms.f32` as one GAGAvatar
 `t_transform` 3x4 matrix per frame. The browser validates this artifact but
-does not apply it yet; the next step is to reconcile that transform with the
-interactive orbit camera without breaking inspection controls.
+keeps the interactive `orbit` view as the default inspection mode. The
+experimental `GAGAvatar` view applies the per-frame transform in the shader so
+the browser preview can be compared against the server renderer's camera
+convention.
 
 The shader preview sorts its instanced splats back-to-front on the CPU when the
 camera changes, and on each animated head-frame update in `head` preview mode.
