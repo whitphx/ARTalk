@@ -44,6 +44,7 @@ export function MeshFaceRenderer({
   const boundingSphereRef = useRef<THREE.Sphere | null>(null)
   const materialModeRef = useRef(materialMode)
   const wireframeRef = useRef(wireframe)
+  const requestRenderRef = useRef<(() => void) | null>(null)
 
   materialModeRef.current = materialMode
   wireframeRef.current = wireframe
@@ -55,10 +56,12 @@ export function MeshFaceRenderer({
     applyColorAttribute(mesh, materialMode)
     mesh.material = createFaceMaterial(materialMode, wireframe)
     disposeMaterial(previousMaterial)
+    requestRenderRef.current?.()
   }, [materialMode, wireframe])
 
   useEffect(() => {
     resetCameraFrame(cameraRef.current, controlsRef.current, groupRef.current, boundingSphereRef.current)
+    requestRenderRef.current?.()
   }, [cameraResetSignal])
 
   useEffect(() => {
@@ -70,8 +73,9 @@ export function MeshFaceRenderer({
 
     const animation = metadata
     let disposed = false
-    let animationId = 0
+    let renderFrameId = 0
     let resizeFrame = 0
+    let renderQueued = false
     let resizeObserver: ResizeObserver | null = null
     const canvas = canvasRef.current
     const renderer = new THREE.WebGLRenderer({
@@ -178,6 +182,7 @@ export function MeshFaceRenderer({
         renderer.setSize(width, height, false)
         camera.aspect = width / Math.max(height, 1)
         camera.updateProjectionMatrix()
+        requestRender()
       }
 
       function scheduleResize() {
@@ -189,7 +194,13 @@ export function MeshFaceRenderer({
       resizeObserver.observe(canvas.parentElement ?? canvas)
       resize()
 
-      function renderLoop() {
+      function requestRender() {
+        if (disposed || renderQueued) return
+        renderQueued = true
+        renderFrameId = window.requestAnimationFrame(renderFrame)
+      }
+
+      function updateFrame() {
         if (disposed) return
         const audio = audioRef.current
         const frame = audio
@@ -202,22 +213,54 @@ export function MeshFaceRenderer({
           geometry.attributes.position.needsUpdate = true
           geometry.computeVertexNormals()
         }
-        controls.update()
-        renderer.render(scene, camera)
-        animationId = window.requestAnimationFrame(renderLoop)
       }
 
+      function renderFrame() {
+        if (disposed) return
+        renderQueued = false
+        updateFrame()
+        const controlsChanged = controls.update()
+        renderer.render(scene, camera)
+        const audio = audioRef.current
+        if (audio && !audio.paused && !audio.ended) {
+          requestRender()
+        } else if (controlsChanged) {
+          requestRender()
+        }
+      }
+
+      const audio = audioRef.current
+      const requestRenderOnAudioChange = () => requestRender()
+      audio?.addEventListener('play', requestRenderOnAudioChange)
+      audio?.addEventListener('seeked', requestRenderOnAudioChange)
+      audio?.addEventListener('timeupdate', requestRenderOnAudioChange)
+      controls.addEventListener('change', requestRender)
+      requestRenderRef.current = requestRender
       onLoadState('Ready')
-      renderLoop()
+      requestRender()
+
+      return () => {
+        audio?.removeEventListener('play', requestRenderOnAudioChange)
+        audio?.removeEventListener('seeked', requestRenderOnAudioChange)
+        audio?.removeEventListener('timeupdate', requestRenderOnAudioChange)
+        controls.removeEventListener('change', requestRender)
+      }
     }
 
-    load().catch((error: unknown) => {
-      if (!disposed) onLoadState(error instanceof Error ? error.message : String(error))
-    })
+    let removeRenderEventListeners: (() => void) | undefined
+    load()
+      .then((cleanup) => {
+        removeRenderEventListeners = cleanup
+      })
+      .catch((error: unknown) => {
+        if (!disposed) onLoadState(error instanceof Error ? error.message : String(error))
+      })
 
     return () => {
       disposed = true
-      window.cancelAnimationFrame(animationId)
+      removeRenderEventListeners?.()
+      requestRenderRef.current = null
+      window.cancelAnimationFrame(renderFrameId)
       window.cancelAnimationFrame(resizeFrame)
       resizeObserver?.disconnect()
       renderer.dispose()

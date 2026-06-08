@@ -50,6 +50,10 @@ element remains the timing source for mesh frame selection. Scrubbing updates
 the audio clock directly, so paused and playing states use the same frame-sync
 path.
 
+The mesh renderer runs a continuous animation loop only while audio is playing
+or orbit controls are damping. In paused states it redraws on explicit events
+such as seek, resize, camera reset, or material changes.
+
 ## Future Gaussian Splatting Extension
 
 GAGAvatar's server-side colored renderer is based on a learned Gaussian avatar,
