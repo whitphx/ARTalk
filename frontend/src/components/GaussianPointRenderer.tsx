@@ -111,7 +111,7 @@ export function GaussianPointRenderer({
 
     async function load() {
       onLoadState('Loading Gaussian buffers')
-      const shouldLoadAnimatedHead = previewMode === 'head' && Boolean(metadata.gaussianUrls!.headXyz)
+      const shouldLoadAnimatedHead = previewMode !== 'planes' && Boolean(metadata.gaussianUrls!.headXyz)
       const [xyzResponse, headXyzResponse, colorResponse, opacityResponse, scaleResponse, rotationResponse] = await Promise.all([
         fetch(metadata.gaussianUrls!.xyz),
         shouldLoadAnimatedHead ? fetch(metadata.gaussianUrls!.headXyz!) : Promise.resolve(null),

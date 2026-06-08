@@ -84,12 +84,12 @@ cannot match server video until it also handles 32-channel feature rendering and
 the neural upsampler output path.
 
 The spike now exports per-frame positions for the first 5,023 head Gaussians.
-That keeps the lightest useful animated path in the browser: the head preview
-can follow the generated audio motion while the learned local feature-plane
-Gaussians remain static first-frame diagnostics. Full Gaussian animation still
-needs a more complete per-frame contract for local Gaussian deformation,
-feature-channel rendering, camera sorting, and the upsampler-equivalent color
-path.
+That keeps the lightest useful animated path in the browser: the `head`
+preview can follow the generated audio motion, and `all` preview animates that
+head subset while the learned local feature-plane Gaussians remain static
+first-frame diagnostics. Full Gaussian animation still needs a more complete
+per-frame contract for local Gaussian deformation, feature-channel rendering,
+camera sorting, and the upsampler-equivalent color path.
 
 The shader preview sorts its instanced splats back-to-front on the CPU when the
 camera changes, and on each animated head-frame update in `head` preview mode.
