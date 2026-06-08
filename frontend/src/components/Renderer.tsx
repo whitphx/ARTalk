@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react'
-import { Loader2, Radio, RotateCcw } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Loader2, Pause, Play, Radio, RotateCcw } from 'lucide-react'
 import type { AnimationMetadata } from '../types'
 import { MeshFaceRenderer, type MeshMaterialMode } from './MeshFaceRenderer'
 import { VideoRenderer } from './VideoRenderer'
@@ -14,6 +14,41 @@ export function Renderer({ metadata }: RendererProps) {
   const [materialMode, setMaterialMode] = useState<MeshMaterialMode>('skin')
   const [wireframe, setWireframe] = useState(false)
   const [cameraResetSignal, setCameraResetSignal] = useState(0)
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
+  const isMeshRender = Boolean(metadata && !metadata.videoUrl)
+  const duration = metadata ? metadata.frameCount / metadata.fps : 0
+  const currentFrame = metadata
+    ? Math.min(metadata.frameCount, Math.floor(currentTime * metadata.fps) + 1)
+    : 0
+
+  useEffect(() => {
+    const audio = audioRef.current
+    audio?.pause()
+    if (audio) audio.currentTime = 0
+    setCurrentTime(0)
+    setIsPlaying(false)
+  }, [metadata?.audioUrl])
+
+  async function togglePlayback() {
+    const audio = audioRef.current
+    if (!audio || !metadata) return
+    if (!audio.paused) {
+      audio.pause()
+      setIsPlaying(false)
+      return
+    }
+    if (audio.currentTime >= duration) audio.currentTime = 0
+    await audio.play()
+    setIsPlaying(true)
+  }
+
+  function seekTo(value: number) {
+    const nextTime = Math.min(Math.max(value, 0), duration)
+    const audio = audioRef.current
+    if (audio) audio.currentTime = nextTime
+    setCurrentTime(nextTime)
+  }
 
   return (
     <section className="stage" aria-label="Generated avatar preview">
@@ -44,8 +79,47 @@ export function Renderer({ metadata }: RendererProps) {
         )}
       </div>
       <div className="transport">
-        {!metadata?.videoUrl && <audio ref={audioRef} src={metadata?.audioUrl} controls />}
-        {metadata && !metadata.videoUrl && (
+        {isMeshRender && (
+          <div className="playback-tools" aria-label="Playback controls">
+            <audio
+              ref={audioRef}
+              src={metadata?.audioUrl}
+              preload="auto"
+              onPause={() => setIsPlaying(false)}
+              onPlay={() => setIsPlaying(true)}
+              onEnded={() => {
+                setIsPlaying(false)
+                setCurrentTime(duration)
+              }}
+              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            />
+            <button
+              type="button"
+              className="icon-command"
+              aria-label={isPlaying ? 'Pause' : 'Play'}
+              title={isPlaying ? 'Pause' : 'Play'}
+              onClick={() => void togglePlayback()}
+              disabled={loadState !== 'Ready'}
+            >
+              {isPlaying ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
+              {isPlaying ? 'Pause' : 'Play'}
+            </button>
+            <label className="scrubber">
+              <span>Timeline</span>
+              <input
+                type="range"
+                min="0"
+                max={duration || 0}
+                step={metadata ? 1 / metadata.fps : 0.04}
+                value={Math.min(currentTime, duration)}
+                onChange={(event) => seekTo(Number(event.target.value))}
+                disabled={loadState !== 'Ready'}
+              />
+            </label>
+            <span className="timecode">{formatTime(currentTime)} / {formatTime(duration)}</span>
+          </div>
+        )}
+        {isMeshRender && (
           <div className="renderer-tools" aria-label="Mesh renderer controls">
             <label>
               <span>Material</span>
@@ -81,10 +155,18 @@ export function Renderer({ metadata }: RendererProps) {
         )}
         <div className="readout" aria-live="polite">
           {metadata
-            ? `${metadata.frameCount} frames · ${metadata.renderMode === 'gagavatar' ? 'colored video' : `${metadata.vertexCount} vertices`} · ${metadata.fps} fps`
+            ? `${metadata.renderMode === 'gagavatar' ? 'colored video' : `frame ${currentFrame}/${metadata.frameCount} · ${metadata.vertexCount} vertices`} · ${metadata.fps} fps`
             : 'No render loaded'}
         </div>
       </div>
     </section>
   )
+}
+
+function formatTime(value: number) {
+  const safeValue = Number.isFinite(value) ? Math.max(value, 0) : 0
+  const minutes = Math.floor(safeValue / 60)
+  const seconds = Math.floor(safeValue % 60)
+  const centiseconds = Math.floor((safeValue % 1) * 100)
+  return `${minutes}:${seconds.toString().padStart(2, '0')}.${centiseconds.toString().padStart(2, '0')}`
 }

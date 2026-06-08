@@ -331,13 +331,67 @@ input[type="range"] {
   border-top: 1px solid rgba(255, 250, 240, 0.22);
   background: rgba(16, 23, 21, 0.92);
   display: grid;
-  grid-template-columns: minmax(220px, 420px) minmax(340px, auto) 1fr;
+  grid-template-columns: minmax(320px, 520px) minmax(340px, auto) 1fr;
   gap: 16px;
   align-items: center;
 }
 
-audio {
-  width: 100%;
+.playback-tools {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(150px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.playback-tools audio {
+  display: none;
+}
+
+.playback-tools button {
+  min-height: 34px;
+  padding: 0 10px;
+  color: #fffaf0;
+  background: #17201d;
+  border-color: rgba(255, 250, 240, 0.32);
+  font-size: 12px;
+}
+
+.playback-tools button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.playback-tools button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.scrubber {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.scrubber span {
+  color: #d7d1c1;
+  font: 700 11px/1.2 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.scrubber input {
+  height: 34px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.timecode {
+  min-width: 116px;
+  color: #fffaf0;
+  font: 700 12px/1.2 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  text-align: right;
 }
 
 .renderer-tools {
@@ -429,6 +483,16 @@ audio {
 
   .transport {
     grid-template-columns: 1fr;
+  }
+
+  .playback-tools {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .timecode {
+    grid-column: 1 / -1;
+    min-width: 0;
+    text-align: left;
   }
 
   .renderer-tools {

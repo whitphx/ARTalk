@@ -45,6 +45,11 @@ The default `skin` material also consumes the region labels, but with a subdued
 palette intended for presentation rather than inspection. The explicit `region`
 material keeps the higher-contrast diagnostic colors.
 
+Playback controls are owned by the renderer shell while the hidden audio
+element remains the timing source for mesh frame selection. Scrubbing updates
+the audio clock directly, so paused and playing states use the same frame-sync
+path.
+
 ## Future Gaussian Splatting Extension
 
 GAGAvatar's server-side colored renderer is based on a learned Gaussian avatar,
