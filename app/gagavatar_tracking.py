@@ -168,16 +168,15 @@ def track_uploaded_avatar(image_path, output_dir, *, device="auto"):
 
 
 def _tracker_runtime():
-    repo_path_value = os.environ.get("GAGAVATAR_REPO")
+    default_repo_path = Path(__file__).resolve().parents[1] / "GAGAvatar"
+    repo_path_value = os.environ.get("GAGAVATAR_REPO", str(default_repo_path))
     python_executable = os.environ.get("GAGAVATAR_PYTHON", sys.executable)
-    if not repo_path_value:
-        raise RuntimeError(
-            "Set GAGAVATAR_REPO to a local GAGAvatar checkout before registering uploaded avatars"
-        )
     repo_path = Path(repo_path_value).expanduser()
     if not repo_path.exists():
         raise RuntimeError(
-            "Set GAGAVATAR_REPO to a local GAGAvatar checkout before registering uploaded avatars"
+            "GAGAvatar checkout not found. Initialize the GAGAvatar submodule "
+            "with `git submodule update --init --recursive`, or set "
+            "GAGAVATAR_REPO to a local GAGAvatar checkout."
         )
     return repo_path, python_executable
 

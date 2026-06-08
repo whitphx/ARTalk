@@ -179,6 +179,7 @@ Clone and checkout:
 git clone https://github.com/whitphx/ARTalk.git
 cd ARTalk
 git checkout web-based-renderer
+git submodule update --init --recursive
 ```
 
 Verify required assets:
@@ -192,6 +193,7 @@ Create the main env and install frontend deps:
 
 ```bash
 micromamba create -f environment-web.yml
+micromamba run -n artalk-web scripts/check_web_backend_env.py
 cd frontend
 pnpm install
 cd ..
@@ -223,47 +225,24 @@ http://127.0.0.1:5173/
 
 ## Uploaded Face Registration Setup
 
-Clone GAGAvatar separately:
-
-```bash
-mkdir -p ~/ghq/github.com/xg-chu
-cd ~/ghq/github.com/xg-chu
-git clone https://github.com/xg-chu/GAGAvatar.git
-```
+The web renderer uses the repo-local `GAGAvatar/` submodule by default. Set
+`GAGAVATAR_REPO` only when you intentionally want to use another checkout.
 
 Create the tracking env:
 
 ```bash
-micromamba create -y -n gagavatar-track -c conda-forge python=3.12 pip
-micromamba install -y -n gagavatar-track -c pytorch -c conda-forge \
-  pytorch torchvision torchaudio
-```
-
-Install tracker dependencies:
-
-```bash
-micromamba run -n gagavatar-track python -m pip install \
-  lmdb transformers==4.45.1 opencv-python face-alignment scikit-image scipy \
-  rich tqdm safetensors imageio av numba onnx onnx2torch omegaconf yacs \
-  lightning torchmetrics matplotlib
-```
-
-Install PyTorch3D on Apple Silicon:
-
-```bash
-CXXFLAGS='-Wno-invalid-specialization' \
-micromamba run -n gagavatar-track python -m pip install --no-build-isolation \
-  'git+https://github.com/facebookresearch/pytorch3d.git'
+micromamba create -f environment-gagavatar-track.yml
 ```
 
 Download GAGAvatar_track resources:
 
 ```bash
-cd ~/ghq/github.com/xg-chu/GAGAvatar/core/libs/GAGAvatar_track
+cd GAGAvatar/core/libs/GAGAvatar_track
 curl -L -o track_resources.tar \
   https://huggingface.co/xg-chu/GAGAvatar_track/resolve/main/track_resources.tar
 tar -xf track_resources.tar
 rm track_resources.tar
+cd ../../../..
 ```
 
 Confirm key resources:
@@ -274,13 +253,35 @@ ls assets/emica/EMICA-CVT_flame2020_notexture.pt
 ls assets/matting/stylematte_synth.pt
 ```
 
-Run backend with tracker env vars:
+Check the tracker environment:
 
 ```bash
-GAGAVATAR_REPO=~/ghq/github.com/xg-chu/GAGAvatar \
+micromamba run -n artalk-web scripts/check_gagavatar_tracker_env.py \
+  --python "$HOME/.local/share/mamba/envs/gagavatar-track/bin/python"
+```
+
+Run backend with the tracker Python configured:
+
+```bash
 GAGAVATAR_PYTHON="$HOME/.local/share/mamba/envs/gagavatar-track/bin/python" \
-micromamba run -n artalk-web \
-  uvicorn web_app:app --host 0.0.0.0 --port 8961
+micromamba run -n artalk-web scripts/run_web_backend.sh
+```
+
+## CUDA Colored Video Setup
+
+Install the GAGAvatar Gaussian rasterizer into the backend env:
+
+```bash
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=6.0 \
+  micromamba run -n artalk-web scripts/install_gagavatar_rasterizer.sh
+```
+
+Use the CUDA architecture for the target GPU. For example, Tesla P100 is `6.0`.
+
+Run the full backend preflight:
+
+```bash
+micromamba run -n artalk-web scripts/check_web_backend_env.py --full
 ```
 
 ## Validation

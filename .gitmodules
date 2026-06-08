@@ -1,0 +1,4 @@
+[submodule "GAGAvatar"]
+	path = GAGAvatar
+	url = https://github.com/whitphx/GAGAvatar.git
+	branch = codex/fix-render-gaussian-bg

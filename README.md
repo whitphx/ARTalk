@@ -39,6 +39,12 @@ git clone --recurse-submodules git@github.com:xg-chu/ARTalk.git
 cd ARTalk
 ```
 
+If you cloned without submodules, initialize GAGAvatar with:
+
+```
+git submodule update --init --recursive
+```
+
 ### Build environment
 
 ```
@@ -88,6 +94,11 @@ Create the web app environment:
 micromamba create -f environment-web.yml
 ```
 
+Check the backend environment:
+```
+micromamba run -n artalk-web scripts/check_web_backend_env.py
+```
+
 Run the API:
 ```
 micromamba run -n artalk-web scripts/run_web_backend.sh
@@ -119,11 +130,26 @@ The web renderer uses a hybrid avatar path:
   identities from `assets/GAGAvatar/tracked.pt`; their `shapecode` drives the
   browser mesh geometry.
 - Single-image avatar registration is exposed as a server-side API. Configure a
-  separate GAGAvatar tracking environment before using it:
+  separate GAGAvatar tracking environment before using it. The backend defaults
+  `GAGAVATAR_REPO` to the `./GAGAvatar` submodule, so only `GAGAVATAR_PYTHON`
+  is required for the default layout:
 
 ```
-export GAGAVATAR_REPO=/path/to/GAGAvatar
 export GAGAVATAR_PYTHON=/path/to/gagavatar-env/bin/python
+```
+
+Create the tracker environment with:
+
+```
+micromamba create -f environment-gagavatar-track.yml
+```
+
+Then place the GAGAvatar tracker resources under
+`GAGAvatar/core/libs/GAGAvatar_track/assets` and check the tracker environment:
+
+```
+micromamba run -n artalk-web scripts/check_gagavatar_tracker_env.py \
+  --python "$HOME/.local/share/mamba/envs/gagavatar-track/bin/python"
 ```
 
 The registration device selector supports `auto`; it resolves to CUDA only
@@ -140,13 +166,16 @@ Server-side colored video mode also requires CUDA and GAGAvatar's Gaussian
 rasterizer in the backend environment:
 
 ```
-CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
-  micromamba run -n artalk-web pip install --no-build-isolation --no-deps \
-  /path/to/diff-gaussian-rasterization
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=6.0 \
+  micromamba run -n artalk-web scripts/install_gagavatar_rasterizer.sh
 ```
 
 If `device=auto` selects CPU, check that the backend process can initialize
-CUDA with `torch.cuda.is_available()`.
+CUDA with `torch.cuda.is_available()`. Run the full backend preflight with:
+
+```
+micromamba run -n artalk-web scripts/check_web_backend_env.py --full
+```
 
 ### Command Line Usage
 
