@@ -91,6 +91,11 @@ first-frame diagnostics. Full Gaussian animation still needs a more complete
 per-frame contract for local Gaussian deformation, feature-channel rendering,
 camera sorting, and the upsampler-equivalent color path.
 
+The backend also exports `gaussians.transforms.f32` as one GAGAvatar
+`t_transform` 3x4 matrix per frame. The browser validates this artifact but
+does not apply it yet; the next step is to reconcile that transform with the
+interactive orbit camera without breaking inspection controls.
+
 The shader preview sorts its instanced splats back-to-front on the CPU when the
 camera changes, and on each animated head-frame update in `head` preview mode.
 This improves ordinary alpha blending for inspection, but it is still a

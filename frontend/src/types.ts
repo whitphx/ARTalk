@@ -53,9 +53,11 @@ export type AnimationMetadata = {
   gaussianColorChannels?: number
   gaussianHeadCount?: number
   gaussianHeadFrameCount?: number
+  gaussianTransformFrameCount?: number
   gaussianUrls?: {
     xyz: string
     headXyz?: string
+    transforms?: string
     colors: string
     opacities: string
     scales: string

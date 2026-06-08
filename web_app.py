@@ -360,6 +360,7 @@ def get_job_file(job_id: str, name: str):
         "gagavatar.mp4",
         "gaussians.xyz.f32",
         "gaussians.head_xyz.f32",
+        "gaussians.transforms.f32",
         "gaussians.colors.f32",
         "gaussians.opacities.f32",
         "gaussians.scales.f32",

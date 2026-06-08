@@ -91,16 +91,19 @@ class GAGAvatarVideoRenderer:
             self._reset_dynamic_avatar_state()
             first_batch = None
             head_frames = []
+            transform_frames = []
             motions = result.motions.to(self.device)
             for motion in motions:
                 batch = self.gagavatar.build_forward_batch(motion[None], self.flame_model)
                 if first_batch is None:
                     first_batch = batch
                 head_frames.append(batch["t_points"][0].detach().float().cpu())
+                transform_frames.append(batch["t_transform"][0].detach().float().cpu())
             if first_batch is None:
                 raise ValueError("Cannot export Gaussian snapshot for an empty animation.")
             gs_params = self.gagavatar.forward_gaussians(first_batch)
             head_positions = torch.stack(head_frames)
+            transforms = torch.stack(transform_frames)
             snapshot = {
                 "xyz": gs_params["xyz"][0].detach().float().cpu(),
                 "colors": gs_params["colors"][0].detach().float().cpu(),
@@ -111,15 +114,18 @@ class GAGAvatarVideoRenderer:
             for name, tensor in snapshot.items():
                 tensor.numpy().astype("float32", copy=False).tofile(output_dir / f"gaussians.{name}.f32")
             head_positions.numpy().astype("float32", copy=False).tofile(output_dir / "gaussians.head_xyz.f32")
+            transforms.numpy().astype("float32", copy=False).tofile(output_dir / "gaussians.transforms.f32")
         return {
             "gaussianCount": int(snapshot["xyz"].shape[0]),
             "gaussianFormat": "gagavatar-first-frame-f32-v1",
             "gaussianColorChannels": int(snapshot["colors"].shape[1]),
             "gaussianHeadCount": int(head_positions.shape[1]),
             "gaussianHeadFrameCount": int(head_positions.shape[0]),
+            "gaussianTransformFrameCount": int(transforms.shape[0]),
             "gaussianUrls": {
                 "xyz": "gaussians.xyz.f32",
                 "headXyz": "gaussians.head_xyz.f32",
+                "transforms": "gaussians.transforms.f32",
                 "colors": "gaussians.colors.f32",
                 "opacities": "gaussians.opacities.f32",
                 "scales": "gaussians.scales.f32",

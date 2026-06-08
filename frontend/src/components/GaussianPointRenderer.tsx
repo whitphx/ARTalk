@@ -112,9 +112,10 @@ export function GaussianPointRenderer({
     async function load() {
       onLoadState('Loading Gaussian buffers')
       const shouldLoadAnimatedHead = previewMode !== 'planes' && Boolean(metadata.gaussianUrls!.headXyz)
-      const [xyzResponse, headXyzResponse, colorResponse, opacityResponse, scaleResponse, rotationResponse] = await Promise.all([
+      const [xyzResponse, headXyzResponse, transformResponse, colorResponse, opacityResponse, scaleResponse, rotationResponse] = await Promise.all([
         fetch(metadata.gaussianUrls!.xyz),
         shouldLoadAnimatedHead ? fetch(metadata.gaussianUrls!.headXyz!) : Promise.resolve(null),
+        metadata.gaussianUrls!.transforms ? fetch(metadata.gaussianUrls!.transforms) : Promise.resolve(null),
         fetch(metadata.gaussianUrls!.colors),
         fetch(metadata.gaussianUrls!.opacities),
         fetch(metadata.gaussianUrls!.scales),
@@ -124,14 +125,18 @@ export function GaussianPointRenderer({
       if (headXyzResponse && !headXyzResponse.ok) {
         throw new Error(`Failed to load animated Gaussian head positions: ${headXyzResponse.status}`)
       }
+      if (transformResponse && !transformResponse.ok) {
+        throw new Error(`Failed to load Gaussian transforms: ${transformResponse.status}`)
+      }
       if (!colorResponse.ok) throw new Error(`Failed to load Gaussian colors: ${colorResponse.status}`)
       if (!opacityResponse.ok) throw new Error(`Failed to load Gaussian opacities: ${opacityResponse.status}`)
       if (!scaleResponse.ok) throw new Error(`Failed to load Gaussian scales: ${scaleResponse.status}`)
       if (!rotationResponse.ok) throw new Error(`Failed to load Gaussian rotations: ${rotationResponse.status}`)
 
-      const [xyzBuffer, headXyzBuffer, colorBuffer, opacityBuffer, scaleBuffer, rotationBuffer] = await Promise.all([
+      const [xyzBuffer, headXyzBuffer, transformBuffer, colorBuffer, opacityBuffer, scaleBuffer, rotationBuffer] = await Promise.all([
         xyzResponse.arrayBuffer(),
         headXyzResponse ? headXyzResponse.arrayBuffer() : Promise.resolve(null),
+        transformResponse ? transformResponse.arrayBuffer() : Promise.resolve(null),
         colorResponse.arrayBuffer(),
         opacityResponse.arrayBuffer(),
         scaleResponse.arrayBuffer(),
@@ -141,6 +146,7 @@ export function GaussianPointRenderer({
 
       const sourcePositions = new Float32Array(xyzBuffer)
       const animatedHeadPositions = headXyzBuffer ? new Float32Array(headXyzBuffer) : null
+      const gaussianTransforms = transformBuffer ? new Float32Array(transformBuffer) : null
       const sourceColors = new Float32Array(colorBuffer)
       const sourceOpacities = new Float32Array(opacityBuffer)
       const sourceScales = new Float32Array(scaleBuffer)
@@ -154,6 +160,12 @@ export function GaussianPointRenderer({
         animatedHeadPositions.length !== (metadata.gaussianHeadFrameCount ?? metadata.frameCount) * headCount * 3
       ) {
         throw new Error('Invalid animated Gaussian head position buffer size')
+      }
+      if (
+        gaussianTransforms &&
+        gaussianTransforms.length !== (metadata.gaussianTransformFrameCount ?? metadata.frameCount) * 12
+      ) {
+        throw new Error('Invalid Gaussian transform buffer size')
       }
       if (sourceColors.length !== count * colorChannels) throw new Error('Invalid Gaussian color buffer size')
       if (sourceOpacities.length !== count) throw new Error('Invalid Gaussian opacity buffer size')
