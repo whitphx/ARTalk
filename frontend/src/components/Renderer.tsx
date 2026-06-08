@@ -61,6 +61,7 @@ export function Renderer({ metadata }: RendererProps) {
         ) : isGaussianRender ? (
           <GaussianPointRenderer
             metadata={metadata}
+            audioRef={audioRef}
             previewMode={gaussianPreviewMode}
             onLoadState={setLoadState}
           />
@@ -88,7 +89,7 @@ export function Renderer({ metadata }: RendererProps) {
         )}
       </div>
       <div className="transport">
-        {isMeshRender && (
+        {(isMeshRender || isGaussianRender) && (
           <div className="playback-tools" aria-label="Playback controls">
             <audio
               ref={audioRef}

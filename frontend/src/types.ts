@@ -51,8 +51,11 @@ export type AnimationMetadata = {
   gaussianCount?: number
   gaussianFormat?: 'gagavatar-first-frame-f32-v1'
   gaussianColorChannels?: number
+  gaussianHeadCount?: number
+  gaussianHeadFrameCount?: number
   gaussianUrls?: {
     xyz: string
+    headXyz?: string
     colors: string
     opacities: string
     scales: string

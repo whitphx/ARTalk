@@ -60,6 +60,7 @@ class GAGAvatarVideoRenderer:
         video_path = output_dir / "gagavatar.mp4"
         with self._lock:
             self.gagavatar.set_tracked_avatar(get_tracked_avatar(avatar_id), avatar_id)
+            self._reset_dynamic_avatar_state()
             frames = []
             motions = result.motions.to(self.device)
             for motion in motions:
@@ -87,9 +88,19 @@ class GAGAvatarVideoRenderer:
         output_dir = Path(output_dir)
         with self._lock:
             self.gagavatar.set_tracked_avatar(get_tracked_avatar(avatar_id), avatar_id)
-            motion = result.motions[:1].to(self.device)
-            batch = self.gagavatar.build_forward_batch(motion, self.flame_model)
-            gs_params = self.gagavatar.forward_gaussians(batch)
+            self._reset_dynamic_avatar_state()
+            first_batch = None
+            head_frames = []
+            motions = result.motions.to(self.device)
+            for motion in motions:
+                batch = self.gagavatar.build_forward_batch(motion[None], self.flame_model)
+                if first_batch is None:
+                    first_batch = batch
+                head_frames.append(batch["t_points"][0].detach().float().cpu())
+            if first_batch is None:
+                raise ValueError("Cannot export Gaussian snapshot for an empty animation.")
+            gs_params = self.gagavatar.forward_gaussians(first_batch)
+            head_positions = torch.stack(head_frames)
             snapshot = {
                 "xyz": gs_params["xyz"][0].detach().float().cpu(),
                 "colors": gs_params["colors"][0].detach().float().cpu(),
@@ -99,12 +110,16 @@ class GAGAvatarVideoRenderer:
             }
             for name, tensor in snapshot.items():
                 tensor.numpy().astype("float32", copy=False).tofile(output_dir / f"gaussians.{name}.f32")
+            head_positions.numpy().astype("float32", copy=False).tofile(output_dir / "gaussians.head_xyz.f32")
         return {
             "gaussianCount": int(snapshot["xyz"].shape[0]),
             "gaussianFormat": "gagavatar-first-frame-f32-v1",
             "gaussianColorChannels": int(snapshot["colors"].shape[1]),
+            "gaussianHeadCount": int(head_positions.shape[1]),
+            "gaussianHeadFrameCount": int(head_positions.shape[0]),
             "gaussianUrls": {
                 "xyz": "gaussians.xyz.f32",
+                "headXyz": "gaussians.head_xyz.f32",
                 "colors": "gaussians.colors.f32",
                 "opacities": "gaussians.opacities.f32",
                 "scales": "gaussians.scales.f32",
@@ -116,6 +131,10 @@ class GAGAvatarVideoRenderer:
                 "size": list(self.gagavatar.cam_params["size"]),
             },
         }
+
+    def _reset_dynamic_avatar_state(self):
+        if hasattr(self.gagavatar, "upper_points"):
+            del self.gagavatar.upper_points
 
 
 _renderers = {}
