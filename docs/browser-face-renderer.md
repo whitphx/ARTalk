@@ -97,6 +97,11 @@ This improves ordinary alpha blending for inspection, but it is still a
 preview approximation. A production Gaussian renderer should move sorting and
 screen-space covariance handling to a purpose-built WebGL/WebGPU path.
 
+The preview shader also projects each Gaussian's scaled 3D axes into view
+space and draws a screen-facing ellipse from the resulting 2D covariance. This
+is closer to Gaussian Splatting than drawing world-oriented cards, but it still
+omits the CUDA rasterizer's exact projection, filtering, and tile pipeline.
+
 Before implementing `browser-gaussian`, inspect and define the data contract
 for `GAGAvatar.forward_expression(...)`:
 

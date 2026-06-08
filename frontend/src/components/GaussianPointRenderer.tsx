@@ -31,14 +31,33 @@ vec3 rotateByQuaternion(vec3 value, vec4 quaternion) {
   return value + 2.0 * cross(quaternion.xyz, cross(quaternion.xyz, value) + quaternion.w * value);
 }
 
+vec2 eigenVectorFor(float cov00, float cov01, float cov11, float eigenValue) {
+  vec2 axis = abs(cov01) > 0.000001
+    ? vec2(cov01, eigenValue - cov00)
+    : (cov00 >= cov11 ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+  return normalize(axis);
+}
+
 void main() {
   vColor = gaussianColor;
   vOpacity = gaussianOpacity;
   vQuad = position.xy;
-  vec3 axisX = rotateByQuaternion(vec3(gaussianScale.x, 0.0, 0.0), gaussianRotation);
-  vec3 axisY = rotateByQuaternion(vec3(0.0, gaussianScale.y, 0.0), gaussianRotation);
-  vec3 splatPosition = center + axisX * position.x * 2.6 + axisY * position.y * 2.6;
-  vec4 viewPosition = modelViewMatrix * vec4(splatPosition, 1.0);
+  vec3 axisX = mat3(modelViewMatrix) * rotateByQuaternion(vec3(gaussianScale.x, 0.0, 0.0), gaussianRotation);
+  vec3 axisY = mat3(modelViewMatrix) * rotateByQuaternion(vec3(0.0, gaussianScale.y, 0.0), gaussianRotation);
+  vec3 axisZ = mat3(modelViewMatrix) * rotateByQuaternion(vec3(0.0, 0.0, gaussianScale.z), gaussianRotation);
+  float cov00 = dot(vec3(axisX.x, axisY.x, axisZ.x), vec3(axisX.x, axisY.x, axisZ.x));
+  float cov01 = dot(vec3(axisX.x, axisY.x, axisZ.x), vec3(axisX.y, axisY.y, axisZ.y));
+  float cov11 = dot(vec3(axisX.y, axisY.y, axisZ.y), vec3(axisX.y, axisY.y, axisZ.y));
+  float trace = cov00 + cov11;
+  float discriminant = sqrt(max((cov00 - cov11) * (cov00 - cov11) + 4.0 * cov01 * cov01, 0.0));
+  float lambda0 = max((trace + discriminant) * 0.5, 0.000036);
+  float lambda1 = max((trace - discriminant) * 0.5, 0.000036);
+  vec2 majorDirection = eigenVectorFor(cov00, cov01, cov11, lambda0);
+  vec2 majorAxis = majorDirection * sqrt(lambda0);
+  vec2 minorAxis = vec2(-majorDirection.y, majorDirection.x) * sqrt(lambda1);
+  vec2 viewOffset = (majorAxis * position.x + minorAxis * position.y) * 2.6;
+  vec4 viewPosition = modelViewMatrix * vec4(center, 1.0);
+  viewPosition.xy += viewOffset;
   gl_Position = projectionMatrix * viewPosition;
 }
 `
