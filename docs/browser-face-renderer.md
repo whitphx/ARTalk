@@ -54,6 +54,11 @@ The mesh renderer runs a continuous animation loop only while audio is playing
 or orbit controls are damping. In paused states it redraws on explicit events
 such as seek, resize, camera reset, or material changes.
 
+During playback, the mesh renderer samples the audio clock at display refresh
+and linearly interpolates between adjacent generated vertex frames. The
+backend artifacts remain 25 fps, but browser playback avoids visibly stepping
+between those frames.
+
 ## Future Gaussian Splatting Extension
 
 GAGAvatar's server-side colored renderer is based on a learned Gaussian avatar,

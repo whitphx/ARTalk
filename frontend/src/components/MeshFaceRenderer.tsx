@@ -91,7 +91,7 @@ export function MeshFaceRenderer({
     const camera = new THREE.PerspectiveCamera(28, 1, 0.01, 100)
     const controls = new OrbitControls(camera, canvas)
     const group = new THREE.Group()
-    let activeFrame = -1
+    let activeFrameSample = ''
     cameraRef.current = camera
     controlsRef.current = controls
     groupRef.current = group
@@ -203,13 +203,10 @@ export function MeshFaceRenderer({
       function updateFrame() {
         if (disposed) return
         const audio = audioRef.current
-        const frame = audio
-          ? Math.min(animation.frameCount - 1, Math.floor(audio.currentTime * animation.fps))
-          : 0
-        if (frame !== activeFrame) {
-          activeFrame = frame
-          const offset = frame * frameSize
-          positions.set(allVertices.subarray(offset, offset + frameSize))
+        const frameSample = sampleAnimationFrame(audio?.currentTime ?? 0, animation.frameCount, animation.fps)
+        if (frameSample.key !== activeFrameSample) {
+          activeFrameSample = frameSample.key
+          writeInterpolatedFrame(positions, allVertices, frameSize, frameSample)
           geometry.attributes.position.needsUpdate = true
           geometry.computeVertexNormals()
         }
@@ -412,6 +409,48 @@ function applyColorAttribute(mesh: THREE.Mesh, materialMode: MeshMaterialMode) {
   if (colors instanceof THREE.BufferAttribute) {
     geometry.setAttribute('color', colors)
     colors.needsUpdate = true
+  }
+}
+
+type FrameSample = {
+  currentFrame: number
+  nextFrame: number
+  alpha: number
+  key: string
+}
+
+function sampleAnimationFrame(currentTime: number, frameCount: number, fps: number): FrameSample {
+  const maxFrame = Math.max(frameCount - 1, 0)
+  const framePosition = Math.min(Math.max(currentTime * fps, 0), maxFrame)
+  const currentFrame = Math.floor(framePosition)
+  const nextFrame = Math.min(currentFrame + 1, maxFrame)
+  const alpha = nextFrame === currentFrame ? 0 : framePosition - currentFrame
+  return {
+    currentFrame,
+    nextFrame,
+    alpha,
+    key: `${currentFrame}:${nextFrame}:${alpha.toFixed(4)}`,
+  }
+}
+
+function writeInterpolatedFrame(
+  positions: Float32Array,
+  allVertices: Float32Array,
+  frameSize: number,
+  sample: FrameSample,
+) {
+  const currentOffset = sample.currentFrame * frameSize
+  const currentFrame = allVertices.subarray(currentOffset, currentOffset + frameSize)
+  if (sample.alpha <= 0 || sample.currentFrame === sample.nextFrame) {
+    positions.set(currentFrame)
+    return
+  }
+
+  const nextOffset = sample.nextFrame * frameSize
+  const nextFrame = allVertices.subarray(nextOffset, nextOffset + frameSize)
+  const inverseAlpha = 1 - sample.alpha
+  for (let index = 0; index < frameSize; index += 1) {
+    positions[index] = currentFrame[index] * inverseAlpha + nextFrame[index] * sample.alpha
   }
 }
 
