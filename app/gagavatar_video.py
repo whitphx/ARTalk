@@ -13,6 +13,7 @@ from app.flame_model.FLAME import FLAMEModel
 
 GAGAVATAR_RENDER_MODE = "gagavatar"
 MESH_RENDER_MODE = "mesh"
+BROWSER_GAUSSIAN_RENDER_MODE = "browser-gaussian"
 
 
 def check_gagavatar_render_environment(device="auto"):
@@ -78,6 +79,43 @@ class GAGAvatarVideoRenderer:
                 "aac",
             )
         return video_path
+
+    @torch.no_grad()
+    def export_gaussian_snapshot(self, result, output_dir, *, avatar_id):
+        if avatar_id in (None, "", NEUTRAL_AVATAR_ID):
+            raise ValueError("Choose a GAGAvatar or uploaded avatar for browser Gaussian output.")
+        output_dir = Path(output_dir)
+        with self._lock:
+            self.gagavatar.set_tracked_avatar(get_tracked_avatar(avatar_id), avatar_id)
+            motion = result.motions[:1].to(self.device)
+            batch = self.gagavatar.build_forward_batch(motion, self.flame_model)
+            gs_params = self.gagavatar.forward_gaussians(batch)
+            snapshot = {
+                "xyz": gs_params["xyz"][0].detach().float().cpu(),
+                "colors": gs_params["colors"][0].detach().float().cpu(),
+                "opacities": gs_params["opacities"][0].detach().float().cpu(),
+                "scales": gs_params["scales"][0].detach().float().cpu(),
+                "rotations": gs_params["rotations"][0].detach().float().cpu(),
+            }
+            for name, tensor in snapshot.items():
+                tensor.numpy().astype("float32", copy=False).tofile(output_dir / f"gaussians.{name}.f32")
+        return {
+            "gaussianCount": int(snapshot["xyz"].shape[0]),
+            "gaussianFormat": "gagavatar-first-frame-f32-v1",
+            "gaussianColorChannels": int(snapshot["colors"].shape[1]),
+            "gaussianUrls": {
+                "xyz": "gaussians.xyz.f32",
+                "colors": "gaussians.colors.f32",
+                "opacities": "gaussians.opacities.f32",
+                "scales": "gaussians.scales.f32",
+                "rotations": "gaussians.rotations.f32",
+            },
+            "gaussianCamera": {
+                "focalX": float(self.gagavatar.cam_params["focal_x"]),
+                "focalY": float(self.gagavatar.cam_params["focal_y"]),
+                "size": list(self.gagavatar.cam_params["size"]),
+            },
+        }
 
 
 _renderers = {}

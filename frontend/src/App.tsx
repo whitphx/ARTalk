@@ -3,14 +3,16 @@ import type { ChangeEvent, FormEvent } from 'react'
 import { Check, Copy, ImageUp, Loader2, Mic2, Play, Upload, Waves } from 'lucide-react'
 import { fetchJson, sleep } from './api'
 import { Renderer } from './components/Renderer'
-import type { AnimationMetadata, Config, InputMode, JobState } from './types'
+import type { AnimationMetadata, Config, InputMode, JobState, RenderModeInfo } from './types'
 import './App.css'
 
 const DEFAULT_AVATARS = [{ id: 'mesh', label: 'Neutral mesh', source: 'mesh', previewUrl: null }]
 const DEFAULT_RENDER_MODES = [
   { id: 'mesh' as const, label: 'Browser mesh' },
+  { id: 'browser-gaussian' as const, label: 'Browser Gaussian (experimental)' },
   { id: 'gagavatar' as const, label: 'Colored video (server)' },
 ]
+type RenderModeId = RenderModeInfo['id']
 
 function normalizeConfig(nextConfig: Config): Config {
   return {
@@ -41,7 +43,7 @@ function App() {
   const [language, setLanguage] = useState('English')
   const [style, setStyle] = useState('default')
   const [avatar, setAvatar] = useState('mesh')
-  const [renderMode, setRenderMode] = useState<'mesh' | 'gagavatar'>('mesh')
+  const [renderMode, setRenderMode] = useState<RenderModeId>('mesh')
   const [clipLength, setClipLength] = useState(300)
   const [device, setDevice] = useState('auto')
   const [job, setJob] = useState<JobState | null>(null)
@@ -275,7 +277,7 @@ function App() {
             <span>Output</span>
             <select
               value={renderMode}
-              onChange={(event) => setRenderMode(event.target.value as 'mesh' | 'gagavatar')}
+              onChange={(event) => setRenderMode(event.target.value as RenderModeId)}
             >
               {config.renderModes.map((item) => (
                 <option key={item.id} value={item.id}>

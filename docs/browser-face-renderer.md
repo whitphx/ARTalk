@@ -72,6 +72,18 @@ the mesh fallback:
 - `server-video`: server-rendered GAGAvatar MP4
 - `browser-gaussian`: future browser-side Gaussian renderer
 
+The experimental `browser-gaussian` path starts by exporting a first-frame
+GAGAvatar Gaussian snapshot and displaying it with a Three.js shader splat
+preview. The preview consumes position, color, opacity, and scale buffers, but
+does not yet apply quaternion rotation or anisotropic covariance. This validates
+the data contract and browser loading path before integrating a true
+anisotropic Gaussian Splatting rasterizer.
+
+The diagnostic preview can show only the first 5,023 FLAME/head Gaussians, only
+the learned local feature-plane Gaussians, or both. GAGAvatar's browser path
+cannot match server video until it also handles 32-channel feature rendering and
+the neural upsampler output path.
+
 Before implementing `browser-gaussian`, inspect and define the data contract
 for `GAGAvatar.forward_expression(...)`:
 

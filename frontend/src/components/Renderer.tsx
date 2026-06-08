@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Loader2, Pause, Play, Radio, RotateCcw } from 'lucide-react'
 import type { AnimationMetadata } from '../types'
+import { GaussianPointRenderer, type GaussianPreviewMode } from './GaussianPointRenderer'
 import { MeshFaceRenderer, type MeshMaterialMode } from './MeshFaceRenderer'
 import { VideoRenderer } from './VideoRenderer'
 
@@ -14,9 +15,11 @@ export function Renderer({ metadata }: RendererProps) {
   const [materialMode, setMaterialMode] = useState<MeshMaterialMode>('skin')
   const [wireframe, setWireframe] = useState(false)
   const [cameraResetSignal, setCameraResetSignal] = useState(0)
+  const [gaussianPreviewMode, setGaussianPreviewMode] = useState<GaussianPreviewMode>('head')
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const isMeshRender = Boolean(metadata && !metadata.videoUrl)
+  const isMeshRender = metadata?.renderMode === 'mesh'
+  const isGaussianRender = metadata?.renderMode === 'browser-gaussian'
   const duration = metadata ? metadata.frameCount / metadata.fps : 0
   const currentFrame = metadata
     ? Math.min(metadata.frameCount, Math.floor(currentTime * metadata.fps) + 1)
@@ -55,6 +58,12 @@ export function Renderer({ metadata }: RendererProps) {
       <div className="viewport">
         {metadata?.videoUrl ? (
           <VideoRenderer metadata={metadata} onLoadState={setLoadState} />
+        ) : isGaussianRender ? (
+          <GaussianPointRenderer
+            metadata={metadata}
+            previewMode={gaussianPreviewMode}
+            onLoadState={setLoadState}
+          />
         ) : (
           <MeshFaceRenderer
             metadata={metadata}
@@ -153,9 +162,24 @@ export function Renderer({ metadata }: RendererProps) {
             </button>
           </div>
         )}
+        {isGaussianRender && (
+          <div className="renderer-tools" aria-label="Gaussian renderer controls">
+            <label>
+              <span>Preview</span>
+              <select
+                value={gaussianPreviewMode}
+                onChange={(event) => setGaussianPreviewMode(event.target.value as GaussianPreviewMode)}
+              >
+                <option value="head">head</option>
+                <option value="planes">planes</option>
+                <option value="all">all</option>
+              </select>
+            </label>
+          </div>
+        )}
         <div className="readout" aria-live="polite">
           {metadata
-            ? `${metadata.renderMode === 'gagavatar' ? 'colored video' : `frame ${currentFrame}/${metadata.frameCount} · ${metadata.vertexCount} vertices`} · ${metadata.fps} fps`
+            ? `${metadata.renderMode === 'gagavatar' ? 'colored video' : metadata.renderMode === 'browser-gaussian' ? `${metadata.gaussianCount ?? 0} gaussians` : `frame ${currentFrame}/${metadata.frameCount} · ${metadata.vertexCount} vertices`} · ${metadata.fps} fps`
             : 'No render loaded'}
         </div>
       </div>

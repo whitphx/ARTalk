@@ -8,7 +8,7 @@ export type AvatarInfo = {
 }
 
 export type RenderModeInfo = {
-  id: 'mesh' | 'gagavatar'
+  id: 'mesh' | 'browser-gaussian' | 'gagavatar'
   label: string
 }
 
@@ -19,7 +19,7 @@ export type Config = {
   languages: string[]
   defaultStyle: string
   defaultAvatar: string
-  defaultRenderMode: 'mesh' | 'gagavatar'
+  defaultRenderMode: 'mesh' | 'browser-gaussian' | 'gagavatar'
 }
 
 export type JobState = {
@@ -33,7 +33,7 @@ export type JobState = {
 }
 
 export type AnimationMetadata = {
-  renderMode: 'mesh' | 'gagavatar'
+  renderMode: 'mesh' | 'browser-gaussian' | 'gagavatar'
   fps: number
   sampleRate: number
   frameCount: number
@@ -48,5 +48,20 @@ export type AnimationMetadata = {
   audioUrl: string
   motionsUrl: string
   videoUrl: string | null
+  gaussianCount?: number
+  gaussianFormat?: 'gagavatar-first-frame-f32-v1'
+  gaussianColorChannels?: number
+  gaussianUrls?: {
+    xyz: string
+    colors: string
+    opacities: string
+    scales: string
+    rotations: string
+  }
+  gaussianCamera?: {
+    focalX: number
+    focalY: number
+    size: [number, number]
+  }
   avatarId: string
 }

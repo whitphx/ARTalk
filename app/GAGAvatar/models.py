@@ -66,6 +66,15 @@ class GAGAvatar(nn.Module):
 
     @torch.no_grad()
     def forward_expression(self, batch):
+        gs_params = self.forward_gaussians(batch)
+        gen_images = render_gaussian(
+            gs_params=gs_params, cam_matrix=batch['t_transform'], cam_params=self.cam_params
+        )['images']
+        sr_gen_images = self.upsampler(gen_images)
+        return self.add_water_mark(sr_gen_images.clamp(0, 1))
+
+    @torch.no_grad()
+    def forward_gaussians(self, batch):
         if not hasattr(self, '_gs_params'):
             batch_size = batch['f_image'].shape[0]
             f_image, f_planes = batch['f_image'], batch['f_planes']
@@ -90,13 +99,9 @@ class GAGAvatar(nn.Module):
             }
             self._gs_params = gs_params
         gs_params = self._gs_params
-        t_image, t_points, t_transform = batch['t_image'], batch['t_points'], batch['t_transform']
+        t_points = batch['t_points']
         gs_params['xyz'][:, :5023] = t_points
-        gen_images = render_gaussian(
-            gs_params=gs_params, cam_matrix=t_transform, cam_params=self.cam_params
-        )['images']
-        sr_gen_images = self.upsampler(gen_images)
-        return self.add_water_mark(sr_gen_images.clamp(0, 1))
+        return gs_params
 
     @torch.no_grad()
     def build_forward_batch(self, motion_code, flame_model):

@@ -17,6 +17,7 @@ from gtts import gTTS
 
 from app.avatar_registry import UPLOADED_AVATAR_ROOT, available_avatars
 from app.gagavatar_video import (
+    BROWSER_GAUSSIAN_RENDER_MODE,
     GAGAVATAR_RENDER_MODE,
     MESH_RENDER_MODE,
     check_gagavatar_render_environment,
@@ -137,12 +138,17 @@ def run_job(job_id, *, input_path, style_id, clip_length, device, avatar_id, ren
         )
         write_state(path, {"id": job_id, "status": "running", "stage": "writing mesh"})
         metadata = write_web_result(result, path)
-        if render_mode == GAGAVATAR_RENDER_MODE:
-            write_state(path, {"id": job_id, "status": "running", "stage": "rendering colored video"})
+        if render_mode in {GAGAVATAR_RENDER_MODE, BROWSER_GAUSSIAN_RENDER_MODE}:
             renderer = get_gagavatar_video_renderer(device)
-            video_path = renderer.render_video(result, path, avatar_id=avatar_id)
-            metadata["renderMode"] = GAGAVATAR_RENDER_MODE
-            metadata["videoUrl"] = video_path.name
+            if render_mode == GAGAVATAR_RENDER_MODE:
+                write_state(path, {"id": job_id, "status": "running", "stage": "rendering colored video"})
+                video_path = renderer.render_video(result, path, avatar_id=avatar_id)
+                metadata["renderMode"] = GAGAVATAR_RENDER_MODE
+                metadata["videoUrl"] = video_path.name
+            else:
+                write_state(path, {"id": job_id, "status": "running", "stage": "exporting gaussian snapshot"})
+                metadata["renderMode"] = BROWSER_GAUSSIAN_RENDER_MODE
+                metadata.update(renderer.export_gaussian_snapshot(result, path, avatar_id=avatar_id))
             write_web_metadata(metadata, path)
         write_state(
             path,
@@ -204,6 +210,7 @@ def config():
         "defaultAvatar": "mesh",
         "renderModes": [
             {"id": MESH_RENDER_MODE, "label": "Browser mesh"},
+            {"id": BROWSER_GAUSSIAN_RENDER_MODE, "label": "Browser Gaussian (experimental)"},
             {"id": GAGAVATAR_RENDER_MODE, "label": "Colored video (server)"},
         ],
         "defaultRenderMode": MESH_RENDER_MODE,
@@ -264,16 +271,16 @@ async def create_job(
     clip_length: int = Form(750),
     device: str = Form("auto"),
     avatar_id: str = Form("mesh"),
-    render_mode: Literal["mesh", "gagavatar"] = Form(MESH_RENDER_MODE),
+    render_mode: Literal["mesh", "browser-gaussian", "gagavatar"] = Form(MESH_RENDER_MODE),
     text: str | None = Form(None),
     text_language: str = Form("English"),
     audio_file: UploadFile | None = File(None),
 ):
-    if render_mode == GAGAVATAR_RENDER_MODE:
+    if render_mode in {GAGAVATAR_RENDER_MODE, BROWSER_GAUSSIAN_RENDER_MODE}:
         if avatar_id == "mesh":
             raise HTTPException(
                 status_code=400,
-                detail="Choose a registered or built-in GAGAvatar avatar for colored video output",
+                detail="Choose a registered or built-in GAGAvatar avatar for Gaussian output",
             )
         try:
             check_gagavatar_render_environment(device)
@@ -335,12 +342,28 @@ def get_metadata(job_id: str):
         "audioUrl": f"/api/jobs/{job_id}/audio.wav",
         "motionsUrl": f"/api/jobs/{job_id}/motions.pt",
         "videoUrl": f"/api/jobs/{job_id}/{metadata['videoUrl']}" if metadata.get("videoUrl") else None,
+        "gaussianUrls": {
+            key: f"/api/jobs/{job_id}/{value}"
+            for key, value in metadata.get("gaussianUrls", {}).items()
+        },
     }
 
 
 @app.get("/api/jobs/{job_id}/{name}")
 def get_job_file(job_id: str, name: str):
-    if name not in {"vertices.f32", "faces.i32", "regions.u8", "audio.wav", "motions.pt", "gagavatar.mp4"}:
+    if name not in {
+        "vertices.f32",
+        "faces.i32",
+        "regions.u8",
+        "audio.wav",
+        "motions.pt",
+        "gagavatar.mp4",
+        "gaussians.xyz.f32",
+        "gaussians.colors.f32",
+        "gaussians.opacities.f32",
+        "gaussians.scales.f32",
+        "gaussians.rotations.f32",
+    }:
         raise HTTPException(status_code=404, detail="File not found")
     file_path = job_dir(job_id) / name
     if not file_path.exists():
