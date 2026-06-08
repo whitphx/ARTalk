@@ -331,13 +331,70 @@ input[type="range"] {
   border-top: 1px solid rgba(255, 250, 240, 0.22);
   background: rgba(16, 23, 21, 0.92);
   display: grid;
-  grid-template-columns: minmax(260px, 520px) 1fr;
+  grid-template-columns: minmax(220px, 420px) minmax(340px, auto) 1fr;
   gap: 16px;
   align-items: center;
 }
 
 audio {
   width: 100%;
+}
+
+.renderer-tools {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.renderer-tools label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.renderer-tools label span {
+  color: #d7d1c1;
+  font: 700 11px/1.2 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.renderer-tools select {
+  min-width: 112px;
+  height: 34px;
+  padding: 5px 8px;
+  color: #fffaf0;
+  background: #17201d;
+  border-color: rgba(255, 250, 240, 0.32);
+  font-size: 13px;
+}
+
+.renderer-tools .toggle-field {
+  min-height: 34px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.renderer-tools .toggle-field input {
+  width: 16px;
+  height: 16px;
+  accent-color: #75e0bd;
+}
+
+.renderer-tools button {
+  min-height: 34px;
+  padding: 0 10px;
+  color: #fffaf0;
+  background: #17201d;
+  border-color: rgba(255, 250, 240, 0.32);
+  font-size: 12px;
+}
+
+.renderer-tools button svg {
+  width: 15px;
+  height: 15px;
 }
 
 .readout {
@@ -372,6 +429,10 @@ audio {
 
   .transport {
     grid-template-columns: 1fr;
+  }
+
+  .renderer-tools {
+    align-items: center;
   }
 
   .avatar-uploader {
