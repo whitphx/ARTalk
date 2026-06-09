@@ -28,6 +28,7 @@ import streamlit as st
 import torch
 from streamlit_webrtc import (
     WebRtcMode,
+    create_audio_sink_track,
     create_audio_source_track,
     create_video_source_track,
     webrtc_streamer,
@@ -84,9 +85,8 @@ if "pipeline" not in st.session_state:
 pipeline = st.session_state.pipeline
 
 
-def audio_frame_callback(frame):
+def on_inbound_audio_frame(frame):
     pipeline.push_audio_frame(frame)
-    return frame
 
 
 def on_audio_ended():
@@ -111,35 +111,31 @@ audio_source_track = create_audio_source_track(
     sample_rate=16000,
     ptime=0.020,
 )
+# Inbound mic tap. This consumes the browser's microphone track while
+# the independent source tracks below emit delayed, model-synced media
+# back to the same WebRTC component.
+audio_sink_track = create_audio_sink_track(
+    on_inbound_audio_frame,
+    key="artalk_audio_sink",
+    on_ended=on_audio_ended,
+)
 
 
 def on_change():
-    ctx = st.session_state["artalk-render"]
-    if not ctx.state.playing and not ctx.state.signalling:
+    ctx = st.session_state.get("artalk")
+    if ctx and not ctx.state.playing and not ctx.state.signalling:
         video_source_track.stop()
         audio_source_track.stop()
 
 
-# Inbound audio (browser mic → server). SENDONLY so the browser does
-# not receive audio back on this peer connection — the synced delayed
-# audio is delivered on the render-side connection below.
-audio_ctx = webrtc_streamer(
-    key="artalk-audio",
-    mode=WebRtcMode.SENDONLY,
-    audio_frame_callback=audio_frame_callback,
-    on_audio_ended=on_audio_ended,
-    media_stream_constraints={"audio": True, "video": False},
-    on_change=on_change,
-)
-
-# Outbound audio + video (server → browser). The audio source emits
-# the same input samples that produced the currently-rendered video
-# frames, so they share the model's ~4 s latency and stay in sync.
+# Single SENDRECV component: browser mic in (consumed by the audio
+# sink), delayed avatar video + synced audio out (the source tracks).
 webrtc_streamer(
-    key="artalk-render",
-    mode=WebRtcMode.RECVONLY,
+    key="artalk",
+    mode=WebRtcMode.SENDRECV,
     source_video_track=video_source_track,
     source_audio_track=audio_source_track,
-    media_stream_constraints={"audio": True, "video": True},
-    desired_playing_state=audio_ctx.state.playing,
+    sink_audio_track=audio_sink_track,
+    media_stream_constraints={"audio": True, "video": False},
+    on_change=on_change,
 )
