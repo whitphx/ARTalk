@@ -18,6 +18,12 @@ export type GaussianViewMode = 'orbit' | 'gagavatar'
 const GAGAVATAR_HEAD_GAUSSIAN_COUNT = 5023
 const TEMP_VECTOR_A = new THREE.Vector3()
 const TEMP_VECTOR_B = new THREE.Vector3()
+const TEMP_MATRIX_A = new THREE.Matrix4()
+const TEMP_MATRIX_B = new THREE.Matrix4()
+const TEMP_MATRIX_C = new THREE.Matrix4()
+const ALL_PREVIEW_HEAD_OPACITY_SCALE = 1.25
+const ALL_PREVIEW_PLANE_OPACITY_SCALE = 0.48
+const ALL_PREVIEW_HEAD_SCALE_BOOST = 1.12
 
 const SPLAT_VERTEX_SHADER = `
 attribute vec3 center;
@@ -25,8 +31,10 @@ attribute vec3 gaussianColor;
 attribute float gaussianOpacity;
 attribute vec3 gaussianScale;
 attribute vec4 gaussianRotation;
+attribute float gaussianUseMirrorView;
 uniform bool useGaussianViewTransform;
 uniform mat4 gaussianViewMatrix;
+uniform mat4 gaussianMirrorViewMatrix;
 varying vec3 vColor;
 varying float vOpacity;
 varying vec2 vQuad;
@@ -46,12 +54,13 @@ void main() {
   vColor = gaussianColor;
   vOpacity = gaussianOpacity;
   vQuad = position.xy;
+  mat4 activeGaussianViewMatrix = gaussianUseMirrorView > 0.5 ? gaussianMirrorViewMatrix : gaussianViewMatrix;
   vec3 worldAxisX = rotateByQuaternion(vec3(gaussianScale.x, 0.0, 0.0), gaussianRotation);
   vec3 worldAxisY = rotateByQuaternion(vec3(0.0, gaussianScale.y, 0.0), gaussianRotation);
   vec3 worldAxisZ = rotateByQuaternion(vec3(0.0, 0.0, gaussianScale.z), gaussianRotation);
-  vec3 axisX = useGaussianViewTransform ? mat3(gaussianViewMatrix) * worldAxisX : mat3(modelViewMatrix) * worldAxisX;
-  vec3 axisY = useGaussianViewTransform ? mat3(gaussianViewMatrix) * worldAxisY : mat3(modelViewMatrix) * worldAxisY;
-  vec3 axisZ = useGaussianViewTransform ? mat3(gaussianViewMatrix) * worldAxisZ : mat3(modelViewMatrix) * worldAxisZ;
+  vec3 axisX = useGaussianViewTransform ? mat3(activeGaussianViewMatrix) * worldAxisX : mat3(modelViewMatrix) * worldAxisX;
+  vec3 axisY = useGaussianViewTransform ? mat3(activeGaussianViewMatrix) * worldAxisY : mat3(modelViewMatrix) * worldAxisY;
+  vec3 axisZ = useGaussianViewTransform ? mat3(activeGaussianViewMatrix) * worldAxisZ : mat3(modelViewMatrix) * worldAxisZ;
   float cov00 = dot(vec3(axisX.x, axisY.x, axisZ.x), vec3(axisX.x, axisY.x, axisZ.x));
   float cov01 = dot(vec3(axisX.x, axisY.x, axisZ.x), vec3(axisX.y, axisY.y, axisZ.y));
   float cov11 = dot(vec3(axisX.y, axisY.y, axisZ.y), vec3(axisX.y, axisY.y, axisZ.y));
@@ -63,7 +72,7 @@ void main() {
   vec2 majorAxis = majorDirection * sqrt(lambda0);
   vec2 minorAxis = vec2(-majorDirection.y, majorDirection.x) * sqrt(lambda1);
   vec2 viewOffset = (majorAxis * position.x + minorAxis * position.y) * 2.6;
-  vec4 viewPosition = useGaussianViewTransform ? gaussianViewMatrix * vec4(center, 1.0) : modelViewMatrix * vec4(center, 1.0);
+  vec4 viewPosition = useGaussianViewTransform ? activeGaussianViewMatrix * vec4(center, 1.0) : modelViewMatrix * vec4(center, 1.0);
   viewPosition.xy += viewOffset;
   gl_Position = projectionMatrix * viewPosition;
 }
@@ -102,7 +111,7 @@ export function GaussianPointRenderer({
     let animationId = 0
     let resizeFrame = 0
     let resizeObserver: ResizeObserver | null = null
-    let activeHeadFrame = -1
+    let activeHeadSample = -1
     let activeTransformFrame = -1
     const canvas = canvasRef.current
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
@@ -189,16 +198,19 @@ export function GaussianPointRenderer({
       const previewOpacities = new Float32Array(previewCount)
       const previewScales = new Float32Array(previewCount * 3)
       const previewRotations = new Float32Array(previewCount * 4)
+      const previewMirrorViewFlags = new Float32Array(previewCount)
       const sortedCenters = new Float32Array(previewCount * 3)
       const sortedColors = new Float32Array(previewCount * 3)
       const sortedOpacities = new Float32Array(previewCount)
       const sortedScales = new Float32Array(previewCount * 3)
       const sortedRotations = new Float32Array(previewCount * 4)
+      const sortedMirrorViewFlags = new Float32Array(previewCount)
       const sortOrder = Array.from({ length: previewCount }, (_, index) => index)
       const depthValues = new Float32Array(previewCount)
       for (let index = 0; index < previewCount; index += 1) {
         const sourceIndex = range.start + index
         const sourceOffset = sourceIndex * 3
+        const isHeadGaussian = sourceIndex < headCount
         centers[index * 3] = sourcePositions[sourceOffset]
         centers[index * 3 + 1] = sourcePositions[sourceOffset + 1]
         centers[index * 3 + 2] = sourcePositions[sourceOffset + 2]
@@ -209,16 +221,18 @@ export function GaussianPointRenderer({
         previewColors[previewOffset] = sigmoid(sourceColors[colorOffset])
         previewColors[previewOffset + 1] = sigmoid(sourceColors[colorOffset + 1])
         previewColors[previewOffset + 2] = sigmoid(sourceColors[colorOffset + 2])
-        previewOpacities[index] = Math.max(opacity, 0.12)
-        previewScales[previewOffset] = Math.max(sourceScales[scaleOffset], 0.006)
-        previewScales[previewOffset + 1] = Math.max(sourceScales[scaleOffset + 1], 0.006)
-        previewScales[previewOffset + 2] = Math.max(sourceScales[scaleOffset + 2], 0.006)
+        previewOpacities[index] = weightedOpacity(opacity, previewMode, isHeadGaussian)
+        const scaleBoost = previewMode === 'all' && isHeadGaussian ? ALL_PREVIEW_HEAD_SCALE_BOOST : 1
+        previewScales[previewOffset] = Math.max(sourceScales[scaleOffset] * scaleBoost, 0.006)
+        previewScales[previewOffset + 1] = Math.max(sourceScales[scaleOffset + 1] * scaleBoost, 0.006)
+        previewScales[previewOffset + 2] = Math.max(sourceScales[scaleOffset + 2] * scaleBoost, 0.006)
         const rotationOffset = sourceIndex * 4
         const previewRotationOffset = index * 4
         previewRotations[previewRotationOffset] = sourceRotations[rotationOffset]
         previewRotations[previewRotationOffset + 1] = sourceRotations[rotationOffset + 1]
         previewRotations[previewRotationOffset + 2] = sourceRotations[rotationOffset + 2]
         previewRotations[previewRotationOffset + 3] = sourceRotations[rotationOffset + 3]
+        previewMirrorViewFlags[index] = isHeadGaussian ? 1 : 0
       }
 
       const geometry = new THREE.InstancedBufferGeometry()
@@ -238,6 +252,10 @@ export function GaussianPointRenderer({
         'gaussianRotation',
         new THREE.InstancedBufferAttribute(sortedRotations, 4).setUsage(THREE.DynamicDrawUsage),
       )
+      geometry.setAttribute(
+        'gaussianUseMirrorView',
+        new THREE.InstancedBufferAttribute(sortedMirrorViewFlags, 1).setUsage(THREE.DynamicDrawUsage),
+      )
       geometry.boundingSphere = boundingSphereForCenters(centers)
 
       const material = new THREE.ShaderMaterial({
@@ -246,6 +264,7 @@ export function GaussianPointRenderer({
         uniforms: {
           useGaussianViewTransform: { value: viewMode === 'gagavatar' },
           gaussianViewMatrix: { value: new THREE.Matrix4() },
+          gaussianMirrorViewMatrix: { value: new THREE.Matrix4() },
         },
         transparent: true,
         blending: THREE.NormalBlending,
@@ -291,13 +310,14 @@ export function GaussianPointRenderer({
           audioRef.current?.currentTime ?? 0,
           metadata.fps,
           headCount,
-          activeHeadFrame,
-          (frame) => {
-            activeHeadFrame = frame
+          activeHeadSample,
+          (sample) => {
+            activeHeadSample = sample
           },
         )
         const transformFrameChanged = updateGaussianViewTransform(
           material.uniforms.gaussianViewMatrix.value as THREE.Matrix4,
+          material.uniforms.gaussianMirrorViewMatrix.value as THREE.Matrix4,
           gaussianTransforms,
           audioRef.current?.currentTime ?? 0,
           metadata.fps,
@@ -310,14 +330,33 @@ export function GaussianPointRenderer({
         sortRequested = sortRequested || headFrameChanged || transformFrameChanged || controls.update()
         if (sortRequested) {
           sortGaussianInstances(
-            { centers, colors: previewColors, opacities: previewOpacities, scales: previewScales, rotations: previewRotations },
-            { centers: sortedCenters, colors: sortedColors, opacities: sortedOpacities, scales: sortedScales, rotations: sortedRotations },
+            {
+              centers,
+              colors: previewColors,
+              opacities: previewOpacities,
+              scales: previewScales,
+              rotations: previewRotations,
+              mirrorViewFlags: previewMirrorViewFlags,
+            },
+            {
+              centers: sortedCenters,
+              colors: sortedColors,
+              opacities: sortedOpacities,
+              scales: sortedScales,
+              rotations: sortedRotations,
+              mirrorViewFlags: sortedMirrorViewFlags,
+            },
             geometry,
             sortOrder,
             depthValues,
             camera,
             points.position,
-            viewMode === 'gagavatar' ? (material.uniforms.gaussianViewMatrix.value as THREE.Matrix4) : null,
+            viewMode === 'gagavatar'
+              ? {
+                  native: material.uniforms.gaussianViewMatrix.value as THREE.Matrix4,
+                  mirror: material.uniforms.gaussianMirrorViewMatrix.value as THREE.Matrix4,
+                }
+              : null,
           )
           sortRequested = false
         }
@@ -366,6 +405,13 @@ function gaussianPreviewRange(previewMode: GaussianPreviewMode, count: number, h
   return { start: 0, end: count }
 }
 
+function weightedOpacity(opacity: number, previewMode: GaussianPreviewMode, isHeadGaussian: boolean) {
+  const baseOpacity = Math.max(opacity, 0.12)
+  if (previewMode !== 'all') return baseOpacity
+  const scale = isHeadGaussian ? ALL_PREVIEW_HEAD_OPACITY_SCALE : ALL_PREVIEW_PLANE_OPACITY_SCALE
+  return Math.min(baseOpacity * scale, 1)
+}
+
 function buildUnitQuadVertices() {
   return new Float32Array([
     -1, -1, 0,
@@ -396,21 +442,37 @@ function updateAnimatedHeadCenters(
   currentTime: number,
   fps: number,
   headCount: number,
-  activeFrame: number,
-  setActiveFrame: (frame: number) => void,
+  activeSample: number,
+  setActiveSample: (sample: number) => void,
 ) {
   if (!animatedHeadPositions) return false
   const frameSize = headCount * 3
   const frameCount = animatedHeadPositions.length / frameSize
-  const frame = Math.min(frameCount - 1, Math.max(0, Math.floor(currentTime * fps)))
-  if (frame === activeFrame) return false
-  centers.set(animatedHeadPositions.subarray(frame * frameSize, (frame + 1) * frameSize))
-  setActiveFrame(frame)
+  const framePosition = Math.min(frameCount - 1, Math.max(0, currentTime * fps))
+  const sample = Math.round(framePosition * 1000)
+  if (sample === activeSample) return false
+  const frame = Math.floor(framePosition)
+  const nextFrame = Math.min(frameCount - 1, frame + 1)
+  const mix = framePosition - frame
+  const frameOffset = frame * frameSize
+  const nextFrameOffset = nextFrame * frameSize
+  if (mix === 0) {
+    for (let index = 0; index < frameSize; index += 1) {
+      centers[index] = animatedHeadPositions[frameOffset + index]
+    }
+  } else {
+    for (let index = 0; index < frameSize; index += 1) {
+      const value = animatedHeadPositions[frameOffset + index]
+      centers[index] = value + (animatedHeadPositions[nextFrameOffset + index] - value) * mix
+    }
+  }
+  setActiveSample(sample)
   return true
 }
 
 function updateGaussianViewTransform(
-  matrix: THREE.Matrix4,
+  nativeMatrix: THREE.Matrix4,
+  mirrorMatrix: THREE.Matrix4,
   transforms: Float32Array | null,
   currentTime: number,
   fps: number,
@@ -423,12 +485,15 @@ function updateGaussianViewTransform(
   const frameCount = transforms.length / frameSize
   const frame = Math.min(frameCount - 1, Math.max(0, Math.floor(currentTime * fps)))
   if (frame === activeFrame) return false
-  writeGaussianViewMatrix(matrix, transforms, frame)
+  writeGaussianViewMatrix(nativeMatrix, transforms, frame, false)
+  invertViewDelta(nativeMatrix, transforms, false)
+  writeGaussianViewMatrix(mirrorMatrix, transforms, frame, true)
+  invertViewDelta(mirrorMatrix, transforms, true)
   setActiveFrame(frame)
   return true
 }
 
-function writeGaussianViewMatrix(matrix: THREE.Matrix4, transforms: Float32Array, frame: number) {
+function writeGaussianViewMatrix(matrix: THREE.Matrix4, transforms: Float32Array, frame: number, mirrorViewX: boolean) {
   const offset = frame * 12
   const r00 = transforms[offset]
   const r01 = transforms[offset + 1]
@@ -442,12 +507,21 @@ function writeGaussianViewMatrix(matrix: THREE.Matrix4, transforms: Float32Array
   const r21 = transforms[offset + 9]
   const r22 = transforms[offset + 10]
   const tz = transforms[offset + 11]
+  const xSign = mirrorViewX ? 1 : -1
   matrix.set(
-    -r00, -r01, -r02, -tx,
+    xSign * r00, xSign * r01, xSign * r02, xSign * tx,
     r10, r11, r12, ty,
     -r20, -r21, -r22, -tz,
     0, 0, 0, 1,
   )
+}
+
+function invertViewDelta(matrix: THREE.Matrix4, transforms: Float32Array, mirrorViewX: boolean) {
+  TEMP_MATRIX_A.copy(matrix)
+  writeGaussianViewMatrix(TEMP_MATRIX_B, transforms, 0, mirrorViewX)
+  TEMP_MATRIX_C.copy(TEMP_MATRIX_A).invert()
+  matrix.multiplyMatrices(TEMP_MATRIX_B, TEMP_MATRIX_C)
+  matrix.multiply(TEMP_MATRIX_B)
 }
 
 type GaussianInstanceAttributes = {
@@ -456,6 +530,12 @@ type GaussianInstanceAttributes = {
   opacities: Float32Array
   scales: Float32Array
   rotations: Float32Array
+  mirrorViewFlags: Float32Array
+}
+
+type GaussianViewMatrices = {
+  native: THREE.Matrix4
+  mirror: THREE.Matrix4
 }
 
 function sortGaussianInstances(
@@ -466,11 +546,11 @@ function sortGaussianInstances(
   depthValues: Float32Array,
   camera: THREE.Camera,
   objectOffset: THREE.Vector3,
-  gaussianViewMatrix: THREE.Matrix4 | null,
+  gaussianViewMatrices: GaussianViewMatrices | null,
 ) {
   const cameraPosition = TEMP_VECTOR_A
   const cameraDirection = TEMP_VECTOR_B
-  if (!gaussianViewMatrix) {
+  if (!gaussianViewMatrices) {
     camera.getWorldPosition(cameraPosition)
     camera.getWorldDirection(cameraDirection)
   }
@@ -481,7 +561,9 @@ function sortGaussianInstances(
     const worldX = source.centers[offset] + objectOffset.x
     const worldY = source.centers[offset + 1] + objectOffset.y
     const worldZ = source.centers[offset + 2] + objectOffset.z
-    if (gaussianViewMatrix) {
+    if (gaussianViewMatrices) {
+      const gaussianViewMatrix =
+        source.mirrorViewFlags[index] > 0.5 ? gaussianViewMatrices.mirror : gaussianViewMatrices.native
       cameraPosition.set(source.centers[offset], source.centers[offset + 1], source.centers[offset + 2])
       cameraPosition.applyMatrix4(gaussianViewMatrix)
       depthValues[index] = -cameraPosition.z
@@ -501,6 +583,7 @@ function sortGaussianInstances(
     target.opacities[targetIndex] = source.opacities[sourceIndex]
     copyVector3(source.scales, target.scales, sourceIndex, targetIndex)
     copyVector4(source.rotations, target.rotations, sourceIndex, targetIndex)
+    target.mirrorViewFlags[targetIndex] = source.mirrorViewFlags[sourceIndex]
   }
 
   markAttributeUpdated(geometry, 'center')
@@ -508,6 +591,7 @@ function sortGaussianInstances(
   markAttributeUpdated(geometry, 'gaussianOpacity')
   markAttributeUpdated(geometry, 'gaussianScale')
   markAttributeUpdated(geometry, 'gaussianRotation')
+  markAttributeUpdated(geometry, 'gaussianUseMirrorView')
 }
 
 function copyVector3(source: Float32Array, target: Float32Array, sourceIndex: number, targetIndex: number) {
