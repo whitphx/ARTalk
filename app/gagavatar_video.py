@@ -2,6 +2,7 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import importlib.util
+import os
 import threading
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from app.flame_model.FLAME import FLAMEModel
 GAGAVATAR_RENDER_MODE = "gagavatar"
 MESH_RENDER_MODE = "mesh"
 BROWSER_GAUSSIAN_RENDER_MODE = "browser-gaussian"
+UPSAMPLER_PREVIEW_FRAME_COUNT = 32
+UPSAMPLER_PREVIEW_FRAME_COUNT_ENV = "ARTALK_UPSAMPLER_PREVIEW_FRAMES"
 
 
 def check_gagavatar_render_environment(device="auto"):
@@ -86,24 +89,54 @@ class GAGAvatarVideoRenderer:
         if avatar_id in (None, "", NEUTRAL_AVATAR_ID):
             raise ValueError("Choose a GAGAvatar or uploaded avatar for browser Gaussian output.")
         output_dir = Path(output_dir)
+        reference_video_path = output_dir / "gaussians.reference.mp4"
         with self._lock:
             self.gagavatar.set_tracked_avatar(get_tracked_avatar(avatar_id), avatar_id)
             self._reset_dynamic_avatar_state()
             first_batch = None
+            first_gs_params = None
             head_frames = []
             transform_frames = []
+            reference_frames = []
             motions = result.motions.to(self.device)
-            for motion in motions:
+            upsampler_preview_indices = _sample_frame_indices(int(motions.shape[0]), _upsampler_preview_frame_count())
+            upsampler_preview_index_set = set(upsampler_preview_indices)
+            upsampler_input_files = []
+            upsampler_input_shape = None
+            from app.GAGAvatar.utils_renderer import render_gaussian
+
+            for frame_index, motion in enumerate(motions):
                 batch = self.gagavatar.build_forward_batch(motion[None], self.flame_model)
                 if first_batch is None:
                     first_batch = batch
                 head_frames.append(batch["t_points"][0].detach().float().cpu())
                 transform_frames.append(batch["t_transform"][0].detach().float().cpu())
+                reference_frames.append(self.gagavatar.forward_expression(batch).cpu()[0])
+                if frame_index in upsampler_preview_index_set:
+                    gs_params_frame = self.gagavatar.forward_gaussians(batch)
+                    if frame_index == 0:
+                        first_gs_params = gs_params_frame
+                    upsampler_input = (
+                        render_gaussian(
+                            gs_params=gs_params_frame,
+                            cam_matrix=batch["t_transform"],
+                            cam_params=self.gagavatar.cam_params,
+                        )["images"][0].detach().to(torch.float16).cpu()
+                    )
+                    upsampler_input_shape = list(upsampler_input.shape)
+                    upsampler_input_file = f"gaussians.upsampler_input_{len(upsampler_input_files):03d}.f16"
+                    upsampler_input.numpy().tofile(output_dir / upsampler_input_file)
+                    if not upsampler_input_files:
+                        upsampler_input.numpy().tofile(output_dir / "gaussians.upsampler_input_first.f16")
+                    upsampler_input_files.append(upsampler_input_file)
             if first_batch is None:
                 raise ValueError("Cannot export Gaussian snapshot for an empty animation.")
-            gs_params = self.gagavatar.forward_gaussians(first_batch)
+            gs_params = first_gs_params if first_gs_params is not None else self.gagavatar.forward_gaussians(first_batch)
+            if not upsampler_input_files or upsampler_input_shape is None:
+                raise ValueError("Cannot export upsampler preview for an empty animation.")
             head_positions = torch.stack(head_frames)
             transforms = torch.stack(transform_frames)
+            reference_video_frames = torch.stack(reference_frames) * 255.0
             snapshot = {
                 "xyz": gs_params["xyz"][0].detach().float().cpu(),
                 "colors": gs_params["colors"][0].detach().float().cpu(),
@@ -113,12 +146,21 @@ class GAGAvatarVideoRenderer:
             }
             for name, tensor in snapshot.items():
                 tensor.numpy().astype("float32", copy=False).tofile(output_dir / f"gaussians.{name}.f32")
+            from app.utils_videos import write_video
+
+            write_video(reference_video_frames, str(reference_video_path), result.fps)
             head_positions.numpy().astype("float32", copy=False).tofile(output_dir / "gaussians.head_xyz.f32")
             transforms.numpy().astype("float32", copy=False).tofile(output_dir / "gaussians.transforms.f32")
         return {
             "gaussianCount": int(snapshot["xyz"].shape[0]),
             "gaussianFormat": "gagavatar-first-frame-f32-v1",
             "gaussianColorChannels": int(snapshot["colors"].shape[1]),
+            "gaussianUpsamplerInput": {
+                "dtype": "float16",
+                "shape": upsampler_input_shape,
+                "frameCount": len(upsampler_input_files),
+                "frameIndices": upsampler_preview_indices,
+            },
             "gaussianHeadCount": int(head_positions.shape[1]),
             "gaussianHeadFrameCount": int(head_positions.shape[0]),
             "gaussianTransformFrameCount": int(transforms.shape[0]),
@@ -126,6 +168,9 @@ class GAGAvatarVideoRenderer:
                 "xyz": "gaussians.xyz.f32",
                 "headXyz": "gaussians.head_xyz.f32",
                 "transforms": "gaussians.transforms.f32",
+                "referenceVideo": "gaussians.reference.mp4",
+                "upsamplerInputFirst": "gaussians.upsampler_input_first.f16",
+                "upsamplerInputFrames": upsampler_input_files,
                 "colors": "gaussians.colors.f32",
                 "opacities": "gaussians.opacities.f32",
                 "scales": "gaussians.scales.f32",
@@ -161,6 +206,29 @@ def _select_render_device(device):
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _sample_frame_indices(frame_count, max_frames):
+    if frame_count <= 0 or max_frames <= 0:
+        return []
+    if frame_count <= max_frames:
+        return list(range(frame_count))
+    if max_frames == 1:
+        return [0]
+    return sorted({
+        round(index * (frame_count - 1) / (max_frames - 1))
+        for index in range(max_frames)
+    })
+
+
+def _upsampler_preview_frame_count():
+    raw_value = os.environ.get(UPSAMPLER_PREVIEW_FRAME_COUNT_ENV)
+    if raw_value is None:
+        return UPSAMPLER_PREVIEW_FRAME_COUNT
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return UPSAMPLER_PREVIEW_FRAME_COUNT
 
 
 def _cuda_diagnostics():

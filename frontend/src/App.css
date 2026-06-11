@@ -300,6 +300,66 @@ input[type="range"] {
   background: #101715;
 }
 
+.gaussian-comparison {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 1;
+  width: clamp(112px, 15vw, 180px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.gaussian-reference {
+  margin: 0;
+  border: 1px solid rgba(255, 250, 240, 0.42);
+  background: rgba(16, 23, 21, 0.82);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.24);
+}
+
+.gaussian-reference video,
+.gaussian-reference canvas {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  background: #101715;
+}
+
+.gaussian-reference figcaption {
+  padding: 6px 8px;
+  color: #fffaf0;
+  font: 700 11px/1.2 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.gaussian-upsampler-preview figcaption {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.gaussian-upsampler-preview button {
+  min-height: 28px;
+  padding: 0 8px;
+  color: #101715;
+  background: #75e0bd;
+  border-color: rgba(255, 250, 240, 0.42);
+  font-size: 11px;
+}
+
+.gaussian-upsampler-preview button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.gaussian-upsampler-preview span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .empty-state,
 .loading-state {
   position: absolute;

@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Loader2, Pause, Play, Radio, RotateCcw } from 'lucide-react'
 import type { AnimationMetadata } from '../types'
-import { GaussianPointRenderer, type GaussianPreviewMode, type GaussianViewMode } from './GaussianPointRenderer'
+import {
+  GaussianPointRenderer,
+  type GaussianPreviewMode,
+  type GaussianViewMode,
+} from './GaussianPointRenderer'
+import { GaussianUpsamplerPreview } from './GaussianUpsamplerPreview'
 import { MeshFaceRenderer, type MeshMaterialMode } from './MeshFaceRenderer'
 import { VideoRenderer } from './VideoRenderer'
 
@@ -11,6 +16,7 @@ type RendererProps = {
 
 export function Renderer({ metadata }: RendererProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const referenceVideoRef = useRef<HTMLVideoElement | null>(null)
   const [loadState, setLoadState] = useState('Waiting for animation data')
   const [materialMode, setMaterialMode] = useState<MeshMaterialMode>('skin')
   const [wireframe, setWireframe] = useState(false)
@@ -30,22 +36,44 @@ export function Renderer({ metadata }: RendererProps) {
 
   useEffect(() => {
     const audio = audioRef.current
+    const referenceVideo = referenceVideoRef.current
     audio?.pause()
     if (audio) audio.currentTime = 0
+    referenceVideo?.pause()
+    if (referenceVideo) referenceVideo.currentTime = 0
     setCurrentTime(0)
     setIsPlaying(false)
   }, [metadata?.audioUrl])
 
+  useEffect(() => {
+    if (!isPlaying) return
+    let frameId = 0
+    const update = () => {
+      const audio = audioRef.current
+      if (audio) {
+        setCurrentTime(audio.currentTime)
+        syncReferenceVideo(audio.currentTime)
+      }
+      frameId = window.requestAnimationFrame(update)
+    }
+    frameId = window.requestAnimationFrame(update)
+    return () => window.cancelAnimationFrame(frameId)
+  }, [isPlaying])
+
   async function togglePlayback() {
     const audio = audioRef.current
+    const referenceVideo = referenceVideoRef.current
     if (!audio || !metadata) return
     if (!audio.paused) {
       audio.pause()
+      referenceVideo?.pause()
       setIsPlaying(false)
       return
     }
     if (audio.currentTime >= duration) audio.currentTime = 0
+    syncReferenceVideo(audio.currentTime, true)
     await audio.play()
+    await referenceVideo?.play().catch(() => undefined)
     setIsPlaying(true)
   }
 
@@ -53,7 +81,16 @@ export function Renderer({ metadata }: RendererProps) {
     const nextTime = Math.min(Math.max(value, 0), duration)
     const audio = audioRef.current
     if (audio) audio.currentTime = nextTime
+    syncReferenceVideo(nextTime, true)
     setCurrentTime(nextTime)
+  }
+
+  function syncReferenceVideo(time: number, force = false) {
+    const referenceVideo = referenceVideoRef.current
+    if (!referenceVideo || !Number.isFinite(time)) return
+    if (force || Math.abs(referenceVideo.currentTime - time) > 0.12) {
+      referenceVideo.currentTime = Math.min(Math.max(time, 0), referenceVideo.duration || duration || time)
+    }
   }
 
   return (
@@ -85,6 +122,26 @@ export function Renderer({ metadata }: RendererProps) {
             <span>No animation loaded.</span>
           </div>
         )}
+        {isGaussianRender && metadata.gaussianUrls?.referenceVideo && (
+          <div className="gaussian-comparison">
+            <figure className="gaussian-reference">
+              <video
+                ref={referenceVideoRef}
+                src={metadata.gaussianUrls.referenceVideo}
+                muted
+                playsInline
+                preload="auto"
+                aria-label="Server-rendered GAGAvatar reference video"
+              />
+              <figcaption>Reference</figcaption>
+            </figure>
+            {(metadata.gaussianUrls.upsamplerInputFrames ??
+              metadata.gaussianUrls.upsamplerInputs ??
+              metadata.gaussianUrls.upsamplerInputFirst) && (
+              <GaussianUpsamplerPreview metadata={metadata} currentTime={currentTime} />
+            )}
+          </div>
+        )}
         {metadata && loadState !== 'Ready' && (
           <div className="loading-state">
             <Loader2 aria-hidden="true" />
@@ -103,9 +160,13 @@ export function Renderer({ metadata }: RendererProps) {
               onPlay={() => setIsPlaying(true)}
               onEnded={() => {
                 setIsPlaying(false)
+                referenceVideoRef.current?.pause()
                 setCurrentTime(duration)
               }}
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+              onTimeUpdate={(event) => {
+                setCurrentTime(event.currentTarget.currentTime)
+                syncReferenceVideo(event.currentTarget.currentTime)
+              }}
             />
             <button
               type="button"

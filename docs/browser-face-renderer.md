@@ -85,11 +85,18 @@ the neural upsampler output path.
 
 The spike now exports per-frame positions for the first 5,023 head Gaussians.
 That keeps the lightest useful animated path in the browser: the `head`
-preview can follow the generated audio motion, and `all` preview animates that
-head subset while the learned local feature-plane Gaussians remain static
-first-frame diagnostics. Full Gaussian animation still needs a more complete
-per-frame contract for local Gaussian deformation, feature-channel rendering,
-camera sorting, and the upsampler-equivalent color path.
+preview can follow the generated audio motion with interpolated centers between
+generated frames, and `all` preview animates that head subset while the learned
+local feature-plane Gaussians remain static first-frame diagnostics. Full
+Gaussian animation still needs a more complete per-frame contract for local
+Gaussian deformation, feature-channel rendering, camera sorting, and the
+upsampler-equivalent color path.
+
+Because the current `all` preview combines animated head Gaussians with
+first-frame static local feature-plane Gaussians, the browser slightly boosts
+the head subset and reduces feature-plane opacity in that composite mode. This
+keeps mouth and expression motion inspectable while the browser path lacks the
+server renderer's 32-channel rasterization and neural upsampler.
 
 The backend also exports `gaussians.transforms.f32` as one GAGAvatar
 `t_transform` 3x4 matrix per frame. The browser validates this artifact but
@@ -97,6 +104,18 @@ keeps the interactive `orbit` view as the default inspection mode. The
 experimental `GAGAvatar` view applies the per-frame transform in the shader so
 the browser preview can be compared against the server renderer's camera
 convention.
+
+In `GAGAvatar` view, the browser renderer applies two internal transform
+conventions: local feature-plane Gaussians use the native exported view matrix,
+while the animated head subset uses the X-mirrored view matrix. Both matrices
+preserve the first frame and invert the per-frame transform delta. This matches
+the server-rendered reference most closely in current visual checks and avoids
+exposing the earlier diagnostic X controls in the UI.
+
+This is still an experimental browser convention. Before treating it as a
+stable artifact contract, verify whether the inverse transform delta belongs in
+the exported `gaussians.transforms.f32` data or only in the browser's mapping
+from GAGAvatar's rasterizer convention to Three.js view space.
 
 The shader preview sorts its instanced splats back-to-front on the CPU when the
 camera changes, and on each animated head-frame update in `head` preview mode.
@@ -108,6 +127,38 @@ The preview shader also projects each Gaussian's scaled 3D axes into view
 space and draws a screen-facing ellipse from the resulting 2D covariance. This
 is closer to Gaussian Splatting than drawing world-oriented cards, but it still
 omits the CUDA rasterizer's exact projection, filtering, and tile pipeline.
+
+Color is still diagnostic. The browser splat preview maps the first three of
+GAGAvatar's 32 learned feature channels to RGB, while the server renderer
+rasterizes all 32 channels and runs the neural upsampler. Browser Gaussian jobs
+therefore export `gaussians.reference.mp4`, a synced server-side GAGAvatar
+reference video, so color and camera experiments can be compared against the
+real target while the browser color path is still approximate.
+
+Browser Gaussian jobs also export a capped sampled sequence of separate
+`gaussians.upsampler_input_*.f16` files, plus the compatibility first-frame
+file `gaussians.upsampler_input_first.f16`. Each sample is the real 32-channel
+`512 x 512` rasterizer output consumed by GAGAvatar's `StyleUNet` upsampler.
+This is a feasibility artifact for the future browser upsampler path: it lets
+us validate ONNX inference and playback synchronization against exact server
+tensors without first implementing browser-side 32-channel Gaussian
+rasterization. Exporting every frame in this raw format is not practical for
+normal playback because one float16 frame is about 16 MB.
+
+The default spike export samples 32 frames, which is about 512 MB of raw
+upsampler input per generated job. The frames are split into individual files
+so the browser can fetch and run the ONNX upsampler incrementally instead of
+waiting for one large transfer. Set `ARTALK_UPSAMPLER_PREVIEW_FRAMES` on the
+backend process to lower or raise that validation budget.
+
+The helper script `scripts/export_gagavatar_upsampler_onnx.py` exports the
+trained `StyleUNet` to `frontend/public/models/gagavatar_upsampler.onnx`.
+Export currently expects the backend Python environment to have `onnx`
+installed, and browser inference still needs a runtime such as
+`onnxruntime-web`. The first browser validation target should run this ONNX
+model on the sampled upsampler tensor sequence, compare those frames with
+`gaussians.reference.mp4`, and use the first-frame file as a compatibility
+fallback for older jobs.
 
 Before implementing `browser-gaussian`, inspect and define the data contract
 for `GAGAvatar.forward_expression(...)`:

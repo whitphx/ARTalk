@@ -343,7 +343,11 @@ def get_metadata(job_id: str):
         "motionsUrl": f"/api/jobs/{job_id}/motions.pt",
         "videoUrl": f"/api/jobs/{job_id}/{metadata['videoUrl']}" if metadata.get("videoUrl") else None,
         "gaussianUrls": {
-            key: f"/api/jobs/{job_id}/{value}"
+            key: (
+                [f"/api/jobs/{job_id}/{item}" for item in value]
+                if isinstance(value, list)
+                else f"/api/jobs/{job_id}/{value}"
+            )
             for key, value in metadata.get("gaussianUrls", {}).items()
         },
     }
@@ -361,16 +365,29 @@ def get_job_file(job_id: str, name: str):
         "gaussians.xyz.f32",
         "gaussians.head_xyz.f32",
         "gaussians.transforms.f32",
+        "gaussians.reference.mp4",
+        "gaussians.upsampler_input_first.f16",
+        "gaussians.upsampler_inputs.f16",
         "gaussians.colors.f32",
         "gaussians.opacities.f32",
         "gaussians.scales.f32",
         "gaussians.rotations.f32",
-    }:
+    } and not _is_upsampler_input_frame_file(name):
         raise HTTPException(status_code=404, detail="File not found")
     file_path = job_dir(job_id) / name
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not ready")
     return FileResponse(file_path)
+
+
+def _is_upsampler_input_frame_file(name: str):
+    prefix = "gaussians.upsampler_input_"
+    suffix = ".f16"
+    return (
+        name.startswith(prefix)
+        and name.endswith(suffix)
+        and name[len(prefix) : -len(suffix)].isdigit()
+    )
 
 
 if FRONTEND_DIST.exists():

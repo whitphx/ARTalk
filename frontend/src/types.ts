@@ -51,6 +51,12 @@ export type AnimationMetadata = {
   gaussianCount?: number
   gaussianFormat?: 'gagavatar-first-frame-f32-v1'
   gaussianColorChannels?: number
+  gaussianUpsamplerInput?: {
+    dtype: 'float16'
+    shape: [number, number, number]
+    frameCount: number
+    frameIndices?: number[]
+  }
   gaussianHeadCount?: number
   gaussianHeadFrameCount?: number
   gaussianTransformFrameCount?: number
@@ -58,6 +64,10 @@ export type AnimationMetadata = {
     xyz: string
     headXyz?: string
     transforms?: string
+    referenceVideo?: string
+    upsamplerInputFirst?: string
+    upsamplerInputs?: string
+    upsamplerInputFrames?: string[]
     colors: string
     opacities: string
     scales: string
