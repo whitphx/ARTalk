@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 FPS = 25
-RENDER_RES = (512, 512)
+DEFAULT_RENDER_RES = 512
 AUDIO_OUT_PTIME = 0.020
 AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 
@@ -46,7 +46,16 @@ AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 class ARTalkPipeline:
     """Per-session pipeline holding the streaming model state."""
 
-    def __init__(self, *, model, flame_model, mesh_renderer, device, style_motion=None):
+    def __init__(
+        self,
+        *,
+        model,
+        flame_model,
+        mesh_renderer,
+        device,
+        style_motion=None,
+        render_res=DEFAULT_RENDER_RES,
+    ):
         self._device = device
         self._streamer = ARTalkStreamer(model, style_motion=style_motion)
         self._smoother = CausalSavgolSmoother()
@@ -75,8 +84,11 @@ class ARTalkPipeline:
         self._pending_audio_for_output: list[np.ndarray] = []
         self._stop_event = threading.Event()
         self._dbg_calls = 0
-        h, w = RENDER_RES
-        self._initial_placeholder = np.zeros((h, w, 3), dtype=np.uint8)
+        self._render_res = int(render_res)
+        self._initial_placeholder = np.zeros(
+            (self._render_res, self._render_res, 3),
+            dtype=np.uint8,
+        )
         self._placeholder = self._initial_placeholder
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
