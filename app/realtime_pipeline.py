@@ -55,15 +55,22 @@ class ARTalkPipeline:
         device,
         style_motion=None,
         render_res=DEFAULT_RENDER_RES,
+        renderer_mode="mesh",
+        gagavatar=None,
+        gagavatar_flame=None,
+        shape_id=None,
     ):
         self._device = device
         self._streamer = ARTalkStreamer(model, style_motion=style_motion)
         self._smoother = CausalSavgolSmoother()
         self._renderer = StreamingRenderer(
-            mode="mesh",
+            mode=renderer_mode,
             basic_vae=model.basic_vae,
             flame_model=flame_model,
             mesh_renderer=mesh_renderer,
+            gagavatar=gagavatar,
+            gagavatar_flame=gagavatar_flame,
+            shape_id=shape_id,
             device=device,
         )
         self._resampler = av.AudioResampler(

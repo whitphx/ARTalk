@@ -51,6 +51,8 @@ from app.realtime_pipeline import ARTalkPipeline
 logger = logging.getLogger(__name__)
 
 OPENAI_REALTIME_SAMPLE_RATE = 24000
+DEFAULT_APPEARANCE = "mesh"
+DEFAULT_STYLE = "default"
 DEFAULT_REALTIME_MODEL = "gpt-realtime"
 DEFAULT_REALTIME_VOICE = "alloy"
 REALTIME_VOICES = [
@@ -85,6 +87,59 @@ def load_model_and_renderer(device, render_res):
     flame = FLAMEModel(n_shape=300, n_exp=100, scale=1.0, no_lmks=True).to(device)
     mesh = RenderMesh(image_size=render_res, faces=flame.get_faces(), scale=1.0)
     return model, flame, mesh
+
+
+@st.cache_data
+def list_gagavatar_ids():
+    try:
+        tracked = torch.load(
+            "./assets/GAGAvatar/tracked.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+    except FileNotFoundError:
+        return []
+    return sorted(tracked.keys())
+
+
+@st.cache_data
+def list_style_ids():
+    style_dir = "./assets/style_motion"
+    if not os.path.isdir(style_dir):
+        return []
+    return sorted(
+        os.path.splitext(name)[0]
+        for name in os.listdir(style_dir)
+        if name.endswith(".pt")
+    )
+
+
+@st.cache_data
+def load_style_motion(style_id):
+    if style_id == DEFAULT_STYLE:
+        return None
+    style_motion = torch.load(
+        f"./assets/style_motion/{style_id}.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    if tuple(style_motion.shape) != (50, 106):
+        raise ValueError(f"Invalid style motion shape: {tuple(style_motion.shape)}")
+    return style_motion
+
+
+@st.cache_resource
+def load_gagavatar(device):
+    from app.GAGAvatar import GAGAvatar
+
+    gagavatar = GAGAvatar().to(device)
+    gagavatar_flame = FLAMEModel(
+        n_shape=300,
+        n_exp=100,
+        scale=5.0,
+        no_lmks=True,
+    ).to(device)
+    return gagavatar, gagavatar_flame
 
 
 class OpenAIRealtimeBridge:
@@ -328,6 +383,21 @@ model, flame_model, mesh_renderer = load_model_and_renderer(
 )
 
 with st.sidebar:
+    gagavatar_ids = list_gagavatar_ids()
+    style_ids = list_style_ids()
+    appearance = st.selectbox(
+        "Appearance",
+        [DEFAULT_APPEARANCE] + gagavatar_ids,
+        index=0,
+    )
+    default_style_index = (
+        style_ids.index("natural_0") + 1 if "natural_0" in style_ids else 0
+    )
+    style_id = st.selectbox(
+        "Style",
+        [DEFAULT_STYLE] + style_ids,
+        index=default_style_index,
+    )
     mode = st.radio("Mode", ["Loopback", "Interactive"], horizontal=True)
     api_key = ""
     realtime_model = DEFAULT_REALTIME_MODEL
@@ -372,7 +442,20 @@ def stop_bridge() -> None:
 
 
 def get_pipeline() -> ARTalkPipeline:
-    config = (args.device, mode, args.render_res)
+    renderer_mode = "mesh" if appearance == DEFAULT_APPEARANCE else "gagavatar"
+    style_motion = load_style_motion(style_id)
+    render_res = args.render_res if renderer_mode == "mesh" else 512
+    gagavatar = None
+    gagavatar_flame = None
+    if renderer_mode == "gagavatar":
+        gagavatar, gagavatar_flame = load_gagavatar(args.device)
+    config = (
+        args.device,
+        mode,
+        render_res,
+        appearance,
+        style_id,
+    )
     pipeline = st.session_state.get(PIPELINE_KEY)
     if pipeline is not None and st.session_state.get(PIPELINE_CONFIG_KEY) != config:
         pipeline.stop()
@@ -383,7 +466,12 @@ def get_pipeline() -> ARTalkPipeline:
             flame_model=flame_model,
             mesh_renderer=mesh_renderer,
             device=args.device,
-            render_res=args.render_res,
+            style_motion=style_motion,
+            render_res=render_res,
+            renderer_mode=renderer_mode,
+            gagavatar=gagavatar,
+            gagavatar_flame=gagavatar_flame,
+            shape_id=appearance if renderer_mode == "gagavatar" else None,
         )
         st.session_state[PIPELINE_KEY] = pipeline
         st.session_state[PIPELINE_CONFIG_KEY] = config
@@ -412,7 +500,11 @@ if mode == "Interactive" and not api_key:
     st.stop()
 
 
-pipeline = get_pipeline()
+try:
+    pipeline = get_pipeline()
+except Exception as exc:
+    st.error(f"Failed to initialize ARTalk avatar pipeline: {exc}")
+    st.stop()
 
 
 def get_bridge() -> OpenAIRealtimeBridge:
