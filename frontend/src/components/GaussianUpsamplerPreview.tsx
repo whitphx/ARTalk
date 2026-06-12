@@ -13,6 +13,24 @@ type RenderedUpsamplerFrames = {
 
 type OrtModule = typeof import('onnxruntime-web')
 type OrtSession = import('onnxruntime-web').InferenceSession
+type UpsamplerRuntimeInfo = {
+  crossOriginIsolated: boolean
+  numThreads: number
+}
+type UpsamplerFrameResult = {
+  image: ImageData
+  inputMs: number
+  inferenceMs: number
+  outputMs: number
+}
+type UpsamplerStats = {
+  startedAt: number
+  fetchMs: number
+  inputMs: number
+  inferenceMs: number
+  outputMs: number
+  runtime: UpsamplerRuntimeInfo
+}
 type UpsamplerRun = {
   abortController: AbortController
   id: number
@@ -20,15 +38,17 @@ type UpsamplerRun = {
 
 const UPSAMPLER_MODEL_URL = '/models/gagavatar_upsampler.onnx'
 const MIN_BUFFERED_FRAMES = 3
+const MAX_WASM_THREADS = 4
 
 let ortModulePromise: Promise<OrtModule> | null = null
 let sessionPromise: Promise<OrtSession> | null = null
+let runtimeInfo: UpsamplerRuntimeInfo | null = null
 let nextRunId = 0
 
 async function loadOrt() {
   if (!ortModulePromise) {
     ortModulePromise = import('onnxruntime-web').then((ort) => {
-      ort.env.wasm.numThreads = 1
+      runtimeInfo = configureOrtRuntime(ort)
       return ort
     })
   }
@@ -98,6 +118,7 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
     try {
       const [ort, session] = await Promise.all([loadOrt(), loadUpsamplerSession()])
       const renderedFrames: RenderedUpsamplerFrames = { frameIndices: [], images: [] }
+      const stats = createUpsamplerStats()
       renderedFramesRef.current = renderedFrames
       if (inputFrameUrls?.length) {
         await runFrameUrlSequence({
@@ -112,6 +133,7 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
           signal: run.abortController.signal,
           getCurrentFrame: () => Math.max(0, Math.floor(currentTimeRef.current * metadata.fps)),
           onMessage: setMessage,
+          stats,
         })
       } else if (inputUrl) {
         await runCombinedInputSequence({
@@ -127,11 +149,12 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
           signal: run.abortController.signal,
           getCurrentFrame: () => Math.max(0, Math.floor(currentTimeRef.current * metadata.fps)),
           onMessage: setMessage,
+          stats,
         })
       }
       if (runRef.current?.id !== run.id || run.abortController.signal.aborted) return
       setStatus('ready')
-      setMessage(`Ready ${renderedFrames.images.length}/${inputFrameCount}`)
+      setMessage(statusMessage('Ready', renderedFrames.images.length, inputFrameCount, stats))
     } catch (error) {
       if (run.abortController.signal.aborted) return
       setStatus('failed')
@@ -164,6 +187,7 @@ async function runFrameUrlSequence({
   signal,
   getCurrentFrame,
   onMessage,
+  stats,
 }: {
   urls: string[]
   frameIndices: number[]
@@ -176,19 +200,25 @@ async function runFrameUrlSequence({
   signal: AbortSignal
   getCurrentFrame: () => number
   onMessage: (message: string) => void
+  stats: UpsamplerStats
 }) {
   const completed = new Set<number>()
   while (completed.size < urls.length) {
     throwIfAborted(signal)
     const index = pickNextSampleIndex(urls.length, frameIndices, completed, getCurrentFrame())
-    onMessage(statusMessage('Loading', renderedFrames.images.length, urls.length))
+    onMessage(statusMessage('Loading', renderedFrames.images.length, urls.length, stats))
+    const fetchStart = performance.now()
     const inputBuffer = await fetchArrayBuffer(urls[index], signal)
+    stats.fetchMs += performance.now() - fetchStart
     throwIfAborted(signal)
-    onMessage(statusMessage('Running', renderedFrames.images.length, urls.length))
-    const image = await runUpsamplerFrame(ort, session, new Uint16Array(inputBuffer), inputShape)
+    onMessage(statusMessage('Running', renderedFrames.images.length, urls.length, stats))
+    const result = await runUpsamplerFrame(ort, session, new Uint16Array(inputBuffer), inputShape)
+    stats.inputMs += result.inputMs
+    stats.inferenceMs += result.inferenceMs
+    stats.outputMs += result.outputMs
     throwIfAborted(signal)
     appendRenderedFrame({
-      image,
+      image: result.image,
       frameIndex: frameIndices[index] ?? index,
       renderedFrames,
       canvas,
@@ -196,7 +226,7 @@ async function runFrameUrlSequence({
       fps,
     })
     completed.add(index)
-    onMessage(statusMessage('Ready', renderedFrames.images.length, urls.length))
+    onMessage(statusMessage('Ready', renderedFrames.images.length, urls.length, stats))
   }
 }
 
@@ -213,6 +243,7 @@ async function runCombinedInputSequence({
   signal,
   getCurrentFrame,
   onMessage,
+  stats,
 }: {
   url: string
   frameCount: number
@@ -226,9 +257,12 @@ async function runCombinedInputSequence({
   signal: AbortSignal
   getCurrentFrame: () => number
   onMessage: (message: string) => void
+  stats: UpsamplerStats
 }) {
   onMessage('Loading')
+  const fetchStart = performance.now()
   const values = new Uint16Array(await fetchArrayBuffer(url, signal))
+  stats.fetchMs += performance.now() - fetchStart
   const frameValueCount = inputShape.reduce((total, value) => total * value, 1)
   if (values.length < frameValueCount * frameCount) {
     throw new Error(`Unexpected upsampler input size: ${values.length}`)
@@ -237,12 +271,15 @@ async function runCombinedInputSequence({
   while (completed.size < frameCount) {
     throwIfAborted(signal)
     const index = pickNextSampleIndex(frameCount, frameIndices, completed, getCurrentFrame())
-    onMessage(statusMessage('Running', renderedFrames.images.length, frameCount))
+    onMessage(statusMessage('Running', renderedFrames.images.length, frameCount, stats))
     const frameValues = values.subarray(index * frameValueCount, (index + 1) * frameValueCount)
-    const image = await runUpsamplerFrame(ort, session, frameValues, inputShape)
+    const result = await runUpsamplerFrame(ort, session, frameValues, inputShape)
+    stats.inputMs += result.inputMs
+    stats.inferenceMs += result.inferenceMs
+    stats.outputMs += result.outputMs
     throwIfAborted(signal)
     appendRenderedFrame({
-      image,
+      image: result.image,
       frameIndex: frameIndices[index] ?? index,
       renderedFrames,
       canvas,
@@ -250,6 +287,7 @@ async function runCombinedInputSequence({
       fps,
     })
     completed.add(index)
+    onMessage(statusMessage('Ready', renderedFrames.images.length, frameCount, stats))
   }
 }
 
@@ -258,12 +296,23 @@ async function runUpsamplerFrame(
   session: OrtSession,
   frameValues: Uint16Array,
   inputShape: [number, number, number],
-) {
+): Promise<UpsamplerFrameResult> {
+  const inputStart = performance.now()
   const input = float16ToFloat32(frameValues)
   const tensor = new ort.Tensor('float32', input, [1, ...inputShape])
+  const inputMs = performance.now() - inputStart
+  const inferenceStart = performance.now()
   const output = await session.run({ [session.inputNames[0]]: tensor })
+  const inferenceMs = performance.now() - inferenceStart
+  const outputStart = performance.now()
   const rgb = output[session.outputNames[0]]
-  return rgbTensorToImageData(rgb.data as Float32Array, rgb.dims)
+  const image = rgbTensorToImageData(rgb.data as Float32Array, rgb.dims)
+  return {
+    image,
+    inputMs,
+    inferenceMs,
+    outputMs: performance.now() - outputStart,
+  }
 }
 
 function appendRenderedFrame({
@@ -323,12 +372,45 @@ function throwIfAborted(signal: AbortSignal) {
   }
 }
 
-function statusMessage(phase: string, readyCount: number, totalCount: number) {
-  const bufferTarget = Math.min(MIN_BUFFERED_FRAMES, totalCount)
-  if (readyCount < bufferTarget) {
-    return `Buffering ${readyCount}/${bufferTarget}`
+function configureOrtRuntime(ort: OrtModule): UpsamplerRuntimeInfo {
+  const isolated = Boolean(globalThis.crossOriginIsolated)
+  const hardwareConcurrency = navigator.hardwareConcurrency || 1
+  const numThreads = isolated ? Math.min(MAX_WASM_THREADS, Math.max(2, Math.ceil(hardwareConcurrency / 2))) : 1
+  ort.env.wasm.numThreads = numThreads
+  return {
+    crossOriginIsolated: isolated,
+    numThreads,
   }
-  return `${phase} ${readyCount}/${totalCount}`
+}
+
+function createUpsamplerStats(): UpsamplerStats {
+  return {
+    startedAt: performance.now(),
+    fetchMs: 0,
+    inputMs: 0,
+    inferenceMs: 0,
+    outputMs: 0,
+    runtime: runtimeInfo ?? {
+      crossOriginIsolated: Boolean(globalThis.crossOriginIsolated),
+      numThreads: 1,
+    },
+  }
+}
+
+function statusMessage(phase: string, readyCount: number, totalCount: number, stats: UpsamplerStats) {
+  const bufferTarget = Math.min(MIN_BUFFERED_FRAMES, totalCount)
+  const runtime = `wasm ${stats.runtime.numThreads}t${stats.runtime.crossOriginIsolated ? '' : ' no-isolation'}`
+  if (readyCount > 0) {
+    const elapsedSeconds = Math.max((performance.now() - stats.startedAt) / 1000, 0.001)
+    const fps = readyCount / elapsedSeconds
+    const measuredMs = (stats.fetchMs + stats.inputMs + stats.inferenceMs + stats.outputMs) / readyCount
+    const inferenceMs = stats.inferenceMs / readyCount
+    return `${phase} ${readyCount}/${totalCount} · ${fps.toFixed(1)} fps · ${measuredMs.toFixed(0)} ms/f · infer ${inferenceMs.toFixed(0)} ms · ${runtime}`
+  }
+  if (readyCount < bufferTarget) {
+    return `Buffering ${readyCount}/${bufferTarget} · ${runtime}`
+  }
+  return `${phase} ${readyCount}/${totalCount} · ${runtime}`
 }
 
 function float16ToFloat32(values: Uint16Array) {

@@ -7,6 +7,10 @@ const apiTarget = process.env.ARTALK_API_TARGET ?? 'http://127.0.0.1:8961'
 export default defineConfig({
   plugins: [react()],
   server: {
+    headers: {
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cross-Origin-Opener-Policy': 'same-origin',
+    },
     proxy: {
       '/api': apiTarget,
     },

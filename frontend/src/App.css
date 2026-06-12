@@ -305,7 +305,7 @@ input[type="range"] {
   top: 18px;
   right: 18px;
   z-index: 1;
-  width: clamp(112px, 15vw, 180px);
+  width: clamp(150px, 18vw, 240px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -355,9 +355,9 @@ input[type="range"] {
 }
 
 .gaussian-upsampler-preview span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .empty-state,
