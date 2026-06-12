@@ -16,6 +16,8 @@ type OrtSession = import('onnxruntime-web').InferenceSession
 type UpsamplerRuntimeInfo = {
   crossOriginIsolated: boolean
   numThreads: number
+  provider: 'webgpu' | 'wasm'
+  fallbackReason?: string
 }
 type UpsamplerFrameResult = {
   image: ImageData
@@ -47,7 +49,7 @@ let nextRunId = 0
 
 async function loadOrt() {
   if (!ortModulePromise) {
-    ortModulePromise = import('onnxruntime-web').then((ort) => {
+    ortModulePromise = loadPreferredOrtModule().then((ort) => {
       runtimeInfo = configureOrtRuntime(ort)
       return ort
     })
@@ -58,10 +60,7 @@ async function loadOrt() {
 async function loadUpsamplerSession() {
   const ort = await loadOrt()
   if (!sessionPromise) {
-    sessionPromise = ort.InferenceSession.create(UPSAMPLER_MODEL_URL, {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
-    })
+    sessionPromise = createUpsamplerSession(ort)
   }
   return sessionPromise
 }
@@ -380,7 +379,51 @@ function configureOrtRuntime(ort: OrtModule): UpsamplerRuntimeInfo {
   return {
     crossOriginIsolated: isolated,
     numThreads,
+    provider: hasWebGpuSupport() ? 'webgpu' : 'wasm',
+    fallbackReason: hasWebGpuSupport() ? undefined : 'WebGPU unavailable',
   }
+}
+
+async function loadPreferredOrtModule(): Promise<OrtModule> {
+  if (hasWebGpuSupport()) return import('onnxruntime-web/webgpu')
+  return import('onnxruntime-web')
+}
+
+async function createUpsamplerSession(ort: OrtModule): Promise<OrtSession> {
+  if (hasWebGpuSupport()) {
+    try {
+      const session = await ort.InferenceSession.create(UPSAMPLER_MODEL_URL, {
+        executionProviders: [{ name: 'webgpu', preferredLayout: 'NCHW' }],
+        graphOptimizationLevel: 'all',
+      })
+      runtimeInfo = {
+        ...(runtimeInfo ?? configureOrtRuntime(ort)),
+        provider: 'webgpu',
+        fallbackReason: undefined,
+      }
+      return session
+    } catch (error) {
+      runtimeInfo = {
+        ...(runtimeInfo ?? configureOrtRuntime(ort)),
+        provider: 'wasm',
+        fallbackReason: error instanceof Error ? error.message : String(error),
+      }
+      console.warn('Falling back to WASM upsampler runtime after WebGPU session creation failed.', error)
+    }
+  }
+  const session = await ort.InferenceSession.create(UPSAMPLER_MODEL_URL, {
+    executionProviders: ['wasm'],
+    graphOptimizationLevel: 'all',
+  })
+  runtimeInfo = {
+    ...(runtimeInfo ?? configureOrtRuntime(ort)),
+    provider: 'wasm',
+  }
+  return session
+}
+
+function hasWebGpuSupport() {
+  return Boolean(globalThis.isSecureContext && navigator.gpu)
 }
 
 function createUpsamplerStats(): UpsamplerStats {
@@ -393,13 +436,15 @@ function createUpsamplerStats(): UpsamplerStats {
     runtime: runtimeInfo ?? {
       crossOriginIsolated: Boolean(globalThis.crossOriginIsolated),
       numThreads: 1,
+      provider: hasWebGpuSupport() ? 'webgpu' : 'wasm',
+      fallbackReason: hasWebGpuSupport() ? undefined : 'WebGPU unavailable',
     },
   }
 }
 
 function statusMessage(phase: string, readyCount: number, totalCount: number, stats: UpsamplerStats) {
   const bufferTarget = Math.min(MIN_BUFFERED_FRAMES, totalCount)
-  const runtime = `wasm ${stats.runtime.numThreads}t${stats.runtime.crossOriginIsolated ? '' : ' no-isolation'}`
+  const runtime = runtimeLabel(stats.runtime)
   if (readyCount > 0) {
     const elapsedSeconds = Math.max((performance.now() - stats.startedAt) / 1000, 0.001)
     const fps = readyCount / elapsedSeconds
@@ -411,6 +456,12 @@ function statusMessage(phase: string, readyCount: number, totalCount: number, st
     return `Buffering ${readyCount}/${bufferTarget} · ${runtime}`
   }
   return `${phase} ${readyCount}/${totalCount} · ${runtime}`
+}
+
+function runtimeLabel(runtime: UpsamplerRuntimeInfo) {
+  if (runtime.provider === 'webgpu') return 'webgpu'
+  const fallback = runtime.fallbackReason ? ' fallback' : ''
+  return `wasm ${runtime.numThreads}t${runtime.crossOriginIsolated ? '' : ' no-isolation'}${fallback}`
 }
 
 function float16ToFloat32(values: Uint16Array) {
