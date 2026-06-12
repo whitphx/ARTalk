@@ -149,7 +149,10 @@ The default spike export samples 32 frames, which is about 512 MB of raw
 upsampler input per generated job. The frames are split into individual files
 so the browser can fetch and run the ONNX upsampler incrementally instead of
 waiting for one large transfer. Set `ARTALK_UPSAMPLER_PREVIEW_FRAMES` on the
-backend process to lower or raise that validation budget.
+backend process to lower or raise that validation budget. Use
+`ARTALK_UPSAMPLER_PREVIEW_FRAMES=all` or
+`ARTALK_UPSAMPLER_PREVIEW_STRIDE=1` only for short clips, because every exported
+frame costs about 16 MB of raw tensor data.
 
 The helper script `scripts/export_gagavatar_upsampler_onnx.py` exports the
 trained `StyleUNet` to `frontend/public/models/gagavatar_upsampler.onnx`.

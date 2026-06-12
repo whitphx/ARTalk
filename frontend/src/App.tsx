@@ -302,7 +302,7 @@ function App() {
             <span>Frame limit: {clipLength}</span>
             <input
               type="range"
-              min="100"
+              min="50"
               max="750"
               step="25"
               value={clipLength}

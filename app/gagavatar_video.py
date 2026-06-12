@@ -17,6 +17,7 @@ MESH_RENDER_MODE = "mesh"
 BROWSER_GAUSSIAN_RENDER_MODE = "browser-gaussian"
 UPSAMPLER_PREVIEW_FRAME_COUNT = 32
 UPSAMPLER_PREVIEW_FRAME_COUNT_ENV = "ARTALK_UPSAMPLER_PREVIEW_FRAMES"
+UPSAMPLER_PREVIEW_FRAME_STRIDE_ENV = "ARTALK_UPSAMPLER_PREVIEW_STRIDE"
 
 
 def check_gagavatar_render_environment(device="auto"):
@@ -99,7 +100,7 @@ class GAGAvatarVideoRenderer:
             transform_frames = []
             reference_frames = []
             motions = result.motions.to(self.device)
-            upsampler_preview_indices = _sample_frame_indices(int(motions.shape[0]), _upsampler_preview_frame_count())
+            upsampler_preview_indices = _upsampler_preview_frame_indices(int(motions.shape[0]))
             upsampler_preview_index_set = set(upsampler_preview_indices)
             upsampler_input_files = []
             upsampler_input_shape = None
@@ -221,14 +222,36 @@ def _sample_frame_indices(frame_count, max_frames):
     })
 
 
-def _upsampler_preview_frame_count():
+def _upsampler_preview_frame_indices(frame_count):
+    if frame_count <= 0:
+        return []
+    stride = _upsampler_preview_frame_stride()
+    if stride is not None:
+        return list(range(0, frame_count, stride))
+    frame_count_limit = _upsampler_preview_frame_count(frame_count)
+    return _sample_frame_indices(frame_count, frame_count_limit)
+
+
+def _upsampler_preview_frame_count(frame_count):
     raw_value = os.environ.get(UPSAMPLER_PREVIEW_FRAME_COUNT_ENV)
     if raw_value is None:
         return UPSAMPLER_PREVIEW_FRAME_COUNT
+    if raw_value.lower() == "all":
+        return frame_count
     try:
         return max(1, int(raw_value))
     except ValueError:
         return UPSAMPLER_PREVIEW_FRAME_COUNT
+
+
+def _upsampler_preview_frame_stride():
+    raw_value = os.environ.get(UPSAMPLER_PREVIEW_FRAME_STRIDE_ENV)
+    if raw_value is None:
+        return None
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return None
 
 
 def _cuda_diagnostics():
