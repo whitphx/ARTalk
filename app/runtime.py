@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
-"""Public ARTalk API for standalone web-renderer integrations.
+"""Public ARTalk runtime API for external integrations.
 
 This module keeps ARTalk inference importable by external programs without
 requiring them to use the demo scripts. It intentionally returns structured
-Python objects first; writing browser artifacts is an adapter concern layered on
-top of the generated result.
+Python objects; application-specific artifact writing belongs in caller code.
 """
 
 from __future__ import annotations
@@ -135,7 +134,7 @@ MEDIAPIPE_MOUTH_LANDMARKS = {
 
 
 @dataclass(frozen=True)
-class ARTalkWebConfig:
+class ARTalkRuntimeConfig:
     asset_dir: Path | str = Path("assets")
     audio_encoder: str = "wav2vec"
     device: str = "auto"
@@ -150,7 +149,7 @@ class ARTalkWebConfig:
 
 
 @dataclass
-class ARTalkWebResult:
+class ARTalkResult:
     audio: torch.Tensor
     motions: torch.Tensor
     vertices: np.ndarray
@@ -162,11 +161,11 @@ class ARTalkWebResult:
     avatar_id: str
 
 
-class ARTalkWebEngine:
+class ARTalkRuntime:
     """Reusable ARTalk motion and FLAME mesh generator."""
 
-    def __init__(self, config: ARTalkWebConfig | None = None):
-        self.config = config or ARTalkWebConfig()
+    def __init__(self, config: ARTalkRuntimeConfig | None = None):
+        self.config = config or ARTalkRuntimeConfig()
         self.asset_dir = self.config.resolved_asset_dir()
         self.device = select_device(self.config.device)
         ckpt = torch.load(
@@ -213,7 +212,7 @@ class ARTalkWebEngine:
         clip_length: int | None = None,
         avatar_id: str = "mesh",
         shape_code: torch.Tensor | None = None,
-    ) -> ARTalkWebResult:
+    ) -> ARTalkResult:
         audio, sr = load_audio(audio_path)
         audio = torchaudio.transforms.Resample(sr, self.config.sample_rate)(audio).mean(dim=0)
         self.set_style_motion(style_id)
@@ -243,7 +242,7 @@ class ARTalkWebEngine:
         )
         audio = audio[: int(vertices.shape[0] / self.config.fps * self.config.sample_rate)]
         faces = self.flame_model.get_faces().cpu().numpy().astype(np.int32, copy=False)
-        return ARTalkWebResult(
+        return ARTalkResult(
             audio=audio.float().cpu(),
             motions=pred_motions.float().cpu(),
             vertices=vertices.float().cpu().numpy().astype(np.float32, copy=False),
@@ -329,38 +328,6 @@ def save_audio(audio_path: str | Path, audio: torch.Tensor, sample_rate: int):
         audio_np = audio_np.T
     audio_np = np.clip(audio_np, -1.0, 1.0)
     wavfile.write(path, sample_rate, (audio_np * 32767.0).astype(np.int16))
-
-
-def write_web_artifacts(result: ARTalkWebResult, output_dir: str | Path) -> dict:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result.vertices.tofile(output_dir / "vertices.f32")
-    result.faces.tofile(output_dir / "faces.i32")
-    result.region_labels.tofile(output_dir / "regions.u8")
-    torch.save(result.motions, output_dir / "motions.pt")
-    save_audio(output_dir / "audio.wav", result.audio[None], result.sample_rate)
-    metadata = {
-        "artifactFormatVersion": "artalk-web-animation-v1",
-        "renderMode": "mesh",
-        "fps": result.fps,
-        "sampleRate": result.sample_rate,
-        "frameCount": int(result.vertices.shape[0]),
-        "vertexCount": int(result.vertices.shape[1]),
-        "faceCount": int(result.faces.shape[0]),
-        "verticesUrl": "vertices.f32",
-        "facesUrl": "faces.i32",
-        "regionLabelsUrl": "regions.u8",
-        "regionLabelFormat": "uint8-vertex",
-        "regionLabels": MESH_REGION_LABELS,
-        "regionSource": result.region_source,
-        "audioUrl": "audio.wav",
-        "motionsUrl": "motions.pt",
-        "videoUrl": None,
-        "avatarId": result.avatar_id,
-    }
-    with open(output_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f)
-    return metadata
 
 
 def build_mesh_region_labels(vertex_count: int, faces: np.ndarray, region_seed_faces: dict) -> np.ndarray:
