@@ -136,23 +136,38 @@ reference video, so color and camera experiments can be compared against the
 real target while the browser color path is still approximate.
 
 Browser Gaussian jobs also export a capped sampled sequence of separate
-`gaussians.upsampler_input_*.f16` files, plus the compatibility first-frame
-file `gaussians.upsampler_input_first.f16`. Each sample is the real 32-channel
-`512 x 512` rasterizer output consumed by GAGAvatar's `StyleUNet` upsampler.
-This is a feasibility artifact for the future browser upsampler path: it lets
-us validate ONNX inference and playback synchronization against exact server
-tensors without first implementing browser-side 32-channel Gaussian
-rasterization. Exporting every frame in this raw format is not practical for
-normal playback because one float16 frame is about 16 MB.
+`gaussians.upsampler_input_*.u8.gz` files, plus the compatibility first-frame
+file `gaussians.upsampler_input_first.u8.gz`. Each sample is the real
+32-channel `512 x 512` rasterizer output consumed by GAGAvatar's `StyleUNet`
+upsampler, quantized per channel to uint8 with float32 min/scale parameters
+appended to the decompressed payload. This is a feasibility artifact for the
+future browser upsampler path: it lets us validate ONNX inference and playback
+synchronization against server tensors without first implementing browser-side
+32-channel Gaussian rasterization.
 
-The default spike export samples 32 frames, which is about 512 MB of raw
-upsampler input per generated job. The frames are split into individual files
-so the browser can fetch and run the ONNX upsampler incrementally instead of
-waiting for one large transfer. Set `ARTALK_UPSAMPLER_PREVIEW_FRAMES` on the
-backend process to lower or raise that validation budget. Use
-`ARTALK_UPSAMPLER_PREVIEW_FRAMES=all` or
-`ARTALK_UPSAMPLER_PREVIEW_STRIDE=1` only for short clips, because every exported
-frame costs about 16 MB of raw tensor data.
+The default is 32 quantization levels. Set
+`ARTALK_UPSAMPLER_QUANTIZATION_LEVELS` to tune the quality/transfer-size
+tradeoff for local experiments.
+
+Older jobs may still point at raw `gaussians.upsampler_input_*.f16` files. The
+browser decoder keeps that float16 path as a compatibility fallback. New
+quantized frames transfer much less data than the raw 16 MB float16 tensors,
+but exporting every frame is still a validation mode, not the final realtime
+architecture.
+
+Measured on a 300-frame WebGPU upsampler preview, 64 levels produced about
+`1.7 fps`, `595 ms/f`, `255 ms/f` fetch time, and `1.9 MiB/f` wire transfer.
+The accepted 32-level baseline produced about `2.0 fps`, `504 ms/f`,
+`186 ms/f` fetch time, and `1.4 MiB/f` wire transfer. Lower values reduce
+transfer size further but may change the neural upsampler output, so they
+should be validated visually against `gaussians.reference.mp4`.
+
+The default spike export samples 32 frames. The frames are split into
+individual files so the browser can fetch and run the ONNX upsampler
+incrementally instead of waiting for one large transfer. Set
+`ARTALK_UPSAMPLER_PREVIEW_FRAMES` on the backend process to lower or raise that
+validation budget. Use `ARTALK_UPSAMPLER_PREVIEW_FRAMES=all` or
+`ARTALK_UPSAMPLER_PREVIEW_STRIDE=1` only for short clips.
 
 The helper script `scripts/export_gagavatar_upsampler_onnx.py` exports the
 trained `StyleUNet` to `frontend/public/models/gagavatar_upsampler.onnx`.

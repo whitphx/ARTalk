@@ -52,10 +52,11 @@ export type AnimationMetadata = {
   gaussianFormat?: 'gagavatar-first-frame-f32-v1'
   gaussianColorChannels?: number
   gaussianUpsamplerInput?: {
-    dtype: 'float16'
+    dtype: 'float16' | 'uint8-linear'
     shape: [number, number, number]
     frameCount: number
     frameIndices?: number[]
+    quantizationLevels?: number
   }
   gaussianHeadCount?: number
   gaussianHeadFrameCount?: number

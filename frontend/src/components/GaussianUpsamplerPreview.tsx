@@ -28,6 +28,8 @@ type UpsamplerFrameResult = {
 type UpsamplerStats = {
   startedAt: number
   fetchMs: number
+  fetchBytes: number
+  wireBytes: number
   inputMs: number
   inferenceMs: number
   outputMs: number
@@ -76,6 +78,7 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
   const inputFrameUrls = metadata.gaussianUrls?.upsamplerInputFrames
   const inputUrl = metadata.gaussianUrls?.upsamplerInputs ?? metadata.gaussianUrls?.upsamplerInputFirst
   const inputShape = metadata.gaussianUpsamplerInput?.shape
+  const inputDtype = metadata.gaussianUpsamplerInput?.dtype ?? 'float16'
   const inputFrameCount = inputFrameUrls?.length ?? metadata.gaussianUpsamplerInput?.frameCount ?? 1
   const inputFrameIndices = metadata.gaussianUpsamplerInput?.frameIndices ?? [0]
   const canRun = Boolean(inputShape && inputFrameCount > 0 && ((inputFrameUrls?.length ?? 0) > 0 || inputUrl))
@@ -124,6 +127,7 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
           urls: inputFrameUrls,
           frameIndices: inputFrameIndices,
           inputShape,
+          inputDtype,
           ort,
           session,
           renderedFrames,
@@ -140,6 +144,7 @@ export function GaussianUpsamplerPreview({ metadata, currentTime }: GaussianUpsa
           frameCount: inputFrameCount,
           frameIndices: inputFrameIndices,
           inputShape,
+          inputDtype,
           ort,
           session,
           renderedFrames,
@@ -178,6 +183,7 @@ async function runFrameUrlSequence({
   urls,
   frameIndices,
   inputShape,
+  inputDtype,
   ort,
   session,
   renderedFrames,
@@ -191,6 +197,7 @@ async function runFrameUrlSequence({
   urls: string[]
   frameIndices: number[]
   inputShape: [number, number, number]
+  inputDtype: 'float16' | 'uint8-linear'
   ort: OrtModule
   session: OrtSession
   renderedFrames: RenderedUpsamplerFrames
@@ -204,14 +211,17 @@ async function runFrameUrlSequence({
   const completed = new Set<number>()
   while (completed.size < urls.length) {
     throwIfAborted(signal)
-    const index = pickNextSampleIndex(urls.length, frameIndices, completed, getCurrentFrame())
+    const index = pickNearestSampleIndices(urls.length, frameIndices, completed, getCurrentFrame(), 1)[0] ?? -1
+    if (index < 0) break
     onMessage(statusMessage('Loading', renderedFrames.images.length, urls.length, stats))
     const fetchStart = performance.now()
-    const inputBuffer = await fetchArrayBuffer(urls[index], signal)
+    const fetched = await fetchArrayBuffer(urls[index], signal)
     stats.fetchMs += performance.now() - fetchStart
+    stats.fetchBytes += fetched.buffer.byteLength
+    stats.wireBytes += fetched.encodedBytes ?? fetched.buffer.byteLength
     throwIfAborted(signal)
     onMessage(statusMessage('Running', renderedFrames.images.length, urls.length, stats))
-    const result = await runUpsamplerFrame(ort, session, new Uint16Array(inputBuffer), inputShape)
+    const result = await runUpsamplerFrame(ort, session, fetched.buffer, inputShape, inputDtype)
     stats.inputMs += result.inputMs
     stats.inferenceMs += result.inferenceMs
     stats.outputMs += result.outputMs
@@ -234,6 +244,7 @@ async function runCombinedInputSequence({
   frameCount,
   frameIndices,
   inputShape,
+  inputDtype,
   ort,
   session,
   renderedFrames,
@@ -248,6 +259,7 @@ async function runCombinedInputSequence({
   frameCount: number
   frameIndices: number[]
   inputShape: [number, number, number]
+  inputDtype: 'float16' | 'uint8-linear'
   ort: OrtModule
   session: OrtSession
   renderedFrames: RenderedUpsamplerFrames
@@ -260,8 +272,11 @@ async function runCombinedInputSequence({
 }) {
   onMessage('Loading')
   const fetchStart = performance.now()
-  const values = new Uint16Array(await fetchArrayBuffer(url, signal))
+  const fetched = await fetchArrayBuffer(url, signal)
+  const values = new Uint16Array(fetched.buffer)
   stats.fetchMs += performance.now() - fetchStart
+  stats.fetchBytes += values.byteLength
+  stats.wireBytes += fetched.encodedBytes ?? values.byteLength
   const frameValueCount = inputShape.reduce((total, value) => total * value, 1)
   if (values.length < frameValueCount * frameCount) {
     throw new Error(`Unexpected upsampler input size: ${values.length}`)
@@ -269,10 +284,17 @@ async function runCombinedInputSequence({
   const completed = new Set<number>()
   while (completed.size < frameCount) {
     throwIfAborted(signal)
-    const index = pickNextSampleIndex(frameCount, frameIndices, completed, getCurrentFrame())
+    const index = pickNearestSampleIndices(frameCount, frameIndices, completed, getCurrentFrame(), 1)[0] ?? -1
+    if (index < 0) break
     onMessage(statusMessage('Running', renderedFrames.images.length, frameCount, stats))
     const frameValues = values.subarray(index * frameValueCount, (index + 1) * frameValueCount)
-    const result = await runUpsamplerFrame(ort, session, frameValues, inputShape)
+    const result = await runUpsamplerFrame(
+      ort,
+      session,
+      frameValues.buffer.slice(frameValues.byteOffset, frameValues.byteOffset + frameValues.byteLength),
+      inputShape,
+      inputDtype,
+    )
     stats.inputMs += result.inputMs
     stats.inferenceMs += result.inferenceMs
     stats.outputMs += result.outputMs
@@ -293,11 +315,12 @@ async function runCombinedInputSequence({
 async function runUpsamplerFrame(
   ort: OrtModule,
   session: OrtSession,
-  frameValues: Uint16Array,
+  frameBuffer: ArrayBuffer,
   inputShape: [number, number, number],
+  inputDtype: 'float16' | 'uint8-linear',
 ): Promise<UpsamplerFrameResult> {
   const inputStart = performance.now()
-  const input = float16ToFloat32(frameValues)
+  const input = decodeUpsamplerInput(frameBuffer, inputShape, inputDtype)
   const tensor = new ort.Tensor('float32', input, [1, ...inputShape])
   const inputMs = performance.now() - inputStart
   const inferenceStart = performance.now()
@@ -343,26 +366,27 @@ function appendRenderedFrame({
 async function fetchArrayBuffer(url: string, signal?: AbortSignal) {
   const response = await fetch(url, { signal })
   if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
-  return response.arrayBuffer()
+  return {
+    buffer: await response.arrayBuffer(),
+    encodedBytes: Number(response.headers.get('content-length')) || undefined,
+  }
 }
 
-function pickNextSampleIndex(
+function pickNearestSampleIndices(
   totalCount: number,
   frameIndices: number[],
   completed: Set<number>,
   currentFrame: number,
+  limit: number,
 ) {
-  let bestIndex = -1
-  let bestDistance = Number.POSITIVE_INFINITY
+  const candidates: { index: number; distance: number }[] = []
   for (let index = 0; index < totalCount; index += 1) {
     if (completed.has(index)) continue
     const distance = Math.abs((frameIndices[index] ?? index) - currentFrame)
-    if (distance < bestDistance) {
-      bestIndex = index
-      bestDistance = distance
-    }
+    candidates.push({ index, distance })
   }
-  return bestIndex < 0 ? 0 : bestIndex
+  candidates.sort((left, right) => left.distance - right.distance || left.index - right.index)
+  return candidates.slice(0, limit).map(({ index }) => index)
 }
 
 function throwIfAborted(signal: AbortSignal) {
@@ -430,6 +454,8 @@ function createUpsamplerStats(): UpsamplerStats {
   return {
     startedAt: performance.now(),
     fetchMs: 0,
+    fetchBytes: 0,
+    wireBytes: 0,
     inputMs: 0,
     inferenceMs: 0,
     outputMs: 0,
@@ -450,12 +476,21 @@ function statusMessage(phase: string, readyCount: number, totalCount: number, st
     const fps = readyCount / elapsedSeconds
     const measuredMs = (stats.fetchMs + stats.inputMs + stats.inferenceMs + stats.outputMs) / readyCount
     const inferenceMs = stats.inferenceMs / readyCount
-    return `${phase} ${readyCount}/${totalCount} · ${fps.toFixed(1)} fps · ${measuredMs.toFixed(0)} ms/f · infer ${inferenceMs.toFixed(0)} ms · ${runtime}`
+    return `${phase} ${readyCount}/${totalCount} · ${fps.toFixed(1)} fps · ${measuredMs.toFixed(0)} ms/f · ${timingBreakdown(stats, readyCount, inferenceMs)} · ${runtime}`
   }
   if (readyCount < bufferTarget) {
     return `Buffering ${readyCount}/${bufferTarget} · ${runtime}`
   }
   return `${phase} ${readyCount}/${totalCount} · ${runtime}`
+}
+
+function timingBreakdown(stats: UpsamplerStats, readyCount: number, inferenceMs: number) {
+  const fetchMs = stats.fetchMs / readyCount
+  const inputMs = stats.inputMs / readyCount
+  const outputMs = stats.outputMs / readyCount
+  const mibPerFrame = stats.fetchBytes / readyCount / 1024 / 1024
+  const wireMibPerFrame = stats.wireBytes / readyCount / 1024 / 1024
+  return `fetch ${fetchMs.toFixed(0)} (${wireMibPerFrame.toFixed(1)} wire/${mibPerFrame.toFixed(1)} MiB/f) · input ${inputMs.toFixed(0)} · infer ${inferenceMs.toFixed(0)} · output ${outputMs.toFixed(0)}`
 }
 
 function runtimeLabel(runtime: UpsamplerRuntimeInfo) {
@@ -464,10 +499,40 @@ function runtimeLabel(runtime: UpsamplerRuntimeInfo) {
   return `wasm ${runtime.numThreads}t${runtime.crossOriginIsolated ? '' : ' no-isolation'}${fallback}`
 }
 
+function decodeUpsamplerInput(
+  buffer: ArrayBuffer,
+  inputShape: [number, number, number],
+  inputDtype: 'float16' | 'uint8-linear',
+) {
+  if (inputDtype === 'float16') return float16ToFloat32(new Uint16Array(buffer))
+  return uint8LinearToFloat32(new Uint8Array(buffer), inputShape)
+}
+
 function float16ToFloat32(values: Uint16Array) {
   const result = new Float32Array(values.length)
   for (let index = 0; index < values.length; index += 1) {
     result[index] = float16ToNumber(values[index])
+  }
+  return result
+}
+
+function uint8LinearToFloat32(values: Uint8Array, inputShape: [number, number, number]) {
+  const [channels, height, width] = inputShape
+  const channelValueCount = height * width
+  const frameValueCount = channels * channelValueCount
+  const paramsByteLength = channels * 2 * Float32Array.BYTES_PER_ELEMENT
+  if (values.byteLength < frameValueCount + paramsByteLength) {
+    throw new Error(`Unexpected quantized upsampler input size: ${values.byteLength}`)
+  }
+  const params = new Float32Array(values.buffer, values.byteOffset + frameValueCount, channels * 2)
+  const result = new Float32Array(frameValueCount)
+  for (let channel = 0; channel < channels; channel += 1) {
+    const min = params[channel * 2]
+    const scale = params[channel * 2 + 1]
+    const channelOffset = channel * channelValueCount
+    for (let index = 0; index < channelValueCount; index += 1) {
+      result[channelOffset + index] = values[channelOffset + index] * scale + min
+    }
   }
   return result
 }

@@ -2,6 +2,7 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import importlib.util
+import gzip
 import os
 import threading
 from pathlib import Path
@@ -18,6 +19,9 @@ BROWSER_GAUSSIAN_RENDER_MODE = "browser-gaussian"
 UPSAMPLER_PREVIEW_FRAME_COUNT = 32
 UPSAMPLER_PREVIEW_FRAME_COUNT_ENV = "ARTALK_UPSAMPLER_PREVIEW_FRAMES"
 UPSAMPLER_PREVIEW_FRAME_STRIDE_ENV = "ARTALK_UPSAMPLER_PREVIEW_STRIDE"
+UPSAMPLER_QUANTIZATION_LEVELS_ENV = "ARTALK_UPSAMPLER_QUANTIZATION_LEVELS"
+UPSAMPLER_QUANTIZATION_LEVELS = 32
+UPSAMPLER_INPUT_DTYPE = "uint8-linear"
 
 
 def check_gagavatar_render_environment(device="auto"):
@@ -125,10 +129,13 @@ class GAGAvatarVideoRenderer:
                         )["images"][0].detach().to(torch.float16).cpu()
                     )
                     upsampler_input_shape = list(upsampler_input.shape)
-                    upsampler_input_file = f"gaussians.upsampler_input_{len(upsampler_input_files):03d}.f16"
-                    upsampler_input.numpy().tofile(output_dir / upsampler_input_file)
+                    upsampler_input_file = f"gaussians.upsampler_input_{len(upsampler_input_files):03d}.u8.gz"
+                    _write_quantized_upsampler_input(upsampler_input, output_dir / upsampler_input_file)
                     if not upsampler_input_files:
-                        upsampler_input.numpy().tofile(output_dir / "gaussians.upsampler_input_first.f16")
+                        _write_quantized_upsampler_input(
+                            upsampler_input,
+                            output_dir / "gaussians.upsampler_input_first.u8.gz",
+                        )
                     upsampler_input_files.append(upsampler_input_file)
             if first_batch is None:
                 raise ValueError("Cannot export Gaussian snapshot for an empty animation.")
@@ -157,10 +164,11 @@ class GAGAvatarVideoRenderer:
             "gaussianFormat": "gagavatar-first-frame-f32-v1",
             "gaussianColorChannels": int(snapshot["colors"].shape[1]),
             "gaussianUpsamplerInput": {
-                "dtype": "float16",
+                "dtype": UPSAMPLER_INPUT_DTYPE,
                 "shape": upsampler_input_shape,
                 "frameCount": len(upsampler_input_files),
                 "frameIndices": upsampler_preview_indices,
+                "quantizationLevels": _upsampler_quantization_levels(),
             },
             "gaussianHeadCount": int(head_positions.shape[1]),
             "gaussianHeadFrameCount": int(head_positions.shape[0]),
@@ -170,7 +178,7 @@ class GAGAvatarVideoRenderer:
                 "headXyz": "gaussians.head_xyz.f32",
                 "transforms": "gaussians.transforms.f32",
                 "referenceVideo": "gaussians.reference.mp4",
-                "upsamplerInputFirst": "gaussians.upsampler_input_first.f16",
+                "upsamplerInputFirst": "gaussians.upsampler_input_first.u8.gz",
                 "upsamplerInputFrames": upsampler_input_files,
                 "colors": "gaussians.colors.f32",
                 "opacities": "gaussians.opacities.f32",
@@ -252,6 +260,37 @@ def _upsampler_preview_frame_stride():
         return max(1, int(raw_value))
     except ValueError:
         return None
+
+
+def _write_quantized_upsampler_input(tensor, output_path):
+    levels = _upsampler_quantization_levels()
+    channels = int(tensor.shape[0])
+    values = tensor.float().flatten(1)
+    mins = values.min(dim=1).values
+    maxs = values.max(dim=1).values
+    scales = ((maxs - mins) / float(levels - 1)).clamp_min(1e-8)
+    quantized = torch.clamp(
+        torch.round((tensor.float() - mins[:, None, None]) / scales[:, None, None]),
+        0,
+        levels - 1,
+    ).to(torch.uint8)
+    params = torch.stack([mins, scales], dim=1).cpu().numpy().astype("float32", copy=False)
+    with gzip.open(output_path, "wb", compresslevel=1) as f:
+        f.write(quantized.cpu().numpy().tobytes(order="C"))
+        f.write(params.tobytes(order="C"))
+    if params.shape != (channels, 2):
+        raise ValueError("Invalid upsampler quantization parameters.")
+
+
+def _upsampler_quantization_levels():
+    raw_value = os.environ.get(UPSAMPLER_QUANTIZATION_LEVELS_ENV)
+    if raw_value is None:
+        return UPSAMPLER_QUANTIZATION_LEVELS
+    try:
+        levels = int(raw_value)
+    except ValueError:
+        return UPSAMPLER_QUANTIZATION_LEVELS
+    return min(max(levels, 2), 256)
 
 
 def _cuda_diagnostics():

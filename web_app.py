@@ -57,7 +57,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_cross_origin_isolation_headers(_request: Request, call_next):
-    response = await call_next(request)
+    response = await call_next(_request)
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
@@ -377,6 +377,7 @@ def get_job_file(job_id: str, name: str):
         "gaussians.transforms.f32",
         "gaussians.reference.mp4",
         "gaussians.upsampler_input_first.f16",
+        "gaussians.upsampler_input_first.u8.gz",
         "gaussians.upsampler_inputs.f16",
         "gaussians.colors.f32",
         "gaussians.opacities.f32",
@@ -387,16 +388,25 @@ def get_job_file(job_id: str, name: str):
     file_path = job_dir(job_id) / name
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not ready")
+    if name.endswith(".gz"):
+        return FileResponse(
+            file_path,
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "gzip"},
+        )
     return FileResponse(file_path)
 
 
 def _is_upsampler_input_frame_file(name: str):
     prefix = "gaussians.upsampler_input_"
     suffix = ".f16"
+    quantized_suffix = ".u8.gz"
     return (
         name.startswith(prefix)
-        and name.endswith(suffix)
-        and name[len(prefix) : -len(suffix)].isdigit()
+        and (
+            (name.endswith(suffix) and name[len(prefix) : -len(suffix)].isdigit())
+            or (name.endswith(quantized_suffix) and name[len(prefix) : -len(quantized_suffix)].isdigit())
+        )
     )
 
 
