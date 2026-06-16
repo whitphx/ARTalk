@@ -36,6 +36,12 @@
 **/render_results
 **/depth-diff-gaussian-rasterization
 **/diff-gaussian-rasterization
+/.local-build/
+
+!frontend/package.json
+!frontend/tsconfig.json
+!frontend/tsconfig.app.json
+!frontend/tsconfig.node.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -39,6 +39,12 @@ git clone --recurse-submodules git@github.com:xg-chu/ARTalk.git
 cd ARTalk
 ```
 
+If you cloned without submodules, initialize GAGAvatar with:
+
+```
+git submodule update --init --recursive
+```
+
 ### Build environment
 
 ```
@@ -74,6 +80,101 @@ You can generate videos by **uploading audio**, **recording audio**, or **enteri
 </b></h1>
 ```
 python inference.py --run_app
+```
+
+### Using the web renderer app
+
+The web app is the macOS-oriented demo path. Python runs ARTalk inference and
+FLAME vertex generation, while the browser renders the animated mesh with
+Three.js. This avoids PyTorch3D and the CUDA Gaussian rasterizer in the default
+mesh path.
+
+Create the web app environment:
+```
+micromamba create -f environment-web.yml
+```
+
+Check the backend environment:
+```
+micromamba run -n artalk-web scripts/check_web_backend_env.py
+```
+
+Run the API:
+```
+micromamba run -n artalk-web scripts/run_web_backend.sh
+```
+
+Run the frontend in another terminal:
+```
+cd frontend
+pnpm install
+pnpm dev
+```
+
+Then open the Vite URL, usually `http://localhost:5173`.
+The dev server proxies `/api` to `http://127.0.0.1:8961` by default; set
+`ARTALK_API_TARGET` when running the backend on a different port.
+
+For a production-style local run, build the frontend and let FastAPI serve it:
+```
+cd frontend
+pnpm build
+cd ..
+micromamba run -n artalk-web scripts/run_web_backend.sh
+```
+
+The web renderer uses a hybrid avatar path:
+
+- Browser rendering is still the lightweight FLAME mesh renderer.
+- The avatar picker can use the neutral mesh or built-in GAGAvatar tracked
+  identities from `assets/GAGAvatar/tracked.pt`; their `shapecode` drives the
+  browser mesh geometry.
+- Single-image avatar registration is exposed as a server-side API. Configure a
+  separate GAGAvatar tracking environment before using it. The backend defaults
+  `GAGAVATAR_REPO` to the `./GAGAvatar` submodule, so only `GAGAVATAR_PYTHON`
+  is required for the default layout:
+
+```
+export GAGAVATAR_PYTHON=/path/to/gagavatar-env/bin/python
+```
+
+Create the tracker environment with:
+
+```
+micromamba create -f environment-gagavatar-track.yml
+```
+
+Then place the GAGAvatar tracker resources under
+`GAGAvatar/core/libs/GAGAvatar_track/assets` and check the tracker environment:
+
+```
+micromamba run -n artalk-web scripts/check_gagavatar_tracker_env.py \
+  --python "$HOME/.local/share/mamba/envs/gagavatar-track/bin/python"
+```
+
+The registration device selector supports `auto`; it resolves to CUDA only
+when the GAGAvatar Python environment can run PyTorch3D's CUDA rasterizer,
+otherwise CPU.
+
+The registration endpoint follows the tracking flow in
+<a href="https://github.com/xg-chu/GAGAvatar/blob/main/inference.py">`GAGAvatar/inference.py`</a>
+and writes uploaded avatar records under `render_results/web_avatars`. Note
+that GAGAvatar's bundled `GAGAvatar_track` dependency is licensed CC BY-NC 4.0,
+so production or commercial use needs separate license review.
+
+Server-side colored video mode also requires CUDA and GAGAvatar's Gaussian
+rasterizer in the backend environment:
+
+```
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=6.0 \
+  micromamba run -n artalk-web scripts/install_gagavatar_rasterizer.sh
+```
+
+If `device=auto` selects CPU, check that the backend process can initialize
+CUDA with `torch.cuda.is_available()`. Run the full backend preflight with:
+
+```
+micromamba run -n artalk-web scripts/check_web_backend_env.py --full
 ```
 
 ### Command Line Usage

@@ -48,6 +48,10 @@ class GAGAvatar(nn.Module):
 
     def set_avatar_id(self, avatar_id):
         tracked_id = copy.deepcopy(self.all_gagavatar_id[avatar_id])
+        self.set_tracked_avatar(tracked_id, avatar_id)
+
+    def set_tracked_avatar(self, tracked_id, avatar_id=None):
+        tracked_id = copy.deepcopy(tracked_id)
         for key in tracked_id.keys():
             if not isinstance(tracked_id[key], torch.Tensor):
                 tracked_id[key] = torch.tensor(tracked_id[key]).float()
