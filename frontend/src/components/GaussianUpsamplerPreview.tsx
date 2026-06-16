@@ -39,9 +39,14 @@ type UpsamplerRun = {
   abortController: AbortController
   id: number
 }
+type FetchedUpsamplerInput = {
+  buffer: ArrayBuffer
+  encodedBytes?: number
+}
 
 const UPSAMPLER_MODEL_URL = '/models/gagavatar_upsampler.onnx'
 const MIN_BUFFERED_FRAMES = 3
+const PREFETCH_FRAME_COUNT = 4
 const MAX_WASM_THREADS = 4
 
 let ortModulePromise: Promise<OrtModule> | null = null
@@ -209,17 +214,35 @@ async function runFrameUrlSequence({
   stats: UpsamplerStats
 }) {
   const completed = new Set<number>()
+  const inFlight = new Map<number, Promise<FetchedUpsamplerInput>>()
   while (completed.size < urls.length) {
     throwIfAborted(signal)
-    const index = pickNearestSampleIndices(urls.length, frameIndices, completed, getCurrentFrame(), 1)[0] ?? -1
+    fillPrefetchQueue({
+      urls,
+      frameIndices,
+      completed,
+      inFlight,
+      currentFrame: getCurrentFrame(),
+      signal,
+      stats,
+    })
+    const index = pickNearestInFlightIndex(frameIndices, inFlight, getCurrentFrame())
     if (index < 0) break
     onMessage(statusMessage('Loading', renderedFrames.images.length, urls.length, stats))
-    const fetchStart = performance.now()
-    const fetched = await fetchArrayBuffer(urls[index], signal)
-    stats.fetchMs += performance.now() - fetchStart
-    stats.fetchBytes += fetched.buffer.byteLength
-    stats.wireBytes += fetched.encodedBytes ?? fetched.buffer.byteLength
+    const fetched = await inFlight.get(index)
+    inFlight.delete(index)
+    if (!fetched) throw new Error(`Missing prefetched upsampler frame: ${index}`)
+    completed.add(index)
     throwIfAborted(signal)
+    fillPrefetchQueue({
+      urls,
+      frameIndices,
+      completed,
+      inFlight,
+      currentFrame: getCurrentFrame(),
+      signal,
+      stats,
+    })
     onMessage(statusMessage('Running', renderedFrames.images.length, urls.length, stats))
     const result = await runUpsamplerFrame(ort, session, fetched.buffer, inputShape, inputDtype)
     stats.inputMs += result.inputMs
@@ -234,7 +257,6 @@ async function runFrameUrlSequence({
       currentTime: getCurrentFrame() / fps,
       fps,
     })
-    completed.add(index)
     onMessage(statusMessage('Ready', renderedFrames.images.length, urls.length, stats))
   }
 }
@@ -312,6 +334,46 @@ async function runCombinedInputSequence({
   }
 }
 
+function fillPrefetchQueue({
+  urls,
+  frameIndices,
+  completed,
+  inFlight,
+  currentFrame,
+  signal,
+  stats,
+}: {
+  urls: string[]
+  frameIndices: number[]
+  completed: Set<number>
+  inFlight: Map<number, Promise<FetchedUpsamplerInput>>
+  currentFrame: number
+  signal: AbortSignal
+  stats: UpsamplerStats
+}) {
+  const scheduled = new Set(inFlight.keys())
+  const nextIndices = pickNearestSampleIndices(
+    urls.length,
+    frameIndices,
+    completed,
+    currentFrame,
+    Math.max(PREFETCH_FRAME_COUNT - inFlight.size, 0),
+    scheduled,
+  )
+  for (const index of nextIndices) {
+    inFlight.set(index, fetchUpsamplerInput(urls[index], signal, stats))
+  }
+}
+
+async function fetchUpsamplerInput(url: string, signal: AbortSignal, stats: UpsamplerStats) {
+  const fetchStart = performance.now()
+  const fetched = await fetchArrayBuffer(url, signal)
+  stats.fetchMs += performance.now() - fetchStart
+  stats.fetchBytes += fetched.buffer.byteLength
+  stats.wireBytes += fetched.encodedBytes ?? fetched.buffer.byteLength
+  return fetched
+}
+
 async function runUpsamplerFrame(
   ort: OrtModule,
   session: OrtSession,
@@ -378,15 +440,34 @@ function pickNearestSampleIndices(
   completed: Set<number>,
   currentFrame: number,
   limit: number,
+  scheduled = new Set<number>(),
 ) {
   const candidates: { index: number; distance: number }[] = []
   for (let index = 0; index < totalCount; index += 1) {
     if (completed.has(index)) continue
+    if (scheduled.has(index)) continue
     const distance = Math.abs((frameIndices[index] ?? index) - currentFrame)
     candidates.push({ index, distance })
   }
   candidates.sort((left, right) => left.distance - right.distance || left.index - right.index)
   return candidates.slice(0, limit).map(({ index }) => index)
+}
+
+function pickNearestInFlightIndex(
+  frameIndices: number[],
+  inFlight: Map<number, Promise<FetchedUpsamplerInput>>,
+  currentFrame: number,
+) {
+  let nearestIndex = -1
+  let nearestDistance = Number.POSITIVE_INFINITY
+  for (const index of inFlight.keys()) {
+    const distance = Math.abs((frameIndices[index] ?? index) - currentFrame)
+    if (distance < nearestDistance || (distance === nearestDistance && index < nearestIndex)) {
+      nearestIndex = index
+      nearestDistance = distance
+    }
+  }
+  return nearestIndex
 }
 
 function throwIfAborted(signal: AbortSignal) {
@@ -474,7 +555,7 @@ function statusMessage(phase: string, readyCount: number, totalCount: number, st
   if (readyCount > 0) {
     const elapsedSeconds = Math.max((performance.now() - stats.startedAt) / 1000, 0.001)
     const fps = readyCount / elapsedSeconds
-    const measuredMs = (stats.fetchMs + stats.inputMs + stats.inferenceMs + stats.outputMs) / readyCount
+    const measuredMs = (elapsedSeconds * 1000) / readyCount
     const inferenceMs = stats.inferenceMs / readyCount
     return `${phase} ${readyCount}/${totalCount} · ${fps.toFixed(1)} fps · ${measuredMs.toFixed(0)} ms/f · ${timingBreakdown(stats, readyCount, inferenceMs)} · ${runtime}`
   }
