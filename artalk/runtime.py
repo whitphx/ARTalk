@@ -21,6 +21,7 @@ import torchaudio
 from scipy.io import wavfile
 from scipy.signal import savgol_filter
 
+from artalk.assets import ARTalkAssets
 from artalk.flame_model.FLAME import FLAMEModel
 from artalk.models import BitwiseARModel
 
@@ -135,7 +136,8 @@ MEDIAPIPE_MOUTH_LANDMARKS = {
 
 @dataclass(frozen=True)
 class ARTalkRuntimeConfig:
-    asset_dir: Path | str = Path("assets")
+    asset_dir: Path | str | None = None
+    assets: ARTalkAssets | None = None
     audio_encoder: str = "wav2vec"
     device: str = "auto"
     clip_length: int = 750
@@ -144,8 +146,13 @@ class ARTalkRuntimeConfig:
     fix_pose: bool = False
     flame_scale: float = 1.0
 
+    def resolved_assets(self) -> ARTalkAssets:
+        if self.assets is not None:
+            return self.assets
+        return ARTalkAssets.resolve(root=self.asset_dir)
+
     def resolved_asset_dir(self) -> Path:
-        return Path(self.asset_dir).expanduser().resolve()
+        return self.resolved_assets().root
 
 
 @dataclass
@@ -166,14 +173,16 @@ class ARTalkRuntime:
 
     def __init__(self, config: ARTalkRuntimeConfig | None = None):
         self.config = config or ARTalkRuntimeConfig()
-        self.asset_dir = self.config.resolved_asset_dir()
+        self.assets = self.config.resolved_assets()
+        self.assets.validate(self.config.audio_encoder)
+        self.asset_dir = self.assets.root
         self.device = select_device(self.config.device)
         ckpt = torch.load(
-            self.asset_dir / f"ARTalk_{self.config.audio_encoder}.pt",
+            self.assets.checkpoint(self.config.audio_encoder),
             map_location="cpu",
             weights_only=True,
         )
-        with open(self.asset_dir / "config.json") as f:
+        with self.assets.config.open() as f:
             configs = json.load(f)
         configs["AR_CONFIG"]["AUDIO_ENCODER"] = self.config.audio_encoder
         self.model = BitwiseARModel(configs).eval().to(self.device)
@@ -183,7 +192,7 @@ class ARTalkRuntime:
             n_exp=100,
             scale=self.config.flame_scale,
             no_lmks=True,
-            model_path=self.asset_dir / "FLAME_with_eye.pt",
+            model_path=self.assets.flame_model,
         ).to(self.device)
         self.style_motion = None
 

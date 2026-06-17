@@ -19,6 +19,7 @@
 **/*.jpg
 **/*.jpeg
 **/*.json
+!artalk/assets_manifest.json
 **/*.png
 **/*.gif
 
