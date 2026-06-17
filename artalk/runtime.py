@@ -21,8 +21,8 @@ import torchaudio
 from scipy.io import wavfile
 from scipy.signal import savgol_filter
 
-from app.flame_model.FLAME import FLAMEModel
-from app.models import BitwiseARModel
+from artalk.flame_model.FLAME import FLAMEModel
+from artalk.models import BitwiseARModel
 
 
 MESH_REGION_LABELS = {

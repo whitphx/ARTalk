@@ -34,9 +34,9 @@ import torch
 import torchaudio
 from scipy.signal import savgol_filter
 
-from app import BitwiseARModel
-from app.rendering import StreamingRenderer
-from app.streaming import ARTalkStreamer, CausalSavgolSmoother
+from artalk import BitwiseARModel
+from artalk.rendering import StreamingRenderer
+from artalk.streaming import ARTalkStreamer, CausalSavgolSmoother
 
 FLAME_ASSET_PATH = "./assets/FLAME_with_eye.pt"
 
@@ -222,7 +222,7 @@ def main():
             "skipping. Run ./build_resources.sh to download FLAME assets."
         )
     else:
-        from app.flame_model import FLAMEModel, RenderMesh
+        from artalk.flame_model import FLAMEModel, RenderMesh
 
         flame_model = FLAMEModel(
             n_shape=300, n_exp=100, scale=1.0, no_lmks=True
