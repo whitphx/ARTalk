@@ -25,6 +25,7 @@ import fractions
 import logging
 import queue
 import threading
+import time
 
 import av
 import numpy as np
@@ -41,6 +42,57 @@ FPS = 25
 DEFAULT_RENDER_RES = 512
 AUDIO_OUT_PTIME = 0.020
 AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
+
+
+class PipelineMetrics:
+    """Thread-safe rolling counters for the development Streamlit app."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._created_at = time.perf_counter()
+        self._counters: dict[str, int | float] = {}
+        self._durations: dict[str, dict[str, float]] = {}
+
+    def inc(self, key: str, value: int | float = 1) -> None:
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + value
+
+    def set(self, key: str, value: int | float | None) -> None:
+        if value is None:
+            return
+        with self._lock:
+            self._counters[key] = value
+
+    def set_once(self, key: str, value: int | float) -> bool:
+        with self._lock:
+            if key in self._counters:
+                return False
+            self._counters[key] = value
+            return True
+
+    def observe_ms(self, key: str, elapsed_s: float) -> None:
+        elapsed_ms = elapsed_s * 1000.0
+        with self._lock:
+            stat = self._durations.setdefault(
+                key,
+                {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
+            )
+            stat["count"] += 1
+            stat["total_ms"] += elapsed_ms
+            stat["max_ms"] = max(stat["max_ms"], elapsed_ms)
+            stat["last_ms"] = elapsed_ms
+
+    def snapshot(self) -> dict:
+        now = time.perf_counter()
+        with self._lock:
+            counters = dict(self._counters)
+            durations = {key: dict(value) for key, value in self._durations.items()}
+        for stat in durations.values():
+            count = stat["count"]
+            stat["avg_ms"] = stat["total_ms"] / count if count else 0.0
+        counters["uptime_s"] = now - self._created_at
+        counters["now_s"] = now
+        return {"counters": counters, "durations": durations}
 
 
 class ARTalkPipeline:
@@ -92,6 +144,16 @@ class ARTalkPipeline:
         self._stop_event = threading.Event()
         self._dbg_calls = 0
         self._render_res = int(render_res)
+        self.metrics = PipelineMetrics()
+        self.metrics.set("streamer_chunk_samples", self._streamer.patch_audio_length)
+        self.metrics.set(
+            "streamer_chunk_floor_s",
+            self._streamer.patch_audio_length / SAMPLE_RATE,
+        )
+        self.metrics.set("streamer_frames_per_chunk", self._streamer.frames_per_chunk)
+        self.metrics.set("fps", FPS)
+        self.metrics.set("audio_out_samples_per_frame", AUDIO_OUT_SAMPLES_PER_FRAME)
+        self.metrics.set("render_res", self._render_res)
         self._initial_placeholder = np.zeros(
             (self._render_res, self._render_res, 3),
             dtype=np.uint8,
@@ -107,7 +169,10 @@ class ARTalkPipeline:
     def push_audio_frame(self, frame: av.AudioFrame):
         """Fast: enqueue the raw frame, return. The worker handles
         resampling to 16 kHz mono and the heavy inference / render."""
+        self.metrics.set_once("first_audio_push_s", time.perf_counter())
+        self.metrics.inc("audio_frames_pushed")
         self._audio_in_queue.put(frame)
+        self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
 
     def video_source_callback(
         self, pts: int, time_base: fractions.Fraction
@@ -121,8 +186,11 @@ class ARTalkPipeline:
         try:
             arr = self.video_queue.get_nowait()
             self._placeholder = arr
+            self.metrics.inc("video_frames_served")
         except queue.Empty:
             arr = self._placeholder
+            self.metrics.inc("video_placeholder_frames")
+        self.metrics.set("video_queue_depth", self.video_queue.qsize())
         return av.VideoFrame.from_ndarray(arr, format="rgb24")
 
     def audio_source_callback(
@@ -142,12 +210,21 @@ class ARTalkPipeline:
             if available >= n:
                 samples = self._audio_out_buffer[:n].copy()
                 self._audio_out_buffer = self._audio_out_buffer[n:]
+                underrun = 0
             elif available > 0:
                 samples = np.zeros(n, dtype=np.int16)
                 samples[:available] = self._audio_out_buffer
                 self._audio_out_buffer = np.zeros(0, dtype=np.int16)
+                underrun = n - available
             else:
                 samples = np.zeros(n, dtype=np.int16)
+                underrun = n
+            buffered = self._audio_out_buffer.size
+        self.metrics.inc("audio_frames_served")
+        if underrun:
+            self.metrics.inc("audio_underrun_frames")
+            self.metrics.inc("audio_underrun_samples", underrun)
+        self.metrics.set("audio_out_buffer_samples", buffered)
         # AudioFrame.from_ndarray for s16 mono expects shape (1, N).
         frame = av.AudioFrame.from_ndarray(
             samples[np.newaxis, :], format="s16", layout="mono"
@@ -195,6 +272,7 @@ class ARTalkPipeline:
                 frame = self._audio_in_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
             try:
                 self._process_input_frame(frame)
             except Exception:
@@ -204,7 +282,9 @@ class ARTalkPipeline:
         # Resample to 16 kHz mono int16 once; the same chunks are both
         # staged for outbound audio (delayed-emit, paired with rendered
         # video below) and fed to the streamer for motion inference.
+        t0 = time.perf_counter()
         resampled = self._resampler.resample(frame)
+        self.metrics.observe_ms("resample", time.perf_counter() - t0)
         if not isinstance(resampled, list):
             resampled = [resampled]
         for rf in resampled:
@@ -214,18 +294,28 @@ class ARTalkPipeline:
             if arr.size == 0:
                 continue
             samples = arr.astype(np.int16, copy=True)
+            self.metrics.inc("audio_chunks_resampled")
+            self.metrics.inc("audio_samples_resampled", samples.size)
             self._pending_audio_for_output.append(samples)
             self._process_audio_chunk(samples)
 
     def _process_audio_chunk(self, samples_int16: np.ndarray):
+        self.metrics.set_once("first_audio_process_s", time.perf_counter())
         samples_t = torch.from_numpy(
             samples_int16.astype(np.float32) / 32768.0
         ).to(self._device)
         buf_before = self._streamer._audio_buffer.shape[0]
+        t0 = time.perf_counter()
         motion = self._streamer.feed(samples_t)
+        streamer_elapsed = time.perf_counter() - t0
+        self.metrics.observe_ms("artalk_streamer_feed", streamer_elapsed)
         buf_after = self._streamer._audio_buffer.shape[0]
+        self.metrics.inc("streamer_feed_calls")
+        self.metrics.inc("audio_samples_fed_to_streamer", samples_int16.size)
+        self.metrics.set("streamer_buffer_samples", buf_after)
         self._dbg_calls += 1
         pending_out_total = sum(p.size for p in self._pending_audio_for_output)
+        self.metrics.set("pending_audio_for_output_samples", pending_out_total)
         if self._dbg_calls <= 3 or self._dbg_calls % 50 == 0:
             logger.warning(
                 "[ARTalkPipeline] call#%d in_samples=%d buf_before=%d "
@@ -243,6 +333,16 @@ class ARTalkPipeline:
             )
         if motion.shape[0] == 0:
             return
+        now = time.perf_counter()
+        if self.metrics.set_once("first_motion_s", now):
+            snapshot = self.metrics.snapshot()["counters"]
+            first_audio = snapshot.get("first_audio_push_s") or snapshot.get("first_audio_process_s")
+            if first_audio is not None:
+                self.metrics.set("first_motion_latency_s", now - first_audio)
+        self.metrics.inc("motion_chunks_produced")
+        self.metrics.inc("motion_frames_produced", motion.shape[0])
+        self.metrics.set("last_motion_frames", motion.shape[0])
+        self.metrics.set("last_motion_s", now)
 
         # Couple the matching audio with the produced motion: each
         # motion frame corresponds to SAMPLE_RATE / FPS = 640 samples,
@@ -262,6 +362,9 @@ class ARTalkPipeline:
             self._audio_out_buffer = np.concatenate(
                 [self._audio_out_buffer, emitted_audio]
             )
+            buffered = self._audio_out_buffer.size
+        self.metrics.inc("audio_samples_emitted", emitted_audio.size)
+        self.metrics.set("audio_out_buffer_samples", buffered)
 
         logger.warning(
             "[ARTalkPipeline] motion produced call#%d motion=%s "
@@ -272,10 +375,19 @@ class ARTalkPipeline:
             n_audio_samples_out,
         )
 
+        t0 = time.perf_counter()
         smoothed = self._smoother.feed(motion)
+        self.metrics.observe_ms("smoother_feed", time.perf_counter() - t0)
+        self.metrics.inc("smoothed_frames_produced", smoothed.shape[0])
+        self.metrics.set("last_smoothed_frames", smoothed.shape[0])
         if smoothed.shape[0] == 0:
             return
-        for rgb in self._renderer.feed(smoothed):
+        render_chunk_t0 = time.perf_counter()
+        for i in range(smoothed.shape[0]):
+            render_t0 = time.perf_counter()
+            rgb = self._renderer.render_frame(smoothed[i])
+            self.metrics.observe_ms("avatar_render_frame", time.perf_counter() - render_t0)
+            convert_t0 = time.perf_counter()
             arr = (
                 (rgb * 255.0)
                 .clamp_(0, 255)
@@ -284,7 +396,11 @@ class ARTalkPipeline:
                 .contiguous()
                 .numpy()
             )
+            self.metrics.observe_ms("rgb_tensor_to_numpy", time.perf_counter() - convert_t0)
             self._enqueue_frame(arr)
+            self.metrics.inc("rendered_frames")
+            self.metrics.set("last_rendered_s", time.perf_counter())
+        self.metrics.observe_ms("render_chunk_total", time.perf_counter() - render_chunk_t0)
         logger.warning(
             "[ARTalkPipeline] frames rendered call#%d video_q=%d "
             "audio_out_buf=%d",
@@ -296,14 +412,18 @@ class ARTalkPipeline:
     def _enqueue_frame(self, arr):
         try:
             self.video_queue.put_nowait(arr)
+            self.metrics.set("video_queue_depth", self.video_queue.qsize())
         except queue.Full:
             # Drop the oldest frame and append the new one. Real-time
             # progresses; the gap is preferable to unbounded buildup.
             try:
                 self.video_queue.get_nowait()
+                self.metrics.inc("video_frames_dropped")
             except queue.Empty:
                 pass
             try:
                 self.video_queue.put_nowait(arr)
+                self.metrics.set("video_queue_depth", self.video_queue.qsize())
             except queue.Full:
+                self.metrics.inc("video_frames_drop_failed")
                 pass
