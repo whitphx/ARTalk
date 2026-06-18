@@ -159,6 +159,8 @@ class ARTalkPipeline:
             dtype=np.uint8,
         )
         self._placeholder = self._initial_placeholder
+        if self._renderer.mode == "gagavatar":
+            self._warm_up_renderer()
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="ARTalkPipelineWorker",
@@ -265,6 +267,28 @@ class ARTalkPipeline:
     @property
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
+
+    def _warm_up_renderer(self):
+        motion = torch.zeros(
+            self._streamer.motion_dim,
+            dtype=self._streamer.dtype,
+            device=self._streamer.device,
+        )
+        t0 = time.perf_counter()
+        rgb, timings = self._renderer.render_frame_profile(motion)
+        for key, elapsed_s in timings.items():
+            self.metrics.observe_ms(f"warmup_{key}", elapsed_s)
+        convert_t0 = time.perf_counter()
+        (
+            (rgb * 255.0)
+            .clamp_(0, 255)
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .contiguous()
+            .numpy()
+        )
+        self.metrics.observe_ms("warmup_rgb_tensor_to_numpy", time.perf_counter() - convert_t0)
+        self.metrics.observe_ms("renderer_warmup", time.perf_counter() - t0)
 
     def _worker_loop(self):
         while not self._stop_event.is_set():
@@ -385,7 +409,9 @@ class ARTalkPipeline:
         render_chunk_t0 = time.perf_counter()
         for i in range(smoothed.shape[0]):
             render_t0 = time.perf_counter()
-            rgb = self._renderer.render_frame(smoothed[i])
+            rgb, render_timings = self._renderer.render_frame_profile(smoothed[i])
+            for key, elapsed_s in render_timings.items():
+                self.metrics.observe_ms(key, elapsed_s)
             self.metrics.observe_ms("avatar_render_frame", time.perf_counter() - render_t0)
             convert_t0 = time.perf_counter()
             arr = (

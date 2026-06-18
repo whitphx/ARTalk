@@ -27,6 +27,8 @@ to skip server-side rendering simply consume motion frames before
 this stage).
 """
 
+import time
+
 import torch
 
 
@@ -99,6 +101,24 @@ class StreamingRenderer:
         return self._render(motion_frame.to(self._device))
 
     @torch.no_grad()
+    def render_frame_profile(self, motion_frame):
+        """Render one frame and return ``(rgb, timings)``.
+
+        Timings are wall-clock seconds. CUDA devices are synchronized at
+        stage boundaries so GPU work is attributed to the stage that queued it.
+        This is intentionally a development/profiling path; ``render_frame``
+        remains the lower-overhead production path.
+        """
+        if motion_frame.dim() != 1:
+            raise ValueError(
+                f"motion_frame must be 1-D, got shape {tuple(motion_frame.shape)}"
+            )
+        motion_frame = motion_frame.to(self._device)
+        if self.mode == "gagavatar":
+            return self._render_gagavatar_profile(motion_frame)
+        return self._render_mesh_profile(motion_frame)
+
+    @torch.no_grad()
     def feed(self, motion_frames):
         """Iterate over (T, motion_dim) and yield per-frame RGB tensors."""
         if motion_frames.dim() != 2:
@@ -118,7 +138,51 @@ class StreamingRenderer:
         rgb = self._mesh_renderer(verts)[0]
         return rgb.cpu()[0] / 255.0
 
+    def _render_mesh_profile(self, motion_frame):
+        timings = {}
+        t0 = time.perf_counter()
+        verts = self._mesh_basic_vae.get_flame_verts(
+            self._mesh_flame,
+            self._mesh_shape_code,
+            motion_frame[None],
+            with_global=True,
+        )
+        self._sync_if_cuda()
+        timings["avatar_prepare_frame"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = self._mesh_renderer(verts)[0]
+        self._sync_if_cuda()
+        timings["avatar_forward_model"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = rgb.cpu()[0] / 255.0
+        timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
+        return rgb, timings
+
     def _render_gagavatar(self, motion_frame):
         batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
         rgb = self._gaga.forward_expression(batch)
         return rgb.cpu()[0]
+
+    def _render_gagavatar_profile(self, motion_frame):
+        timings = {}
+        t0 = time.perf_counter()
+        batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
+        self._sync_if_cuda()
+        timings["avatar_prepare_frame"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = self._gaga.forward_expression(batch)
+        self._sync_if_cuda()
+        timings["avatar_forward_model"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = rgb.cpu()[0]
+        timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
+        return rgb, timings
+
+    def _sync_if_cuda(self):
+        device = torch.device(self._device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
