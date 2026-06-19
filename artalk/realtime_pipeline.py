@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 FPS = 25
 DEFAULT_RENDER_RES = 512
+DEFAULT_RENDER_BATCH_SIZE = 4
 AUDIO_OUT_PTIME = 0.020
 AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 
@@ -111,6 +112,7 @@ class ARTalkPipeline:
         gagavatar=None,
         gagavatar_flame=None,
         shape_id=None,
+        render_batch_size=DEFAULT_RENDER_BATCH_SIZE,
     ):
         self._device = device
         self._streamer = ARTalkStreamer(model, style_motion=style_motion)
@@ -144,6 +146,7 @@ class ARTalkPipeline:
         self._stop_event = threading.Event()
         self._dbg_calls = 0
         self._render_res = int(render_res)
+        self._render_batch_size = max(1, int(render_batch_size))
         self.metrics = PipelineMetrics()
         self.metrics.set("streamer_chunk_samples", self._streamer.patch_audio_length)
         self.metrics.set(
@@ -154,6 +157,7 @@ class ARTalkPipeline:
         self.metrics.set("fps", FPS)
         self.metrics.set("audio_out_samples_per_frame", AUDIO_OUT_SAMPLES_PER_FRAME)
         self.metrics.set("render_res", self._render_res)
+        self.metrics.set("render_batch_size", self._render_batch_size)
         self._initial_placeholder = np.zeros(
             (self._render_res, self._render_res, 3),
             dtype=np.uint8,
@@ -407,26 +411,42 @@ class ARTalkPipeline:
         if smoothed.shape[0] == 0:
             return
         render_chunk_t0 = time.perf_counter()
-        for i in range(smoothed.shape[0]):
+        rendered_in_chunk = 0
+        for start in range(0, smoothed.shape[0], self._render_batch_size):
+            motion_batch = smoothed[start : start + self._render_batch_size]
             render_t0 = time.perf_counter()
-            rgb, render_timings = self._renderer.render_frame_profile(smoothed[i])
+            rgb_batch, render_timings = self._renderer.render_batch_profile(
+                motion_batch
+            )
             for key, elapsed_s in render_timings.items():
                 self.metrics.observe_ms(key, elapsed_s)
-            self.metrics.observe_ms("avatar_render_frame", time.perf_counter() - render_t0)
+            self.metrics.observe_ms("avatar_render_batch", time.perf_counter() - render_t0)
+            self.metrics.inc("render_batches")
+            self.metrics.inc("render_batch_frames", motion_batch.shape[0])
             convert_t0 = time.perf_counter()
-            arr = (
-                (rgb * 255.0)
+            arr_batch = (
+                (rgb_batch * 255.0)
                 .clamp_(0, 255)
                 .to(torch.uint8)
-                .permute(1, 2, 0)
+                .permute(0, 2, 3, 1)
                 .contiguous()
                 .numpy()
             )
-            self.metrics.observe_ms("rgb_tensor_to_numpy", time.perf_counter() - convert_t0)
-            self._enqueue_frame(arr)
-            self.metrics.inc("rendered_frames")
-            self.metrics.set("last_rendered_s", time.perf_counter())
-        self.metrics.observe_ms("render_chunk_total", time.perf_counter() - render_chunk_t0)
+            self.metrics.observe_ms("rgb_batch_to_numpy", time.perf_counter() - convert_t0)
+            for arr in arr_batch:
+                self._enqueue_frame(arr)
+                self.metrics.inc("rendered_frames")
+                rendered_in_chunk += 1
+                self.metrics.set("last_rendered_s", time.perf_counter())
+        render_chunk_elapsed = time.perf_counter() - render_chunk_t0
+        self.metrics.observe_ms("render_chunk_total", render_chunk_elapsed)
+        self.metrics.set("last_render_chunk_frames", rendered_in_chunk)
+        self.metrics.set("last_render_chunk_s", render_chunk_elapsed)
+        if render_chunk_elapsed > 0:
+            self.metrics.set(
+                "last_render_chunk_fps",
+                rendered_in_chunk / render_chunk_elapsed,
+            )
         logger.warning(
             "[ARTalkPipeline] frames rendered call#%d video_q=%d "
             "audio_out_buf=%d",

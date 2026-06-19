@@ -119,6 +119,23 @@ class StreamingRenderer:
         return self._render_mesh_profile(motion_frame)
 
     @torch.no_grad()
+    def render_batch_profile(self, motion_frames):
+        """Render a motion batch and return ``(rgb_batch, timings)``.
+
+        ``motion_frames``: 2-D tensor of shape (T, motion_dim). Returns
+        a (T, 3, H, W) ``torch.float32`` tensor on CPU with values in
+        [0, 1]. Timings are batch totals, not per-frame durations.
+        """
+        if motion_frames.dim() != 2:
+            raise ValueError(
+                f"motion_frames must be 2-D, got shape {tuple(motion_frames.shape)}"
+            )
+        motion_frames = motion_frames.to(self._device)
+        if self.mode == "gagavatar":
+            return self._render_gagavatar_batch_profile(motion_frames)
+        return self._render_mesh_batch_profile(motion_frames)
+
+    @torch.no_grad()
     def feed(self, motion_frames):
         """Iterate over (T, motion_dim) and yield per-frame RGB tensors."""
         if motion_frames.dim() != 2:
@@ -160,6 +177,29 @@ class StreamingRenderer:
         timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
         return rgb, timings
 
+    def _render_mesh_batch_profile(self, motion_frames):
+        timings = {}
+        t0 = time.perf_counter()
+        shape_code = self._mesh_shape_code.expand(motion_frames.shape[0], -1)
+        verts = self._mesh_basic_vae.get_flame_verts(
+            self._mesh_flame,
+            shape_code,
+            motion_frames,
+            with_global=True,
+        )
+        self._sync_if_cuda()
+        timings["avatar_prepare_batch"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = self._mesh_renderer(verts)[0] / 255.0
+        self._sync_if_cuda()
+        timings["avatar_forward_batch"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = rgb.cpu()
+        timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
+        return rgb, timings
+
     def _render_gagavatar(self, motion_frame):
         batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
         rgb = self._gaga.forward_expression(batch)
@@ -180,6 +220,23 @@ class StreamingRenderer:
         t0 = time.perf_counter()
         rgb = rgb.cpu()[0]
         timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
+        return rgb, timings
+
+    def _render_gagavatar_batch_profile(self, motion_frames):
+        timings = {}
+        t0 = time.perf_counter()
+        batch = self._gaga.build_forward_batch(motion_frames, self._gaga_flame)
+        self._sync_if_cuda()
+        timings["avatar_prepare_batch"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = self._gaga.forward_expression(batch)
+        self._sync_if_cuda()
+        timings["avatar_forward_batch"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        rgb = rgb.cpu()
+        timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
         return rgb, timings
 
     def _sync_if_cuda(self):
