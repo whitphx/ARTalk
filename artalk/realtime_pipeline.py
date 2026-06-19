@@ -189,6 +189,8 @@ class ARTalkPipeline:
         otherwise — the call must return promptly so the outbound
         track keeps firing at its configured fps.
         """
+        self.metrics.set_once("first_video_callback_s", time.perf_counter())
+        self.metrics.inc("video_callbacks")
         try:
             arr = self.video_queue.get_nowait()
             self._placeholder = arr
@@ -210,6 +212,8 @@ class ARTalkPipeline:
         underrun) so the outbound track keeps timestamping at the
         configured ptime.
         """
+        self.metrics.set_once("first_audio_callback_s", time.perf_counter())
+        self.metrics.inc("audio_callbacks")
         n = AUDIO_OUT_SAMPLES_PER_FRAME
         with self._audio_out_lock:
             available = self._audio_out_buffer.size
