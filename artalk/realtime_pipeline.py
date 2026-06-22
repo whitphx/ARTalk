@@ -177,6 +177,7 @@ class ARTalkPipeline:
         resampling to 16 kHz mono and the heavy inference / render."""
         self.metrics.set_once("first_audio_push_s", time.perf_counter())
         self.metrics.inc("audio_frames_pushed")
+        self._record_frame_timestamp("input_audio", frame)
         self._audio_in_queue.put(frame)
         self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
 
@@ -191,6 +192,7 @@ class ARTalkPipeline:
         """
         self.metrics.set_once("first_video_callback_s", time.perf_counter())
         self.metrics.inc("video_callbacks")
+        self._record_callback_timestamp("video_source", pts, time_base)
         try:
             arr = self.video_queue.get_nowait()
             self._placeholder = arr
@@ -199,7 +201,10 @@ class ARTalkPipeline:
             arr = self._placeholder
             self.metrics.inc("video_placeholder_frames")
         self.metrics.set("video_queue_depth", self.video_queue.qsize())
-        return av.VideoFrame.from_ndarray(arr, format="rgb24")
+        frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
 
     def audio_source_callback(
         self, pts: int, time_base: fractions.Fraction
@@ -214,6 +219,7 @@ class ARTalkPipeline:
         """
         self.metrics.set_once("first_audio_callback_s", time.perf_counter())
         self.metrics.inc("audio_callbacks")
+        self._record_callback_timestamp("audio_source", pts, time_base)
         n = AUDIO_OUT_SAMPLES_PER_FRAME
         with self._audio_out_lock:
             available = self._audio_out_buffer.size
@@ -240,7 +246,31 @@ class ARTalkPipeline:
             samples[np.newaxis, :], format="s16", layout="mono"
         )
         frame.sample_rate = SAMPLE_RATE
+        frame.pts = pts
+        frame.time_base = time_base
         return frame
+
+    def _record_frame_timestamp(self, prefix: str, frame) -> None:
+        if frame.pts is None:
+            return
+        self.metrics.set(f"last_{prefix}_pts", frame.pts)
+        if frame.time_base is not None:
+            time_base = float(frame.time_base)
+            self.metrics.set(f"last_{prefix}_time_base", time_base)
+            self.metrics.set(f"last_{prefix}_time_s", frame.pts * time_base)
+
+    def _record_callback_timestamp(
+        self,
+        prefix: str,
+        pts: int | None,
+        time_base: fractions.Fraction,
+    ) -> None:
+        if pts is None:
+            return
+        self.metrics.set(f"last_{prefix}_pts", pts)
+        time_base_s = float(time_base)
+        self.metrics.set(f"last_{prefix}_time_base", time_base_s)
+        self.metrics.set(f"last_{prefix}_time_s", pts * time_base_s)
 
     def stop(self):
         # Signal the worker first so any frames it produces past this
@@ -271,6 +301,30 @@ class ARTalkPipeline:
                 q.get_nowait()
             except queue.Empty:
                 return
+
+    def _pop_pending_audio_for_output(self, n_samples: int) -> np.ndarray:
+        all_pending = (
+            np.concatenate(self._pending_audio_for_output)
+            if self._pending_audio_for_output
+            else np.zeros(0, dtype=np.int16)
+        )
+        emitted_audio = all_pending[:n_samples]
+        leftover = all_pending[n_samples:]
+        self._pending_audio_for_output = (
+            [leftover] if leftover.size > 0 else []
+        )
+        self.metrics.set("pending_audio_for_output_samples", leftover.size)
+        return emitted_audio
+
+    def _append_output_audio(self, samples: np.ndarray) -> None:
+        if samples.size == 0:
+            return
+        with self._audio_out_lock:
+            self._audio_out_buffer = np.concatenate(
+                [self._audio_out_buffer, samples]
+            )
+            buffered = self._audio_out_buffer.size
+        self.metrics.set("audio_out_buffer_samples", buffered)
 
     @property
     def is_stopped(self) -> bool:
@@ -376,35 +430,10 @@ class ARTalkPipeline:
         self.metrics.set("last_motion_frames", motion.shape[0])
         self.metrics.set("last_motion_s", now)
 
-        # Couple the matching audio with the produced motion: each
-        # motion frame corresponds to SAMPLE_RATE / FPS = 640 samples,
-        # so 100 frames consume 64000 samples (= 4 s @ 16 kHz).
-        n_audio_samples_out = motion.shape[0] * SAMPLE_RATE // FPS
-        all_pending = (
-            np.concatenate(self._pending_audio_for_output)
-            if self._pending_audio_for_output
-            else np.zeros(0, dtype=np.int16)
-        )
-        emitted_audio = all_pending[:n_audio_samples_out]
-        leftover = all_pending[n_audio_samples_out:]
-        self._pending_audio_for_output = (
-            [leftover] if leftover.size > 0 else []
-        )
-        with self._audio_out_lock:
-            self._audio_out_buffer = np.concatenate(
-                [self._audio_out_buffer, emitted_audio]
-            )
-            buffered = self._audio_out_buffer.size
-        self.metrics.inc("audio_samples_emitted", emitted_audio.size)
-        self.metrics.set("audio_out_buffer_samples", buffered)
-
         logger.warning(
-            "[ARTalkPipeline] motion produced call#%d motion=%s "
-            "audio_emitted=%d expected=%d",
+            "[ARTalkPipeline] motion produced call#%d motion=%s",
             self._dbg_calls,
             tuple(motion.shape),
-            emitted_audio.size,
-            n_audio_samples_out,
         )
 
         t0 = time.perf_counter()
@@ -414,8 +443,15 @@ class ARTalkPipeline:
         self.metrics.set("last_smoothed_frames", smoothed.shape[0])
         if smoothed.shape[0] == 0:
             return
+        # Couple output audio with frames that will actually be rendered.
+        # Each video frame corresponds to SAMPLE_RATE / FPS = 640 samples.
+        n_audio_samples_out = smoothed.shape[0] * SAMPLE_RATE // FPS
+        emitted_audio = self._pop_pending_audio_for_output(n_audio_samples_out)
+        self.metrics.inc("audio_samples_emitted", emitted_audio.size)
+        self.metrics.set("last_audio_samples_emitted", emitted_audio.size)
         render_chunk_t0 = time.perf_counter()
         rendered_in_chunk = 0
+        audio_cursor = 0
         for start in range(0, smoothed.shape[0], self._render_batch_size):
             motion_batch = smoothed[start : start + self._render_batch_size]
             render_t0 = time.perf_counter()
@@ -442,6 +478,12 @@ class ARTalkPipeline:
                 self.metrics.inc("rendered_frames")
                 rendered_in_chunk += 1
                 self.metrics.set("last_rendered_s", time.perf_counter())
+            n_batch_audio_samples = arr_batch.shape[0] * SAMPLE_RATE // FPS
+            audio_slice = emitted_audio[
+                audio_cursor : audio_cursor + n_batch_audio_samples
+            ]
+            audio_cursor += n_batch_audio_samples
+            self._append_output_audio(audio_slice)
         render_chunk_elapsed = time.perf_counter() - render_chunk_t0
         self.metrics.observe_ms("render_chunk_total", render_chunk_elapsed)
         self.metrics.set("last_render_chunk_frames", rendered_in_chunk)
