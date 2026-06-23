@@ -45,10 +45,9 @@ DEFAULT_RENDER_BATCH_SIZE = 8
 AUDIO_OUT_PTIME = 0.020
 AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 AUDIO_SAMPLES_PER_VIDEO_FRAME = SAMPLE_RATE // FPS
-OUTPUT_AUDIO_PREBUFFER_SECONDS = 1.00
-OUTPUT_AUDIO_PREBUFFER_SAMPLES = int(SAMPLE_RATE * OUTPUT_AUDIO_PREBUFFER_SECONDS)
-OUTPUT_SEGMENT_SECONDS = 1.00
-OUTPUT_SEGMENT_MIN_FRAMES = max(1, int(FPS * OUTPUT_SEGMENT_SECONDS))
+DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS = 1.00
+DEFAULT_OUTPUT_SEGMENT_SECONDS = 1.00
+DEFAULT_EVENT_HISTORY_LIMIT = 3000
 
 
 class PipelineMetrics:
@@ -59,6 +58,7 @@ class PipelineMetrics:
         self._created_at = time.perf_counter()
         self._counters: dict[str, int | float] = {}
         self._durations: dict[str, dict[str, float]] = {}
+        self._events: deque[dict] = deque(maxlen=DEFAULT_EVENT_HISTORY_LIMIT)
 
     def inc(self, key: str, value: int | float = 1) -> None:
         with self._lock:
@@ -89,17 +89,41 @@ class PipelineMetrics:
             stat["max_ms"] = max(stat["max_ms"], elapsed_ms)
             stat["last_ms"] = elapsed_ms
 
+    def observe_min(self, key: str, value: int | float) -> None:
+        with self._lock:
+            current = self._counters.get(key)
+            if current is None or value < current:
+                self._counters[key] = value
+
+    def observe_max(self, key: str, value: int | float) -> None:
+        with self._lock:
+            current = self._counters.get(key)
+            if current is None or value > current:
+                self._counters[key] = value
+
+    def event(self, event_type: str, **fields) -> None:
+        event = {
+            "t": time.perf_counter() - self._created_at,
+            "type": event_type,
+        }
+        for key, value in fields.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                event[key] = value
+        with self._lock:
+            self._events.append(event)
+
     def snapshot(self) -> dict:
         now = time.perf_counter()
         with self._lock:
             counters = dict(self._counters)
             durations = {key: dict(value) for key, value in self._durations.items()}
+            events = list(self._events)
         for stat in durations.values():
             count = stat["count"]
             stat["avg_ms"] = stat["total_ms"] / count if count else 0.0
         counters["uptime_s"] = now - self._created_at
         counters["now_s"] = now
-        return {"counters": counters, "durations": durations}
+        return {"counters": counters, "durations": durations, "events": events}
 
 
 class ARTalkPipeline:
@@ -119,6 +143,8 @@ class ARTalkPipeline:
         gagavatar_flame=None,
         shape_id=None,
         render_batch_size=DEFAULT_RENDER_BATCH_SIZE,
+        output_audio_prebuffer_seconds=DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS,
+        output_segment_seconds=DEFAULT_OUTPUT_SEGMENT_SECONDS,
     ):
         self._device = device
         self._streamer = ARTalkStreamer(model, style_motion=style_motion)
@@ -170,6 +196,18 @@ class ARTalkPipeline:
         self._dbg_calls = 0
         self._render_res = int(render_res)
         self._render_batch_size = max(1, int(render_batch_size))
+        self._output_audio_prebuffer_seconds = max(
+            0.0,
+            float(output_audio_prebuffer_seconds),
+        )
+        self._output_audio_prebuffer_samples = int(
+            SAMPLE_RATE * self._output_audio_prebuffer_seconds
+        )
+        self._output_segment_seconds = max(1 / FPS, float(output_segment_seconds))
+        self._output_segment_min_frames = max(
+            1,
+            int(round(FPS * self._output_segment_seconds)),
+        )
         self.metrics = PipelineMetrics()
         self.metrics.set("streamer_chunk_samples", self._streamer.patch_audio_length)
         self.metrics.set(
@@ -180,8 +218,16 @@ class ARTalkPipeline:
         self.metrics.set("fps", FPS)
         self.metrics.set("audio_out_samples_per_frame", AUDIO_OUT_SAMPLES_PER_FRAME)
         self.metrics.set("audio_samples_per_video_frame", AUDIO_SAMPLES_PER_VIDEO_FRAME)
-        self.metrics.set("output_audio_prebuffer_samples", OUTPUT_AUDIO_PREBUFFER_SAMPLES)
-        self.metrics.set("output_segment_min_frames", OUTPUT_SEGMENT_MIN_FRAMES)
+        self.metrics.set(
+            "output_audio_prebuffer_seconds",
+            self._output_audio_prebuffer_seconds,
+        )
+        self.metrics.set(
+            "output_audio_prebuffer_samples",
+            self._output_audio_prebuffer_samples,
+        )
+        self.metrics.set("output_segment_seconds", self._output_segment_seconds)
+        self.metrics.set("output_segment_min_frames", self._output_segment_min_frames)
         self.metrics.set("render_res", self._render_res)
         self.metrics.set("render_batch_size", self._render_batch_size)
         self._initial_placeholder = np.zeros(
@@ -205,7 +251,9 @@ class ARTalkPipeline:
         self.metrics.inc("audio_frames_pushed")
         self._record_frame_timestamp("input_audio", frame)
         self._audio_in_queue.put(frame)
-        self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
+        depth = self._audio_in_queue.qsize()
+        self.metrics.set("audio_in_queue_depth", depth)
+        self.metrics.event("input_audio_frame", queue_depth=depth)
 
     def push_audio_samples(self, samples_int16: np.ndarray) -> None:
         """Queue already-resampled 16 kHz mono int16 samples.
@@ -224,7 +272,13 @@ class ARTalkPipeline:
         self.metrics.inc("audio_sample_chunks_pushed")
         self.metrics.inc("audio_samples_pushed", samples.size)
         self._audio_in_queue.put(samples.copy())
-        self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
+        depth = self._audio_in_queue.qsize()
+        self.metrics.set("audio_in_queue_depth", depth)
+        self.metrics.event(
+            "input_sample_chunk",
+            samples=samples.size,
+            queue_depth=depth,
+        )
 
     def push_silence(self, duration_s: float) -> None:
         n_samples = max(0, int(round(duration_s * SAMPLE_RATE)))
@@ -259,12 +313,24 @@ class ARTalkPipeline:
         if arr is None:
             arr = self._placeholder
             self.metrics.inc("video_placeholder_frames")
+            self.metrics.inc("video_no_ready_frame_callbacks")
+            self.metrics.event(
+                "output_video_placeholder",
+                target_index=target_index,
+            )
         else:
             self._placeholder = arr
             self._last_video_frame_index_served = frame_index
             self.metrics.inc("video_frames_served")
             self.metrics.set("last_video_frame_index_served", frame_index)
+            self._record_served_video_lag(target_index, frame_index)
+            self.metrics.event(
+                "output_video_frame",
+                target_index=target_index,
+                frame_index=frame_index,
+            )
         self.metrics.set("video_queue_depth", self._video_queue_depth())
+        self._record_video_lead(target_index)
         frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
         frame.pts = pts
         frame.time_base = time_base
@@ -288,7 +354,10 @@ class ARTalkPipeline:
         playback_started_now = False
         with self._audio_out_lock:
             available = self._audio_out_buffer.size
-            if not self._playback_started and available >= OUTPUT_AUDIO_PREBUFFER_SAMPLES:
+            if (
+                not self._playback_started
+                and available >= self._output_audio_prebuffer_samples
+            ):
                 self._playback_started = True
                 playback_started_now = True
             # Do not emit partial audio padded with zeros. That made chunk
@@ -310,16 +379,24 @@ class ARTalkPipeline:
         self.metrics.inc("audio_frames_served")
         if playback_started_now:
             self.metrics.inc("audio_playback_starts")
+            self.metrics.event("audio_playback_start", buffered_samples=available)
         if underrun:
             if not self._playback_started:
                 self.metrics.inc("audio_preplayback_silence_frames")
                 self.metrics.inc("audio_preplayback_silence_samples", underrun)
+                self.metrics.event("audio_preplayback_silence", samples=underrun)
             elif available > 0:
                 self.metrics.inc("audio_short_buffer_frames")
                 self.metrics.inc("audio_short_buffer_samples", underrun)
+                self.metrics.event(
+                    "audio_short_buffer",
+                    underrun_samples=underrun,
+                    available=available,
+                )
             else:
                 self.metrics.inc("audio_playback_underrun_frames")
                 self.metrics.inc("audio_playback_underrun_samples", underrun)
+                self.metrics.event("audio_underrun", available=available)
         self.metrics.set("audio_playback_started", 1 if self._playback_started else 0)
         self.metrics.set("synced_audio_samples_served", synced_audio_samples)
         self.metrics.set(
@@ -327,6 +404,15 @@ class ARTalkPipeline:
             synced_audio_samples // AUDIO_SAMPLES_PER_VIDEO_FRAME,
         )
         self.metrics.set("audio_out_buffer_samples", buffered)
+        self.metrics.set("audio_out_buffer_seconds", buffered / SAMPLE_RATE)
+        self.metrics.observe_min("min_audio_out_buffer_seconds", buffered / SAMPLE_RATE)
+        self.metrics.observe_max("max_audio_out_buffer_seconds", buffered / SAMPLE_RATE)
+        self.metrics.event(
+            "output_audio_callback",
+            underrun_samples=underrun,
+            buffered_samples=buffered,
+            synced_samples=synced_audio_samples,
+        )
         # AudioFrame.from_ndarray for s16 mono expects shape (1, N).
         frame = av.AudioFrame.from_ndarray(
             samples[np.newaxis, :], format="s16", layout="mono"
@@ -361,10 +447,51 @@ class ARTalkPipeline:
             depth = len(self._video_queue)
         if dropped_for_sync:
             self.metrics.inc("video_frames_dropped_for_sync", dropped_for_sync)
+            self.metrics.event(
+                "video_sync_drop",
+                frames=dropped_for_sync,
+                target_index=target_index,
+            )
         self.metrics.set("video_queue_depth", depth)
         if selected is None:
             return None, None
         return selected[1], selected[0]
+
+    def _record_served_video_lag(
+        self,
+        target_index: int,
+        frame_index: int | None,
+    ) -> None:
+        if frame_index is None or target_index < 0:
+            return
+        lag_frames = target_index - frame_index
+        self.metrics.set("last_video_served_lag_frames", lag_frames)
+        self.metrics.set("last_video_served_lag_seconds", lag_frames / FPS)
+        self.metrics.observe_max("max_video_served_lag_frames", lag_frames)
+
+    def _record_video_lead(self, target_index: int) -> None:
+        with self._video_queue_lock:
+            depth = len(self._video_queue)
+            first_index = self._video_queue[0][0] if self._video_queue else None
+            last_index = self._video_queue[-1][0] if self._video_queue else None
+            last_enqueued = self._next_video_frame_index - 1
+        self.metrics.set("video_queue_depth", depth)
+        if first_index is not None:
+            self.metrics.set("video_queue_first_frame_index", first_index)
+        if last_index is not None:
+            self.metrics.set("video_queue_last_frame_index", last_index)
+            self.metrics.set("video_queue_span_frames", last_index - first_index + 1)
+            self.metrics.set(
+                "video_queue_span_seconds",
+                (last_index - first_index + 1) / FPS,
+            )
+        if target_index < 0 or last_enqueued < 0:
+            return
+        lead_frames = last_enqueued - target_index
+        self.metrics.set("video_lead_frames", lead_frames)
+        self.metrics.set("video_lead_seconds", lead_frames / FPS)
+        self.metrics.observe_min("min_video_lead_frames", lead_frames)
+        self.metrics.observe_max("max_video_lead_frames", lead_frames)
 
     def _record_frame_timestamp(self, prefix: str, frame) -> None:
         if frame.pts is None:
@@ -478,11 +605,28 @@ class ARTalkPipeline:
             self.metrics.set("last_video_frame_index_enqueued", last_frame_index)
         self.metrics.set("video_queue_depth", video_depth)
         self.metrics.set("audio_out_buffer_samples", audio_buffered)
+        self.metrics.set("audio_out_buffer_seconds", audio_buffered / SAMPLE_RATE)
+        self.metrics.observe_min(
+            "min_audio_out_buffer_seconds",
+            audio_buffered / SAMPLE_RATE,
+        )
+        self.metrics.observe_max(
+            "max_audio_out_buffer_seconds",
+            audio_buffered / SAMPLE_RATE,
+        )
         self.metrics.inc("output_segments_published")
         self.metrics.inc("output_segment_frames", len(frames))
         self.metrics.inc("output_segment_audio_samples", audio.size)
         self.metrics.set("last_output_segment_frames", len(frames))
         self.metrics.set("last_output_segment_audio_samples", audio.size)
+        self.metrics.event(
+            "output_segment",
+            frames=len(frames),
+            audio_samples=audio.size,
+            audio_buffered=audio_buffered,
+            video_depth=video_depth,
+        )
+        self._record_video_lead(self._media_clock_frame_index())
 
     @property
     def is_stopped(self) -> bool:
@@ -568,6 +712,12 @@ class ARTalkPipeline:
         self.metrics.inc("streamer_feed_calls")
         self.metrics.inc("audio_samples_fed_to_streamer", samples_int16.size)
         self.metrics.set("streamer_buffer_samples", buf_after)
+        self.metrics.event(
+            "streamer_feed",
+            samples=samples_int16.size,
+            duration_s=streamer_elapsed,
+            motion_frames=motion.shape[0],
+        )
         self._dbg_calls += 1
         pending_out_total = sum(p.size for p in self._pending_audio_for_output)
         self.metrics.set("pending_audio_for_output_samples", pending_out_total)
@@ -598,6 +748,7 @@ class ARTalkPipeline:
         self.metrics.inc("motion_frames_produced", motion.shape[0])
         self.metrics.set("last_motion_frames", motion.shape[0])
         self.metrics.set("last_motion_s", now)
+        self.metrics.event("motion_chunk", frames=motion.shape[0])
 
         logger.warning(
             "[ARTalkPipeline] motion produced call#%d motion=%s",
@@ -670,7 +821,7 @@ class ARTalkPipeline:
                 self.metrics.inc("rendered_frames")
                 rendered_in_chunk += 1
                 self.metrics.set("last_rendered_s", time.perf_counter())
-            if len(segment_frames) >= OUTPUT_SEGMENT_MIN_FRAMES:
+            if len(segment_frames) >= self._output_segment_min_frames:
                 publish_pending_segment()
         publish_pending_segment()
         render_chunk_elapsed = time.perf_counter() - render_chunk_t0
@@ -689,6 +840,12 @@ class ARTalkPipeline:
                 "last_render_chunk_fps",
                 rendered_in_chunk / render_chunk_elapsed,
             )
+        self.metrics.event(
+            "render_chunk",
+            frames=rendered_in_chunk,
+            duration_s=render_chunk_elapsed,
+            media_s=render_chunk_media_s,
+        )
         logger.warning(
             "[ARTalkPipeline] frames rendered call#%d video_q=%d "
             "audio_out_buf=%d",
