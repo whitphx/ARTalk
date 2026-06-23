@@ -166,6 +166,7 @@ class ARTalkPipeline:
         # _audio_out_buffer.
         self._pending_audio_for_output: list[np.ndarray] = []
         self._stop_event = threading.Event()
+        self._worker_busy = False
         self._dbg_calls = 0
         self._render_res = int(render_res)
         self._render_batch_size = max(1, int(render_batch_size))
@@ -205,6 +206,40 @@ class ARTalkPipeline:
         self._record_frame_timestamp("input_audio", frame)
         self._audio_in_queue.put(frame)
         self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
+
+    def push_audio_samples(self, samples_int16: np.ndarray) -> None:
+        """Queue already-resampled 16 kHz mono int16 samples.
+
+        This is useful for app-level glue code that synthesizes filler audio
+        between upstream audio chunks. The samples still flow through the
+        pipeline worker so ARTalkStreamer, smoothing, and rendering state remain
+        single-threaded.
+        """
+        samples = np.asarray(samples_int16, dtype=np.int16)
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        if samples.size == 0:
+            return
+        self.metrics.set_once("first_audio_push_s", time.perf_counter())
+        self.metrics.inc("audio_sample_chunks_pushed")
+        self.metrics.inc("audio_samples_pushed", samples.size)
+        self._audio_in_queue.put(samples.copy())
+        self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
+
+    def push_silence(self, duration_s: float) -> None:
+        n_samples = max(0, int(round(duration_s * SAMPLE_RATE)))
+        if n_samples:
+            self.push_audio_samples(np.zeros(n_samples, dtype=np.int16))
+
+    def output_buffer_snapshot(self) -> dict[str, int]:
+        with self._audio_out_lock:
+            audio_out_buffer_samples = self._audio_out_buffer.size
+        return {
+            "audio_in_queue_depth": self._audio_in_queue.qsize(),
+            "audio_out_buffer_samples": audio_out_buffer_samples,
+            "video_queue_depth": self._video_queue_depth(),
+            "worker_busy": int(self._worker_busy),
+        }
 
     def video_source_callback(
         self, pts: int, time_base: fractions.Fraction
@@ -478,14 +513,22 @@ class ARTalkPipeline:
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                frame = self._audio_in_queue.get(timeout=0.1)
+                item = self._audio_in_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             self.metrics.set("audio_in_queue_depth", self._audio_in_queue.qsize())
+            self._worker_busy = True
+            self.metrics.set("worker_busy", 1)
             try:
-                self._process_input_frame(frame)
+                if isinstance(item, np.ndarray):
+                    self._process_sample_chunk(item)
+                else:
+                    self._process_input_frame(item)
             except Exception:
                 logger.exception("[ARTalkPipeline] worker error")
+            finally:
+                self._worker_busy = False
+                self.metrics.set("worker_busy", 0)
 
     def _process_input_frame(self, frame: av.AudioFrame):
         # Resample to 16 kHz mono int16 once; the same chunks are both
@@ -505,8 +548,11 @@ class ARTalkPipeline:
             samples = arr.astype(np.int16, copy=True)
             self.metrics.inc("audio_chunks_resampled")
             self.metrics.inc("audio_samples_resampled", samples.size)
-            self._pending_audio_for_output.append(samples)
-            self._process_audio_chunk(samples)
+            self._process_sample_chunk(samples)
+
+    def _process_sample_chunk(self, samples_int16: np.ndarray) -> None:
+        self._pending_audio_for_output.append(samples_int16)
+        self._process_audio_chunk(samples_int16)
 
     def _process_audio_chunk(self, samples_int16: np.ndarray):
         self.metrics.set_once("first_audio_process_s", time.perf_counter())
