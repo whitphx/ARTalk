@@ -34,6 +34,11 @@ import torch
 import torch.nn.functional as F
 from scipy.signal import savgol_filter
 
+from .metrics import (
+    observe_pipeline_duration_if_active,
+    pipeline_metrics_scope_if_active,
+)
+
 
 SAMPLE_RATE = 16000
 FPS = 25.0
@@ -90,17 +95,22 @@ class ARTalkStreamer:
     def feed(self, audio):
         if audio.dim() != 1:
             raise ValueError(f"audio must be 1-D, got shape {tuple(audio.shape)}")
-        audio = audio.to(device=self.device, dtype=self.dtype)
-        self._audio_buffer = torch.cat([self._audio_buffer, audio])
+        with pipeline_metrics_scope_if_active("artalk"):
+            with observe_pipeline_duration_if_active("streamer_audio_to_device"):
+                audio = audio.to(device=self.device, dtype=self.dtype)
+            with observe_pipeline_duration_if_active("streamer_buffer_append"):
+                self._audio_buffer = torch.cat([self._audio_buffer, audio])
 
-        outputs = []
-        while self._audio_buffer.shape[0] >= self.patch_audio_length:
-            chunk = self._audio_buffer[: self.patch_audio_length]
-            self._audio_buffer = self._audio_buffer[self.patch_audio_length:]
-            outputs.append(self._step_chunk(chunk[None]))
-        if outputs:
-            return torch.cat(outputs, dim=0)
-        return torch.zeros(0, self.motion_dim, dtype=self.dtype, device=self.device)
+            outputs = []
+            while self._audio_buffer.shape[0] >= self.patch_audio_length:
+                chunk = self._audio_buffer[: self.patch_audio_length]
+                self._audio_buffer = self._audio_buffer[self.patch_audio_length:]
+                with observe_pipeline_duration_if_active("streamer_step_chunk"):
+                    outputs.append(self._step_chunk(chunk[None]))
+            if outputs:
+                with observe_pipeline_duration_if_active("streamer_output_concat"):
+                    return torch.cat(outputs, dim=0)
+            return torch.zeros(0, self.motion_dim, dtype=self.dtype, device=self.device)
 
     @torch.no_grad()
     def finish(self):
@@ -120,66 +130,86 @@ class ARTalkStreamer:
     @torch.no_grad()
     def _step_chunk(self, audio_chunk):
         model = self.model
-        lvl_pos_embed = model.lvl_embed(model.lvl_idx) + model.pos_embed
-        prev_lvl_pos_embed = (
-            model.lvl_embed(model.lvl_idx).repeat(1, model.prev_ratio, 1)
-            + model.prev_pos_embed
-        )
-
-        split_audio_feat = model.audio_encoder(audio_chunk).permute(0, 2, 1)
-        split_audio_feats = [
-            F.interpolate(split_audio_feat, size=(pn), mode="area").permute(0, 2, 1)
-            for pn in model.patch_nums
-        ]
-        split_audio_cond = torch.cat(split_audio_feats, dim=1).detach()
-
-        next_ar_vqfeat = self._motion_style_cond
-        pred_motion_bits = None
-        for pidx, _pn in enumerate(model.patch_nums):
-            patch_audio_cond = split_audio_cond[:, : sum(model.patch_nums[: pidx + 1])]
-            patch_attn_bias = model.attn_bias_for_masking[
-                :,
-                :,
-                : sum(model.patch_nums[: pidx + 1]),
-                : sum(model.patch_nums[: pidx + 1]) + sum(model.patch_nums) * model.prev_ratio,
-            ]
-            attn_feat = next_ar_vqfeat + lvl_pos_embed[:, : next_ar_vqfeat.shape[1]]
-            for bidx in range(model.attn_depth):
-                attn_feat = model.attn_blocks[bidx](
-                    attn_feat,
-                    self._prev_attn_feat + prev_lvl_pos_embed,
-                    patch_audio_cond,
-                    attn_bias=patch_attn_bias,
-                )
-            pred_motion_logits = model.logits_head(
-                model.cond_logits_head(attn_feat, patch_audio_cond)
+        with observe_pipeline_duration_if_active("streamer_pos_embed"):
+            lvl_pos_embed = model.lvl_embed(model.lvl_idx) + model.pos_embed
+            prev_lvl_pos_embed = (
+                model.lvl_embed(model.lvl_idx).repeat(1, model.prev_ratio, 1)
+                + model.prev_pos_embed
             )
-            pred_motion_bits = pred_motion_logits.view(
-                pred_motion_logits.shape[0], pred_motion_logits.shape[1], -1, 2,
-            ).argmax(dim=-1)
-            if pidx < len(model.patch_nums) - 1:
-                next_ar_vqfeat = model.basic_vae.vqidx_to_ar_vqfeat(pidx, pred_motion_bits)
-                next_ar_vqfeat = torch.cat(
-                    [self._motion_style_cond, model.vqfeat_embed(next_ar_vqfeat)], dim=1,
+
+        with observe_pipeline_duration_if_active("streamer_audio_encoder"):
+            split_audio_feat = model.audio_encoder(audio_chunk).permute(0, 2, 1)
+        with observe_pipeline_duration_if_active("streamer_audio_condition_resample"):
+            split_audio_feats = [
+                F.interpolate(split_audio_feat, size=(pn), mode="area").permute(0, 2, 1)
+                for pn in model.patch_nums
+            ]
+            split_audio_cond = torch.cat(split_audio_feats, dim=1).detach()
+
+        with observe_pipeline_duration_if_active("streamer_ar_decode"):
+            next_ar_vqfeat = self._motion_style_cond
+            pred_motion_bits = None
+            for pidx, _pn in enumerate(model.patch_nums):
+                patch_audio_cond = split_audio_cond[:, : sum(model.patch_nums[: pidx + 1])]
+                patch_attn_bias = model.attn_bias_for_masking[
+                    :,
+                    :,
+                    : sum(model.patch_nums[: pidx + 1]),
+                    : sum(model.patch_nums[: pidx + 1])
+                    + sum(model.patch_nums) * model.prev_ratio,
+                ]
+                attn_feat = next_ar_vqfeat + lvl_pos_embed[:, : next_ar_vqfeat.shape[1]]
+                for bidx in range(model.attn_depth):
+                    attn_feat = model.attn_blocks[bidx](
+                        attn_feat,
+                        self._prev_attn_feat + prev_lvl_pos_embed,
+                        patch_audio_cond,
+                        attn_bias=patch_attn_bias,
+                    )
+                pred_motion_logits = model.logits_head(
+                    model.cond_logits_head(attn_feat, patch_audio_cond)
                 )
+                pred_motion_bits = pred_motion_logits.view(
+                    pred_motion_logits.shape[0], pred_motion_logits.shape[1], -1, 2,
+                ).argmax(dim=-1)
+                if pidx < len(model.patch_nums) - 1:
+                    next_ar_vqfeat = model.basic_vae.vqidx_to_ar_vqfeat(
+                        pidx,
+                        pred_motion_bits,
+                    )
+                    next_ar_vqfeat = torch.cat(
+                        [self._motion_style_cond, model.vqfeat_embed(next_ar_vqfeat)],
+                        dim=1,
+                    )
 
-        _, this_pred_motion = model.basic_vae.vqidx_to_motion(
-            self._prev_code_bits, pred_motion_bits
-        )
+        with observe_pipeline_duration_if_active("streamer_vq_to_motion"):
+            _, this_pred_motion = model.basic_vae.vqidx_to_motion(
+                self._prev_code_bits, pred_motion_bits
+            )
 
-        new_prev_code_bits, _ = model.basic_vae.quant_to_vqidx(this_pred_motion, this_motion=None)
-        new_prev_vqfeat = model.basic_vae.vqidx_to_ms_vqfeat(new_prev_code_bits).detach()
-        this_prev_attn_feat = torch.cat(
-            [self._motion_style_cond, model.vqfeat_embed(new_prev_vqfeat)], dim=1,
-        )
-        new_prev_attn_feat = torch.cat(
-            [self._prev_attn_feat[:, this_prev_attn_feat.shape[1]:], this_prev_attn_feat], dim=1,
-        )
+        with observe_pipeline_duration_if_active("streamer_state_update"):
+            new_prev_code_bits, _ = model.basic_vae.quant_to_vqidx(
+                this_pred_motion,
+                this_motion=None,
+            )
+            new_prev_vqfeat = (
+                model.basic_vae.vqidx_to_ms_vqfeat(new_prev_code_bits).detach()
+            )
+            this_prev_attn_feat = torch.cat(
+                [self._motion_style_cond, model.vqfeat_embed(new_prev_vqfeat)], dim=1,
+            )
+            new_prev_attn_feat = torch.cat(
+                [
+                    self._prev_attn_feat[:, this_prev_attn_feat.shape[1]:],
+                    this_prev_attn_feat,
+                ],
+                dim=1,
+            )
 
-        self._prev_code_bits = new_prev_code_bits
-        self._prev_attn_feat = new_prev_attn_feat
+            self._prev_code_bits = new_prev_code_bits
+            self._prev_attn_feat = new_prev_attn_feat
 
-        return this_pred_motion[0]
+            return this_pred_motion[0]
 
 
 class CausalSavgolSmoother:
@@ -268,12 +298,19 @@ class CausalSavgolSmoother:
 
     @classmethod
     def _apply_savgol(cls, buffer):
-        motion_np = buffer.detach().cpu().numpy()
-        smoothed = savgol_filter(
-            motion_np, cls.DEFAULT_WINDOW, cls.DEFAULT_POLY, axis=0,
-        )
-        smoothed[..., cls.POSE_SLICE] = savgol_filter(
-            motion_np[..., cls.POSE_SLICE],
-            cls.POSE_WINDOW, cls.POSE_POLY, axis=0,
-        )
-        return torch.from_numpy(smoothed).to(device=buffer.device, dtype=buffer.dtype)
+        with pipeline_metrics_scope_if_active("artalk"):
+            with observe_pipeline_duration_if_active("smoother_motion_to_cpu"):
+                motion_np = buffer.detach().cpu().numpy()
+            with observe_pipeline_duration_if_active("smoother_savgol"):
+                smoothed = savgol_filter(
+                    motion_np, cls.DEFAULT_WINDOW, cls.DEFAULT_POLY, axis=0,
+                )
+                smoothed[..., cls.POSE_SLICE] = savgol_filter(
+                    motion_np[..., cls.POSE_SLICE],
+                    cls.POSE_WINDOW, cls.POSE_POLY, axis=0,
+                )
+            with observe_pipeline_duration_if_active("smoother_tensor_to_device"):
+                return torch.from_numpy(smoothed).to(
+                    device=buffer.device,
+                    dtype=buffer.dtype,
+                )

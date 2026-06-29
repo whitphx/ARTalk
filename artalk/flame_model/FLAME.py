@@ -7,10 +7,10 @@ Modified from smplx code for FLAME by Xuangeng Chu (xg.chu@outlook.com)
 import os
 
 import torch
-import pickle
 import numpy as np
 import torch.nn as nn
 
+from ..metrics import observe_pipeline_duration_if_active, pipeline_metrics_scope_if_active
 from .lbs import lbs, batch_rodrigues, vertices2landmarks
 
 class FLAMEModel(nn.Module):
@@ -131,40 +131,44 @@ class FLAMEModel(nn.Module):
             eye_pose_params = self.eye_pose.expand(batch_size, -1)
         if expression_params is None:
             expression_params = torch.zeros(batch_size, self.cfg.n_exp).to(shape_params.device)
-        if pose_params.shape[-1] == 3:
-            pose_params = torch.cat([torch.zeros(batch_size, 3).to(pose_params.device), pose_params], dim=-1)
-        betas = torch.cat([shape_params, expression_params], dim=1)
-        full_pose = torch.cat([
-                pose_params[:, :3], self.neck_pose.expand(batch_size, -1), 
-                pose_params[:, 3:], eye_pose_params
-            ], dim=1
-        )
-        template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
-        vertices, _ = lbs(
-            betas, full_pose, template_vertices,
-            self.shapedirs, self.posedirs, self.J_regressor, self.parents,
-            self.lbs_weights, dtype=self.dtype, detach_pose_correctives=False
-        )
-        if self.no_lmks:
-            return vertices * self.scale
-        if self.lmks_type == 'lmks70':
-            landmarks3d = vertices2landmarks(
-                vertices, self.faces_tensor, 
-                self.full_lmk_faces_idx.repeat(vertices.shape[0], 1),
-                self.full_lmk_bary_coords.repeat(vertices.shape[0], 1, 1)
-            )
-            landmark_3d = reselect_eyes(vertices, landmarks3d)
-        elif self.lmks_type == 'dense105':
-            landmarks3d = vertices2landmarks(
-                vertices, self.faces_tensor,
-                self.lmk_faces_idx_mediapipe.unsqueeze(dim=0).expand(batch_size, -1).contiguous(),
-                self.lmk_bary_coords_mediapipe.unsqueeze(dim=0).expand(batch_size, -1, -1).contiguous()
-            )
-        else:
-            raise ValueError(f"Unknown lmks_type: {self.lmks_type}.")
-        if verts_sclae is not None:
-            return vertices * verts_sclae, landmark_3d * verts_sclae
-        return vertices * self.scale, landmarks3d * self.scale
+        with pipeline_metrics_scope_if_active("flame"):
+            with observe_pipeline_duration_if_active("prepare_params"):
+                if pose_params.shape[-1] == 3:
+                    pose_params = torch.cat([torch.zeros(batch_size, 3).to(pose_params.device), pose_params], dim=-1)
+                betas = torch.cat([shape_params, expression_params], dim=1)
+                full_pose = torch.cat([
+                        pose_params[:, :3], self.neck_pose.expand(batch_size, -1),
+                        pose_params[:, 3:], eye_pose_params
+                    ], dim=1
+                )
+                template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
+            with observe_pipeline_duration_if_active("lbs"):
+                vertices, _ = lbs(
+                    betas, full_pose, template_vertices,
+                    self.shapedirs, self.posedirs, self.J_regressor, self.parents,
+                    self.lbs_weights, dtype=self.dtype, detach_pose_correctives=False
+                )
+            if self.no_lmks:
+                return vertices * self.scale
+            with observe_pipeline_duration_if_active("landmarks"):
+                if self.lmks_type == 'lmks70':
+                    landmarks3d = vertices2landmarks(
+                        vertices, self.faces_tensor,
+                        self.full_lmk_faces_idx.repeat(vertices.shape[0], 1),
+                        self.full_lmk_bary_coords.repeat(vertices.shape[0], 1, 1)
+                    )
+                    landmark_3d = reselect_eyes(vertices, landmarks3d)
+                elif self.lmks_type == 'dense105':
+                    landmarks3d = vertices2landmarks(
+                        vertices, self.faces_tensor,
+                        self.lmk_faces_idx_mediapipe.unsqueeze(dim=0).expand(batch_size, -1).contiguous(),
+                        self.lmk_bary_coords_mediapipe.unsqueeze(dim=0).expand(batch_size, -1, -1).contiguous()
+                    )
+                else:
+                    raise ValueError(f"Unknown lmks_type: {self.lmks_type}.")
+            if verts_sclae is not None:
+                return vertices * verts_sclae, landmark_3d * verts_sclae
+            return vertices * self.scale, landmarks3d * self.scale
 
     def _vertices2landmarks(self, vertices):
         landmarks3d = vertices2landmarks(

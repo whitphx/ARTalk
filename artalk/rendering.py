@@ -31,6 +31,12 @@ import time
 
 import torch
 
+from .metrics import (
+    active_pipeline_metrics,
+    observe_pipeline_duration_if_active,
+    pipeline_metrics_scope_if_active,
+)
+
 
 class StreamingRenderer:
     def __init__(
@@ -113,10 +119,12 @@ class StreamingRenderer:
             raise ValueError(
                 f"motion_frame must be 1-D, got shape {tuple(motion_frame.shape)}"
             )
-        motion_frame = motion_frame.to(self._device)
-        if self.mode == "gagavatar":
-            return self._render_gagavatar_profile(motion_frame)
-        return self._render_mesh_profile(motion_frame)
+        with pipeline_metrics_scope_if_active("renderer"):
+            with observe_pipeline_duration_if_active("motion_frame_to_device"):
+                motion_frame = motion_frame.to(self._device)
+            if self.mode == "gagavatar":
+                return self._render_gagavatar_profile(motion_frame)
+            return self._render_mesh_profile(motion_frame)
 
     @torch.no_grad()
     def render_batch_profile(self, motion_frames):
@@ -130,10 +138,12 @@ class StreamingRenderer:
             raise ValueError(
                 f"motion_frames must be 2-D, got shape {tuple(motion_frames.shape)}"
             )
-        motion_frames = motion_frames.to(self._device)
-        if self.mode == "gagavatar":
-            return self._render_gagavatar_batch_profile(motion_frames)
-        return self._render_mesh_batch_profile(motion_frames)
+        with pipeline_metrics_scope_if_active("renderer"):
+            with observe_pipeline_duration_if_active("motion_batch_to_device"):
+                motion_frames = motion_frames.to(self._device)
+            if self.mode == "gagavatar":
+                return self._render_gagavatar_batch_profile(motion_frames)
+            return self._render_mesh_batch_profile(motion_frames)
 
     @torch.no_grad()
     def feed(self, motion_frames):
@@ -156,49 +166,59 @@ class StreamingRenderer:
         return rgb.cpu()[0] / 255.0
 
     def _render_mesh_profile(self, motion_frame):
-        timings = {}
-        t0 = time.perf_counter()
-        verts = self._mesh_basic_vae.get_flame_verts(
-            self._mesh_flame,
-            self._mesh_shape_code,
-            motion_frame[None],
-            with_global=True,
-        )
-        self._sync_if_cuda()
-        timings["avatar_prepare_frame"] = time.perf_counter() - t0
+        with pipeline_metrics_scope_if_active("mesh"):
+            timings = {}
+            t0 = time.perf_counter()
+            verts = self._mesh_basic_vae.get_flame_verts(
+                self._mesh_flame,
+                self._mesh_shape_code,
+                motion_frame[None],
+                with_global=True,
+            )
+            self._sync_if_cuda()
+            timings["avatar_prepare_frame"] = time.perf_counter() - t0
+            self._observe_active("flame_vertices", timings["avatar_prepare_frame"])
 
-        t0 = time.perf_counter()
-        rgb = self._mesh_renderer(verts)[0]
-        self._sync_if_cuda()
-        timings["avatar_forward_model"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            rgb = self._mesh_renderer(verts)[0]
+            self._sync_if_cuda()
+            timings["avatar_forward_model"] = time.perf_counter() - t0
+            self._observe_active("pytorch3d_forward", timings["avatar_forward_model"])
 
-        t0 = time.perf_counter()
-        rgb = rgb.cpu()[0] / 255.0
-        timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
-        return rgb, timings
+            t0 = time.perf_counter()
+            rgb = rgb.cpu()[0] / 255.0
+            timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
+            self._observe_active("gpu_to_cpu", timings["avatar_gpu_to_cpu_copy"])
+            self._record_cuda_memory()
+            return rgb, timings
 
     def _render_mesh_batch_profile(self, motion_frames):
-        timings = {}
-        t0 = time.perf_counter()
-        shape_code = self._mesh_shape_code.expand(motion_frames.shape[0], -1)
-        verts = self._mesh_basic_vae.get_flame_verts(
-            self._mesh_flame,
-            shape_code,
-            motion_frames,
-            with_global=True,
-        )
-        self._sync_if_cuda()
-        timings["avatar_prepare_batch"] = time.perf_counter() - t0
+        with pipeline_metrics_scope_if_active("mesh"):
+            timings = {}
+            t0 = time.perf_counter()
+            shape_code = self._mesh_shape_code.expand(motion_frames.shape[0], -1)
+            verts = self._mesh_basic_vae.get_flame_verts(
+                self._mesh_flame,
+                shape_code,
+                motion_frames,
+                with_global=True,
+            )
+            self._sync_if_cuda()
+            timings["avatar_prepare_batch"] = time.perf_counter() - t0
+            self._observe_active("flame_vertices_batch", timings["avatar_prepare_batch"])
 
-        t0 = time.perf_counter()
-        rgb = self._mesh_renderer(verts)[0] / 255.0
-        self._sync_if_cuda()
-        timings["avatar_forward_batch"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            rgb = self._mesh_renderer(verts)[0] / 255.0
+            self._sync_if_cuda()
+            timings["avatar_forward_batch"] = time.perf_counter() - t0
+            self._observe_active("pytorch3d_forward_batch", timings["avatar_forward_batch"])
 
-        t0 = time.perf_counter()
-        rgb = rgb.cpu()
-        timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
-        return rgb, timings
+            t0 = time.perf_counter()
+            rgb = rgb.cpu()
+            timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
+            self._observe_active("gpu_to_cpu_batch", timings["avatar_gpu_to_cpu_batch"])
+            self._record_cuda_memory()
+            return rgb, timings
 
     def _render_gagavatar(self, motion_frame):
         batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
@@ -206,40 +226,74 @@ class StreamingRenderer:
         return rgb.cpu()[0]
 
     def _render_gagavatar_profile(self, motion_frame):
-        timings = {}
-        t0 = time.perf_counter()
-        batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
-        self._sync_if_cuda()
-        timings["avatar_prepare_frame"] = time.perf_counter() - t0
+        with pipeline_metrics_scope_if_active("gagavatar"):
+            timings = {}
+            t0 = time.perf_counter()
+            batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
+            self._sync_if_cuda()
+            timings["avatar_prepare_frame"] = time.perf_counter() - t0
+            self._observe_active("prepare_frame", timings["avatar_prepare_frame"])
 
-        t0 = time.perf_counter()
-        rgb = self._gaga.forward_expression(batch)
-        self._sync_if_cuda()
-        timings["avatar_forward_model"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            rgb = self._gaga.forward_expression(batch)
+            self._sync_if_cuda()
+            timings["avatar_forward_model"] = time.perf_counter() - t0
+            self._observe_active("forward_model", timings["avatar_forward_model"])
 
-        t0 = time.perf_counter()
-        rgb = rgb.cpu()[0]
-        timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
-        return rgb, timings
+            t0 = time.perf_counter()
+            rgb = rgb.cpu()[0]
+            timings["avatar_gpu_to_cpu_copy"] = time.perf_counter() - t0
+            self._observe_active("gpu_to_cpu", timings["avatar_gpu_to_cpu_copy"])
+            self._record_cuda_memory()
+            return rgb, timings
 
     def _render_gagavatar_batch_profile(self, motion_frames):
-        timings = {}
-        t0 = time.perf_counter()
-        batch = self._gaga.build_forward_batch(motion_frames, self._gaga_flame)
-        self._sync_if_cuda()
-        timings["avatar_prepare_batch"] = time.perf_counter() - t0
+        with pipeline_metrics_scope_if_active("gagavatar"):
+            timings = {}
+            t0 = time.perf_counter()
+            batch = self._gaga.build_forward_batch(motion_frames, self._gaga_flame)
+            self._sync_if_cuda()
+            timings["avatar_prepare_batch"] = time.perf_counter() - t0
+            self._observe_active("prepare_batch", timings["avatar_prepare_batch"])
 
-        t0 = time.perf_counter()
-        rgb = self._gaga.forward_expression(batch)
-        self._sync_if_cuda()
-        timings["avatar_forward_batch"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            rgb = self._gaga.forward_expression(batch)
+            self._sync_if_cuda()
+            timings["avatar_forward_batch"] = time.perf_counter() - t0
+            self._observe_active("forward_batch", timings["avatar_forward_batch"])
 
-        t0 = time.perf_counter()
-        rgb = rgb.cpu()
-        timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
-        return rgb, timings
+            t0 = time.perf_counter()
+            rgb = rgb.cpu()
+            timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
+            self._observe_active("gpu_to_cpu_batch", timings["avatar_gpu_to_cpu_batch"])
+            self._record_cuda_memory()
+            return rgb, timings
 
     def _sync_if_cuda(self):
         device = torch.device(self._device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+
+    @staticmethod
+    def _observe_active(key, elapsed_s):
+        metrics = active_pipeline_metrics()
+        if metrics is not None:
+            metrics.observe_ms(key, elapsed_s)
+
+    def _record_cuda_memory(self):
+        metrics = active_pipeline_metrics()
+        device = torch.device(self._device)
+        if metrics is None or device.type != "cuda":
+            return
+        metrics.set(
+            "cuda_memory_allocated_mb",
+            torch.cuda.memory_allocated(device) / (1024 * 1024),
+        )
+        metrics.set(
+            "cuda_memory_reserved_mb",
+            torch.cuda.memory_reserved(device) / (1024 * 1024),
+        )
+        metrics.observe_max(
+            "cuda_max_memory_allocated_mb",
+            torch.cuda.max_memory_allocated(device) / (1024 * 1024),
+        )

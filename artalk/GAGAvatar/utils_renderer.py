@@ -5,6 +5,8 @@ import math
 import torch
 from diff_gaussian_rasterization_32d import GaussianRasterizationSettings, GaussianRasterizer
 
+from ..metrics import observe_pipeline_duration_if_active
+
 NUM_CHANNELS = 32
 
 def render_gaussian(gs_params, cam_matrix, cam_params=None, sh_degree=0, bg_color=None):
@@ -13,35 +15,41 @@ def render_gaussian(gs_params, cam_matrix, cam_params=None, sh_degree=0, bg_colo
     focal_x, focal_y, cam_size = cam_params['focal_x'], cam_params['focal_y'], cam_params['size']
     points, colors, opacities, scales, rotations = \
         gs_params['xyz'], gs_params['colors'], gs_params['opacities'], gs_params['scales'], gs_params['rotations']
-    view_mat, proj_mat, cam_pos = build_camera_matrices(cam_matrix, focal_x, focal_y)
-    bg_color = cam_matrix.new_zeros(batch_size, NUM_CHANNELS, dtype=torch.float32) if bg_color is None else bg_color
+    with observe_pipeline_duration_if_active("gaussian_camera_matrices"):
+        view_mat, proj_mat, cam_pos = build_camera_matrices(cam_matrix, focal_x, focal_y)
+    with observe_pipeline_duration_if_active("gaussian_background"):
+        bg_color = cam_matrix.new_zeros(batch_size, NUM_CHANNELS, dtype=torch.float32) if bg_color is None else bg_color
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    means2D = torch.zeros_like(points, dtype=points.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        means2D.retain_grad()
-    except:
-        pass
+    with observe_pipeline_duration_if_active("gaussian_means2d_alloc"):
+        means2D = torch.zeros_like(points, dtype=points.dtype, requires_grad=True, device="cuda") + 0
+        try:
+            means2D.retain_grad()
+        except:
+            pass
     # Run rendering
     all_rendered, all_radii = [], []
     for bid in range(batch_size):
-        raster_settings = GaussianRasterizationSettings(
-            sh_degree=sh_degree, bg=bg_color, 
-            image_height=cam_size[0], image_width=cam_size[1],
-            tanfovx=1.0 / focal_x, tanfovy=1.0 / focal_y,
-            viewmatrix=view_mat[bid], projmatrix=proj_mat[bid], campos=cam_pos[bid],
-            scale_modifier=1.0, prefiltered=False, debug=False
-        )
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-        rendered, radii = rasterizer(
-            means3D=points[bid], means2D=means2D[bid], 
-            shs=None, colors_precomp=colors[bid], 
-            opacities=opacities[bid], scales=scales[bid], 
-            rotations=rotations[bid], cov3D_precomp=None
-        )
+        with observe_pipeline_duration_if_active("gaussian_rasterizer_setup"):
+            raster_settings = GaussianRasterizationSettings(
+                sh_degree=sh_degree, bg=bg_color,
+                image_height=cam_size[0], image_width=cam_size[1],
+                tanfovx=1.0 / focal_x, tanfovy=1.0 / focal_y,
+                viewmatrix=view_mat[bid], projmatrix=proj_mat[bid], campos=cam_pos[bid],
+                scale_modifier=1.0, prefiltered=False, debug=False
+            )
+            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+        with observe_pipeline_duration_if_active("gaussian_rasterizer_forward"):
+            rendered, radii = rasterizer(
+                means3D=points[bid], means2D=means2D[bid],
+                shs=None, colors_precomp=colors[bid],
+                opacities=opacities[bid], scales=scales[bid],
+                rotations=rotations[bid], cov3D_precomp=None
+            )
         all_rendered.append(rendered)
         all_radii.append(radii)
-    all_rendered = torch.stack(all_rendered, dim=0)
-    all_radii = torch.stack(all_radii, dim=0)
+    with observe_pipeline_duration_if_active("gaussian_stack_outputs"):
+        all_rendered = torch.stack(all_rendered, dim=0)
+        all_radii = torch.stack(all_radii, dim=0)
     return {
         "images": all_rendered, "radii": all_radii, "viewspace_points": means2D,
     }

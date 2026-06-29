@@ -3,7 +3,6 @@
 
 import os
 import copy
-import math
 import torch
 import torchvision
 import torch.nn as nn
@@ -12,6 +11,7 @@ from pytorch3d.renderer.implicit.harmonic_embedding import HarmonicEmbedding
 
 from .modules import DINOBase, StyleUNet
 from .utils_renderer import render_gaussian
+from ..metrics import observe_pipeline_duration_if_active
 
 class GAGAvatar(nn.Module):
     def __init__(self, ):
@@ -65,34 +65,44 @@ class GAGAvatar(nn.Module):
         if not hasattr(self, '_gs_params'):
             batch_size = batch['f_image'].shape[0]
             f_image, f_planes = batch['f_image'], batch['f_planes']
-            f_feature0, f_feature1 = self.base_model(f_image)
+            with observe_pipeline_duration_if_active("model_base_feature_extract"):
+                f_feature0, f_feature1 = self.base_model(f_image)
             # dir encoding
-            plane_direnc = self.harmo_encoder(f_planes['plane_dirs'])
+            with observe_pipeline_duration_if_active("model_plane_dir_encode"):
+                plane_direnc = self.harmo_encoder(f_planes['plane_dirs'])
             # global part
-            gs_params_g = self.gs_generator_g(
-                torch.cat([
-                        self.head_base[None].expand(batch_size, -1, -1), f_feature1[:, None].expand(-1, 5023, -1), 
-                    ], dim=-1
-                ), plane_direnc
-            )
-            gs_params_g['xyz'] = batch['f_image'].new_zeros((batch_size, 5023, 3))
+            with observe_pipeline_duration_if_active("model_global_gs_generator"):
+                gs_params_g = self.gs_generator_g(
+                    torch.cat([
+                            self.head_base[None].expand(batch_size, -1, -1), f_feature1[:, None].expand(-1, 5023, -1),
+                        ], dim=-1
+                    ), plane_direnc
+                )
+                gs_params_g['xyz'] = batch['f_image'].new_zeros((batch_size, 5023, 3))
             # local part
-            gs_params_l0 = self.gs_generator_l0(f_feature0, plane_direnc)
-            gs_params_l1 = self.gs_generator_l1(f_feature0, plane_direnc)
-            gs_params_l0['xyz'] = f_planes['plane_points'] + gs_params_l0['positions'] * f_planes['plane_dirs'][:, None]
-            gs_params_l1['xyz'] = f_planes['plane_points'] + -1 * gs_params_l1['positions'] * f_planes['plane_dirs'][:, None]
-            gs_params = {
-                k:torch.cat([gs_params_g[k], gs_params_l0[k], gs_params_l1[k]], dim=1) for k in gs_params_g.keys()
-            }
+            with observe_pipeline_duration_if_active("model_local_gs_generator_l0"):
+                gs_params_l0 = self.gs_generator_l0(f_feature0, plane_direnc)
+                gs_params_l0['xyz'] = f_planes['plane_points'] + gs_params_l0['positions'] * f_planes['plane_dirs'][:, None]
+            with observe_pipeline_duration_if_active("model_local_gs_generator_l1"):
+                gs_params_l1 = self.gs_generator_l1(f_feature0, plane_direnc)
+                gs_params_l1['xyz'] = f_planes['plane_points'] + -1 * gs_params_l1['positions'] * f_planes['plane_dirs'][:, None]
+            with observe_pipeline_duration_if_active("model_concat_gs_params"):
+                gs_params = {
+                    k:torch.cat([gs_params_g[k], gs_params_l0[k], gs_params_l1[k]], dim=1) for k in gs_params_g.keys()
+                }
             self._gs_params = gs_params
         gs_params = self._gs_params
-        t_image, t_points, t_transform = batch['t_image'], batch['t_points'], batch['t_transform']
-        gs_params['xyz'][:, :5023] = t_points
-        gen_images = render_gaussian(
-            gs_params=gs_params, cam_matrix=t_transform, cam_params=self.cam_params
-        )['images']
-        sr_gen_images = self.upsampler(gen_images)
-        return self.add_water_mark(sr_gen_images.clamp(0, 1))
+        t_points, t_transform = batch['t_points'], batch['t_transform']
+        with observe_pipeline_duration_if_active("model_update_dynamic_points"):
+            gs_params['xyz'][:, :5023] = t_points
+        with observe_pipeline_duration_if_active("model_gaussian_rasterize"):
+            gen_images = render_gaussian(
+                gs_params=gs_params, cam_matrix=t_transform, cam_params=self.cam_params
+            )['images']
+        with observe_pipeline_duration_if_active("model_upsampler"):
+            sr_gen_images = self.upsampler(gen_images)
+        with observe_pipeline_duration_if_active("model_watermark"):
+            return self.add_water_mark(sr_gen_images.clamp(0, 1))
 
     @torch.no_grad()
     def build_forward_batch(self, motion_code, flame_model):
@@ -100,31 +110,36 @@ class GAGAvatar(nn.Module):
             self.set_avatar_id('11.jpg')
         device = motion_code.device
         if not hasattr(self, 'feature_batch'):
-            feature_batch = {}
-            feature_batch['f_image'] = torchvision.transforms.functional.resize(self._tracked_id['image'], (518, 518), antialias=True)[None].to(device)
-            feature_batch['f_planes'] = build_points_planes(296, self._tracked_id['transform_matrix'])
-            feature_batch['f_planes']['plane_points'] = feature_batch['f_planes']['plane_points'][None].to(device)
-            feature_batch['f_planes']['plane_dirs'] = feature_batch['f_planes']['plane_dirs'][None].to(device)
-            feature_batch['t_image'] = torchvision.transforms.functional.resize(self._tracked_id['image'], (512, 512), antialias=True)[None].to(device)
-            feature_batch['t_transform'] = self._tracked_id['transform_matrix'][None].to(device)
-            self.feature_batch = feature_batch
-            self.shapecode = self._tracked_id['shapecode'][None].to(device)
+            with observe_pipeline_duration_if_active("prepare_feature_cache"):
+                feature_batch = {}
+                feature_batch['f_image'] = torchvision.transforms.functional.resize(self._tracked_id['image'], (518, 518), antialias=True)[None].to(device)
+                feature_batch['f_planes'] = build_points_planes(296, self._tracked_id['transform_matrix'])
+                feature_batch['f_planes']['plane_points'] = feature_batch['f_planes']['plane_points'][None].to(device)
+                feature_batch['f_planes']['plane_dirs'] = feature_batch['f_planes']['plane_dirs'][None].to(device)
+                feature_batch['t_image'] = torchvision.transforms.functional.resize(self._tracked_id['image'], (512, 512), antialias=True)[None].to(device)
+                feature_batch['t_transform'] = self._tracked_id['transform_matrix'][None].to(device)
+                self.feature_batch = feature_batch
+                self.shapecode = self._tracked_id['shapecode'][None].to(device)
 
-        feature_batch = copy.deepcopy(self.feature_batch)
+        with observe_pipeline_duration_if_active("prepare_copy_feature_batch"):
+            feature_batch = copy.deepcopy(self.feature_batch)
         exp_code = motion_code[:, :100]
         pose_code = torch.cat([motion_code.new_zeros(1, 3), motion_code[:, 103:]], dim=-1)
-        t_points = flame_model(
-            shape_params=self.shapecode, pose_params=pose_code, 
-            expression_params=exp_code, eye_pose_params=pose_code.new_zeros(1, 6)
-        ).float()
-        if not hasattr(self, 'upper_points'):
-            self.upper_points = t_points[:, forehead_indices]
-        else:
-            current_points = t_points[:, forehead_indices]
-            self.upper_points = 0.98 * self.upper_points + 0.02 * current_points
-            t_points[:, forehead_indices] = self.upper_points
+        with observe_pipeline_duration_if_active("prepare_flame_forward"):
+            t_points = flame_model(
+                shape_params=self.shapecode, pose_params=pose_code,
+                expression_params=exp_code, eye_pose_params=pose_code.new_zeros(1, 6)
+            ).float()
+        with observe_pipeline_duration_if_active("prepare_forehead_smoothing"):
+            if not hasattr(self, 'upper_points'):
+                self.upper_points = t_points[:, forehead_indices]
+            else:
+                current_points = t_points[:, forehead_indices]
+                self.upper_points = 0.98 * self.upper_points + 0.02 * current_points
+                t_points[:, forehead_indices] = self.upper_points
         feature_batch['t_points'] = t_points
-        feature_batch['t_transform'][:, :3, :3] = transform_emoca_to_p3d(motion_code[:, 100:103])[:, :3, :3]
+        with observe_pipeline_duration_if_active("prepare_transform_update"):
+            feature_batch['t_transform'][:, :3, :3] = transform_emoca_to_p3d(motion_code[:, 100:103])[:, :3, :3]
         return feature_batch
 
     @torch.no_grad()
