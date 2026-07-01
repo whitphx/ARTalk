@@ -96,6 +96,17 @@ class ConsumedAudioSlice:
     frame_midpoint_accepted_at: list[float]
 
 
+@dataclass
+class RenderedVideoFrame:
+    image: np.ndarray
+    motion_produced_at: float
+    render_started_at: float
+    render_finished_at: float
+    audio_midpoint_accepted_at: float | None = None
+    published_at: float | None = None
+    frame_index: int | None = None
+
+
 def with_pipeline_metrics(method):
     @wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -147,7 +158,7 @@ class ARTalkPipeline:
         # video source callback then serves the newest frame whose index is not
         # ahead of that audio clock. This prevents video from racing ahead when
         # rendering completes before enough delayed audio has actually played.
-        self._video_queue: deque[tuple[int, np.ndarray]] = deque()
+        self._video_queue: deque[tuple[int, RenderedVideoFrame]] = deque()
         self._video_queue_lock = threading.Lock()
         self._video_queue_max = 200
         self._next_video_frame_index = 0
@@ -308,18 +319,20 @@ class ARTalkPipeline:
         metrics.inc("video_callbacks")
         self._record_callback_timestamp("video_source", pts, time_base)
         target_index = self._media_clock_frame_index()
-        arr, frame_index = self._pop_video_frame_for_media_clock(target_index)
+        rendered_frame, frame_index = self._pop_video_frame_for_media_clock(target_index)
         metrics.set("last_video_target_frame_index", target_index)
-        if arr is None:
+        if rendered_frame is None:
             arr = self._placeholder
             metrics.inc("video_placeholder_frames")
             metrics.inc("video_no_ready_frame_callbacks")
         else:
+            arr = rendered_frame.image
             self._placeholder = arr
             self._last_video_frame_index_served = frame_index
             metrics.inc("video_frames_served")
             metrics.set("last_video_frame_index_served", frame_index)
             self._record_served_video_lag(target_index, frame_index)
+            self._record_served_frame_latency(rendered_frame)
         metrics.set("video_queue_depth", self._video_queue_depth())
         self._record_video_lead(target_index)
         frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
@@ -420,14 +433,14 @@ class ARTalkPipeline:
     def _pop_video_frame_for_media_clock(
         self,
         target_index: int,
-    ) -> tuple[np.ndarray | None, int | None]:
+    ) -> tuple[RenderedVideoFrame | None, int | None]:
         # The browser asks for video at a steady cadence even when rendering is
         # bursty. If rendering fell behind and then catches up, multiple queued
         # frames can be older than the audio clock. Drop those stale frames and
         # serve the latest frame at or before the current audio-derived index.
         dropped_for_sync = 0
         with self._video_queue_lock:
-            selected: tuple[int, np.ndarray] | None = None
+            selected: tuple[int, RenderedVideoFrame] | None = None
             while self._video_queue and self._video_queue[0][0] <= target_index:
                 selected = self._video_queue.popleft()
                 if self._video_queue and self._video_queue[0][0] <= target_index:
@@ -440,6 +453,27 @@ class ARTalkPipeline:
         if selected is None:
             return None, None
         return selected[1], selected[0]
+
+    def _record_served_frame_latency(self, frame: RenderedVideoFrame) -> None:
+        if frame.audio_midpoint_accepted_at is None:
+            return
+        served_at = time.perf_counter()
+        metrics = current_pipeline_metrics()
+        served_latency_s = served_at - frame.audio_midpoint_accepted_at
+        publish_to_serve_s = (
+            served_at - frame.published_at
+            if frame.published_at is not None
+            else 0.0
+        )
+        render_to_serve_s = served_at - frame.render_finished_at
+        metrics.set("last_frame_audio_to_video_served_latency_s", served_latency_s)
+        metrics.set("last_frame_publish_to_serve_latency_s", publish_to_serve_s)
+        metrics.set("last_frame_render_to_serve_latency_s", render_to_serve_s)
+        metrics.observe_ms("frame_audio_to_video_served_latency", served_latency_s)
+        metrics.observe_ms("frame_publish_to_serve_latency", publish_to_serve_s)
+        metrics.observe_ms("frame_render_to_serve_latency", render_to_serve_s)
+        metrics.observe_min("min_frame_audio_to_video_served_latency_s", served_latency_s)
+        metrics.observe_max("max_frame_audio_to_video_served_latency_s", served_latency_s)
 
     def _record_served_video_lag(
         self,
@@ -638,7 +672,7 @@ class ARTalkPipeline:
 
     def _publish_output_segment(
         self,
-        frames: list[np.ndarray],
+        frames: list[RenderedVideoFrame],
         audio_slice: ConsumedAudioSlice,
         motion_produced_at: float,
         segment_render_started_at: float | None,
@@ -656,15 +690,20 @@ class ARTalkPipeline:
         metrics = current_pipeline_metrics()
         dropped_video_frames = 0
         last_frame_index = None
+        frame_timestamps = audio_slice.frame_midpoint_accepted_at[: len(frames)]
+        for frame, accepted_at in zip(frames, frame_timestamps):
+            frame.audio_midpoint_accepted_at = accepted_at
+            frame.published_at = published_at
         publish_video_t0 = time.perf_counter()
         with self._video_queue_lock:
-            for arr in frames:
+            for frame in frames:
                 frame_index = self._next_video_frame_index
                 self._next_video_frame_index += 1
+                frame.frame_index = frame_index
                 while len(self._video_queue) >= self._video_queue_max:
                     self._video_queue.popleft()
                     dropped_video_frames += 1
-                self._video_queue.append((frame_index, arr))
+                self._video_queue.append((frame_index, frame))
                 last_frame_index = frame_index
             video_depth = len(self._video_queue)
         metrics.observe_ms(
@@ -705,12 +744,23 @@ class ARTalkPipeline:
         metrics.set("last_output_segment_audio_samples", audio.size)
         if frames and audio_slice.first_accepted_at is not None:
             pre_model_compute_s = self._last_motion_streamer_elapsed_s
-            frame_accepted_at = audio_slice.frame_midpoint_accepted_at[: len(frames)]
+            frames_with_audio = [
+                frame for frame in frames if frame.audio_midpoint_accepted_at is not None
+            ]
             frame_latencies_s = [
-                published_at - accepted_at for accepted_at in frame_accepted_at
+                published_at - frame.audio_midpoint_accepted_at
+                for frame in frames_with_audio
             ]
             frame_pre_model_s = [
-                motion_produced_at - accepted_at for accepted_at in frame_accepted_at
+                frame.motion_produced_at - frame.audio_midpoint_accepted_at
+                for frame in frames_with_audio
+            ]
+            frame_render_s = [
+                frame.render_finished_at - frame.render_started_at
+                for frame in frames_with_audio
+            ]
+            frame_render_to_publish_s = [
+                published_at - frame.render_finished_at for frame in frames_with_audio
             ]
             frame_pre_model_wait_s = [
                 max(0.0, latency_s - pre_model_compute_s)
@@ -722,6 +772,10 @@ class ARTalkPipeline:
                 metrics.observe_max("max_frame_audio_to_video_latency_s", latency_s)
             for latency_s in frame_pre_model_s:
                 metrics.observe_ms("frame_pre_model_latency", latency_s)
+            for latency_s in frame_render_s:
+                metrics.observe_ms("frame_render_latency", latency_s)
+            for latency_s in frame_render_to_publish_s:
+                metrics.observe_ms("frame_render_to_publish_latency", latency_s)
             if frame_latencies_s:
                 mid_index = len(frame_latencies_s) // 2
                 frame_first_latency_s = frame_latencies_s[0]
@@ -733,6 +787,8 @@ class ARTalkPipeline:
                 frame_pre_model_wait_first_s = frame_pre_model_wait_s[0]
                 frame_pre_model_wait_midpoint_s = frame_pre_model_wait_s[mid_index]
                 frame_pre_model_wait_last_s = frame_pre_model_wait_s[-1]
+                frame_render_midpoint_s = frame_render_s[mid_index]
+                frame_render_to_publish_midpoint_s = frame_render_to_publish_s[mid_index]
                 metrics.set(
                     "last_frame_audio_to_video_first_latency_s",
                     frame_first_latency_s,
@@ -762,6 +818,11 @@ class ARTalkPipeline:
                 metrics.set(
                     "last_frame_pre_model_wait_last_s",
                     frame_pre_model_wait_last_s,
+                )
+                metrics.set("last_frame_render_midpoint_latency_s", frame_render_midpoint_s)
+                metrics.set(
+                    "last_frame_render_to_publish_midpoint_latency_s",
+                    frame_render_to_publish_midpoint_s,
                 )
                 metrics.observe_ms(
                     "frame_audio_to_video_first_latency",
@@ -798,6 +859,14 @@ class ARTalkPipeline:
                 metrics.observe_ms(
                     "frame_pre_model_wait_last",
                     frame_pre_model_wait_last_s,
+                )
+                metrics.observe_ms(
+                    "frame_render_midpoint_latency",
+                    frame_render_midpoint_s,
+                )
+                metrics.observe_ms(
+                    "frame_render_to_publish_midpoint_latency",
+                    frame_render_to_publish_midpoint_s,
                 )
             audio_to_video_latency_s = published_at - audio_slice.first_accepted_at
             midpoint_latency_s = (
@@ -1069,7 +1138,7 @@ class ARTalkPipeline:
         metrics.set("last_audio_samples_emitted", emitted_audio_samples)
         render_chunk_t0 = time.perf_counter()
         rendered_in_chunk = 0
-        segment_frames: list[np.ndarray] = []
+        segment_frames: list[RenderedVideoFrame] = []
         segment_render_started_at: float | None = None
         first_segment_render_started_at: float | None = None
         segment_index = 0
@@ -1218,8 +1287,16 @@ class ARTalkPipeline:
                     "rgb_batch_to_numpy",
                     time.perf_counter() - convert_t0,
                 )
+                render_finished_at = time.perf_counter()
             for arr in arr_batch:
-                segment_frames.append(arr)
+                segment_frames.append(
+                    RenderedVideoFrame(
+                        image=arr,
+                        motion_produced_at=motion_produced_at,
+                        render_started_at=render_t0,
+                        render_finished_at=render_finished_at,
+                    )
+                )
                 metrics.inc("rendered_frames")
                 rendered_in_chunk += 1
                 metrics.set("last_rendered_s", time.perf_counter())
