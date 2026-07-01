@@ -40,6 +40,7 @@ from .metrics import (
     current_pipeline_metrics,
     observe_pipeline_duration,
     pipeline_metrics_context,
+    pipeline_metrics_tags,
 )
 from .rendering import StreamingRenderer
 from .streaming import ARTalkStreamer, CausalSavgolSmoother
@@ -75,12 +76,24 @@ class PendingAudioChunk:
     samples: np.ndarray
     accepted_at: float
 
+    def split(self, n_samples: int) -> tuple["PendingAudioChunk", "PendingAudioChunk"]:
+        head = PendingAudioChunk(
+            samples=self.samples[:n_samples],
+            accepted_at=self.accepted_at,
+        )
+        tail = PendingAudioChunk(
+            samples=self.samples[n_samples:],
+            accepted_at=self.accepted_at + n_samples / SAMPLE_RATE,
+        )
+        return head, tail
+
 
 @dataclass
 class ConsumedAudioSlice:
     samples: np.ndarray
     first_accepted_at: float | None
     midpoint_accepted_at: float | None
+    frame_midpoint_accepted_at: list[float]
 
 
 def with_pipeline_metrics(method):
@@ -532,9 +545,9 @@ class ARTalkPipeline:
         # ARTalk consumes audio in large model chunks before it can produce
         # motion. Keep the raw input audio staged until the corresponding
         # smoothed motion frames are known, then pop exactly the samples that
-        # map to those rendered frames. Chunks keep their original accept
-        # timestamp so segment publication can report end-to-end latency without
-        # keeping a full event timeline.
+        # map to those rendered frames. When a chunk is split, the tail timestamp
+        # advances by media duration so latency can be attributed to the
+        # relevant video frames rather than the parent chunk's first sample.
         remaining = max(0, n_samples)
         emitted: list[PendingAudioChunk] = []
         while remaining and self._pending_audio_for_output:
@@ -543,19 +556,9 @@ class ARTalkPipeline:
                 emitted.append(chunk)
                 remaining -= chunk.samples.size
                 continue
-            emitted.append(
-                PendingAudioChunk(
-                    samples=chunk.samples[:remaining],
-                    accepted_at=chunk.accepted_at,
-                )
-            )
-            self._pending_audio_for_output.insert(
-                0,
-                PendingAudioChunk(
-                    samples=chunk.samples[remaining:],
-                    accepted_at=chunk.accepted_at,
-                ),
-            )
+            head, tail = chunk.split(remaining)
+            emitted.append(head)
+            self._pending_audio_for_output.insert(0, tail)
             remaining = 0
         pending_samples = sum(chunk.samples.size for chunk in self._pending_audio_for_output)
         metrics = current_pipeline_metrics()
@@ -563,7 +566,26 @@ class ARTalkPipeline:
         return emitted
 
     @staticmethod
+    def _chunk_timestamp_at(chunk: PendingAudioChunk, sample_offset: int) -> float:
+        return chunk.accepted_at + sample_offset / SAMPLE_RATE
+
+    @classmethod
+    def _timestamp_at_consumed_sample(
+        cls,
+        consumed_chunks: list[PendingAudioChunk],
+        sample_index: int,
+    ) -> float | None:
+        cursor = 0
+        for chunk in consumed_chunks:
+            next_cursor = cursor + chunk.samples.size
+            if sample_index < next_cursor:
+                return cls._chunk_timestamp_at(chunk, sample_index - cursor)
+            cursor = next_cursor
+        return None
+
+    @classmethod
     def _consume_audio_chunks(
+        cls,
         chunks: list[PendingAudioChunk],
         n_samples: int,
     ) -> ConsumedAudioSlice:
@@ -580,40 +602,38 @@ class ARTalkPipeline:
                 consumed_chunks.append(chunk)
                 remaining -= chunk.samples.size
                 continue
-            consumed.append(chunk.samples[:remaining])
-            consumed_chunks.append(
-                PendingAudioChunk(
-                    samples=chunk.samples[:remaining],
-                    accepted_at=chunk.accepted_at,
-                )
-            )
-            chunks.insert(
-                0,
-                PendingAudioChunk(
-                    samples=chunk.samples[remaining:],
-                    accepted_at=chunk.accepted_at,
-                ),
-            )
+            head, tail = chunk.split(remaining)
+            consumed.append(head.samples)
+            consumed_chunks.append(head)
+            chunks.insert(0, tail)
             remaining = 0
         if not consumed:
             return ConsumedAudioSlice(
                 samples=np.zeros(0, dtype=np.int16),
                 first_accepted_at=accepted_at,
                 midpoint_accepted_at=accepted_at,
+                frame_midpoint_accepted_at=[],
             )
-        midpoint_accepted_at = accepted_at
-        midpoint_sample = sum(chunk.samples.size for chunk in consumed_chunks) // 2
-        cursor = 0
-        for chunk in consumed_chunks:
-            next_cursor = cursor + chunk.samples.size
-            if midpoint_sample < next_cursor:
-                midpoint_accepted_at = chunk.accepted_at
-                break
-            cursor = next_cursor
+        total_samples = sum(chunk.samples.size for chunk in consumed_chunks)
+        midpoint_sample = total_samples // 2
+        midpoint_accepted_at = cls._timestamp_at_consumed_sample(
+            consumed_chunks,
+            midpoint_sample,
+        )
+        frame_midpoint_accepted_at = []
+        for start in range(0, total_samples, AUDIO_SAMPLES_PER_VIDEO_FRAME):
+            midpoint = min(
+                start + AUDIO_SAMPLES_PER_VIDEO_FRAME // 2,
+                total_samples - 1,
+            )
+            timestamp = cls._timestamp_at_consumed_sample(consumed_chunks, midpoint)
+            if timestamp is not None:
+                frame_midpoint_accepted_at.append(timestamp)
         return ConsumedAudioSlice(
             samples=np.concatenate(consumed),
             first_accepted_at=accepted_at,
             midpoint_accepted_at=midpoint_accepted_at,
+            frame_midpoint_accepted_at=frame_midpoint_accepted_at,
         )
 
     def _publish_output_segment(
@@ -684,6 +704,101 @@ class ARTalkPipeline:
         metrics.set("last_output_segment_frames", len(frames))
         metrics.set("last_output_segment_audio_samples", audio.size)
         if frames and audio_slice.first_accepted_at is not None:
+            pre_model_compute_s = self._last_motion_streamer_elapsed_s
+            frame_accepted_at = audio_slice.frame_midpoint_accepted_at[: len(frames)]
+            frame_latencies_s = [
+                published_at - accepted_at for accepted_at in frame_accepted_at
+            ]
+            frame_pre_model_s = [
+                motion_produced_at - accepted_at for accepted_at in frame_accepted_at
+            ]
+            frame_pre_model_wait_s = [
+                max(0.0, latency_s - pre_model_compute_s)
+                for latency_s in frame_pre_model_s
+            ]
+            for latency_s in frame_latencies_s:
+                metrics.observe_ms("frame_audio_to_video_latency", latency_s)
+                metrics.observe_min("min_frame_audio_to_video_latency_s", latency_s)
+                metrics.observe_max("max_frame_audio_to_video_latency_s", latency_s)
+            for latency_s in frame_pre_model_s:
+                metrics.observe_ms("frame_pre_model_latency", latency_s)
+            if frame_latencies_s:
+                mid_index = len(frame_latencies_s) // 2
+                frame_first_latency_s = frame_latencies_s[0]
+                frame_midpoint_latency_s = frame_latencies_s[mid_index]
+                frame_last_latency_s = frame_latencies_s[-1]
+                frame_pre_model_first_s = frame_pre_model_s[0]
+                frame_pre_model_midpoint_s = frame_pre_model_s[mid_index]
+                frame_pre_model_last_s = frame_pre_model_s[-1]
+                frame_pre_model_wait_first_s = frame_pre_model_wait_s[0]
+                frame_pre_model_wait_midpoint_s = frame_pre_model_wait_s[mid_index]
+                frame_pre_model_wait_last_s = frame_pre_model_wait_s[-1]
+                metrics.set(
+                    "last_frame_audio_to_video_first_latency_s",
+                    frame_first_latency_s,
+                )
+                metrics.set(
+                    "last_frame_audio_to_video_midpoint_latency_s",
+                    frame_midpoint_latency_s,
+                )
+                metrics.set(
+                    "last_frame_audio_to_video_last_latency_s",
+                    frame_last_latency_s,
+                )
+                metrics.set("last_frame_pre_model_first_latency_s", frame_pre_model_first_s)
+                metrics.set(
+                    "last_frame_pre_model_midpoint_latency_s",
+                    frame_pre_model_midpoint_s,
+                )
+                metrics.set("last_frame_pre_model_last_latency_s", frame_pre_model_last_s)
+                metrics.set(
+                    "last_frame_pre_model_wait_first_s",
+                    frame_pre_model_wait_first_s,
+                )
+                metrics.set(
+                    "last_frame_pre_model_wait_midpoint_s",
+                    frame_pre_model_wait_midpoint_s,
+                )
+                metrics.set(
+                    "last_frame_pre_model_wait_last_s",
+                    frame_pre_model_wait_last_s,
+                )
+                metrics.observe_ms(
+                    "frame_audio_to_video_first_latency",
+                    frame_first_latency_s,
+                )
+                metrics.observe_ms(
+                    "frame_audio_to_video_midpoint_latency",
+                    frame_midpoint_latency_s,
+                )
+                metrics.observe_ms(
+                    "frame_audio_to_video_last_latency",
+                    frame_last_latency_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_first_latency",
+                    frame_pre_model_first_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_midpoint_latency",
+                    frame_pre_model_midpoint_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_last_latency",
+                    frame_pre_model_last_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_wait_first",
+                    frame_pre_model_wait_first_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_wait_midpoint",
+                    frame_pre_model_wait_midpoint_s,
+                )
+                metrics.observe_ms(
+                    "frame_pre_model_wait_last",
+                    frame_pre_model_wait_last_s,
+                )
             audio_to_video_latency_s = published_at - audio_slice.first_accepted_at
             midpoint_latency_s = (
                 published_at - audio_slice.midpoint_accepted_at
@@ -704,7 +819,6 @@ class ARTalkPipeline:
             )
             pre_render_wait_s = post_model_s - render_s
             post_model_excess_s = max(0.0, post_model_s - segment_media_offset_s)
-            pre_model_compute_s = self._last_motion_streamer_elapsed_s
             pre_model_wait_s = max(0.0, pre_model_s - pre_model_compute_s)
             post_model_publish_overhead_s = max(
                 0.0,
@@ -971,17 +1085,9 @@ class ARTalkPipeline:
             # a time gives the output buffer chances to refill while the rest of
             # the chunk is still rendering, but keeps segments large enough to
             # avoid the previous per-render-batch crackle.
-            n_audio_samples = len(segment_frames) * AUDIO_SAMPLES_PER_VIDEO_FRAME
-            pair_t0 = time.perf_counter()
-            audio_slice = self._consume_audio_chunks(
-                emitted_audio_chunks,
-                n_audio_samples,
-            )
-            metrics.observe_ms(
-                "post_model_segment_audio_pairing",
-                time.perf_counter() - pair_t0,
-            )
             segment_media_offset_s = 0.0
+            segment_render_offset_s = 0.0
+            segment_excess_s = 0.0
             if segment_render_started_at is not None:
                 segment_render_offset_s = segment_render_started_at - motion_produced_at
                 segment_media_offset_s = segment_start_frame_in_chunk / FPS
@@ -989,56 +1095,78 @@ class ARTalkPipeline:
                     0.0,
                     segment_render_offset_s - segment_media_offset_s,
                 )
-                metrics.observe_ms(
+            with pipeline_metrics_tags(
+                pipeline_call=self._dbg_calls,
+                segment_index=segment_index,
+                segment_start_frame=segment_start_frame_in_chunk,
+                segment_frames=len(segment_frames),
+                segment_media_offset_s=segment_media_offset_s,
+                segment_render_offset_s=segment_render_offset_s,
+                segment_excess_s=segment_excess_s,
+                audio_in_queue_depth=self._audio_in_queue.qsize(),
+                video_queue_depth=self._video_queue_depth(),
+                audio_out_buffer_s=self._audio_out_buffer.size / SAMPLE_RATE,
+            ) as segment_metrics:
+                n_audio_samples = len(segment_frames) * AUDIO_SAMPLES_PER_VIDEO_FRAME
+                pair_t0 = time.perf_counter()
+                audio_slice = self._consume_audio_chunks(
+                    emitted_audio_chunks,
+                    n_audio_samples,
+                )
+                segment_metrics.observe_ms(
+                    "post_model_segment_audio_pairing",
+                    time.perf_counter() - pair_t0,
+                )
+                segment_metrics.observe_ms(
                     "pre_render_wait_segment_start_offset",
                     segment_render_offset_s,
                 )
-                metrics.observe_ms(
+                segment_metrics.observe_ms(
                     "pre_render_wait_segment_media_offset",
                     segment_media_offset_s,
                 )
-                metrics.observe_ms(
+                segment_metrics.observe_ms(
                     "pre_render_wait_segment_excess_over_media",
                     segment_excess_s,
                 )
                 if first_segment_render_started_at is not None:
-                    metrics.observe_ms(
+                    segment_metrics.observe_ms(
                         "pre_render_wait_prior_segment_backlog",
                         segment_render_started_at - first_segment_render_started_at,
                     )
-                metrics.set("last_pre_render_wait_segment_index", segment_index)
-                metrics.set(
+                segment_metrics.set("last_pre_render_wait_segment_index", segment_index)
+                segment_metrics.set(
                     "last_pre_render_wait_segment_start_frame",
                     segment_start_frame_in_chunk,
                 )
-                metrics.set(
+                segment_metrics.set(
                     "last_pre_render_wait_segment_frames",
                     len(segment_frames),
                 )
-                metrics.set(
+                segment_metrics.set(
                     "last_pre_render_wait_segment_render_offset_s",
                     segment_render_offset_s,
                 )
-                metrics.set(
+                segment_metrics.set(
                     "last_pre_render_wait_segment_media_offset_s",
                     segment_media_offset_s,
                 )
-                metrics.set(
+                segment_metrics.set(
                     "last_pre_render_wait_segment_excess_s",
                     segment_excess_s,
                 )
-            publish_t0 = time.perf_counter()
-            self._publish_output_segment(
-                segment_frames,
-                audio_slice,
-                motion_produced_at,
-                segment_render_started_at,
-                segment_media_offset_s,
-            )
-            metrics.observe_ms(
-                "post_model_publish_segment",
-                time.perf_counter() - publish_t0,
-            )
+                publish_t0 = time.perf_counter()
+                self._publish_output_segment(
+                    segment_frames,
+                    audio_slice,
+                    motion_produced_at,
+                    segment_render_started_at,
+                    segment_media_offset_s,
+                )
+                segment_metrics.observe_ms(
+                    "post_model_publish_segment",
+                    time.perf_counter() - publish_t0,
+                )
             segment_index += 1
             segment_frames = []
             segment_render_started_at = None
@@ -1055,30 +1183,41 @@ class ARTalkPipeline:
                         "pre_render_wait_first_render_start",
                         first_segment_render_started_at - motion_produced_at,
                     )
-            rgb_batch, render_timings = self._renderer.render_batch_profile(
-                motion_batch
-            )
-            for key, elapsed_s in render_timings.items():
-                metrics.observe_ms(key, elapsed_s)
-            metrics.observe_ms(
-                "avatar_render_batch",
-                time.perf_counter() - render_t0,
-            )
-            metrics.inc("render_batches")
-            metrics.inc("render_batch_frames", motion_batch.shape[0])
-            convert_t0 = time.perf_counter()
-            arr_batch = (
-                (rgb_batch * 255.0)
-                .clamp_(0, 255)
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)
-                .contiguous()
-                .numpy()
-            )
-            metrics.observe_ms(
-                "rgb_batch_to_numpy",
-                time.perf_counter() - convert_t0,
-            )
+            with pipeline_metrics_tags(
+                pipeline_call=self._dbg_calls,
+                segment_index=segment_index,
+                segment_start_frame=segment_start_frame_in_chunk,
+                render_batch_index=start // self._render_batch_size,
+                render_start_frame=rendered_in_chunk,
+                render_batch_frames=motion_batch.shape[0],
+                audio_in_queue_depth=self._audio_in_queue.qsize(),
+                video_queue_depth=self._video_queue_depth(),
+                audio_out_buffer_s=self._audio_out_buffer.size / SAMPLE_RATE,
+            ) as render_metrics:
+                rgb_batch, render_timings = self._renderer.render_batch_profile(
+                    motion_batch
+                )
+                for key, elapsed_s in render_timings.items():
+                    render_metrics.observe_ms(key, elapsed_s)
+                render_metrics.observe_ms(
+                    "avatar_render_batch",
+                    time.perf_counter() - render_t0,
+                )
+                render_metrics.inc("render_batches")
+                render_metrics.inc("render_batch_frames", motion_batch.shape[0])
+                convert_t0 = time.perf_counter()
+                arr_batch = (
+                    (rgb_batch * 255.0)
+                    .clamp_(0, 255)
+                    .to(torch.uint8)
+                    .permute(0, 2, 3, 1)
+                    .contiguous()
+                    .numpy()
+                )
+                render_metrics.observe_ms(
+                    "rgb_batch_to_numpy",
+                    time.perf_counter() - convert_t0,
+                )
             for arr in arr_batch:
                 segment_frames.append(arr)
                 metrics.inc("rendered_frames")

@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+SPIKE_SAMPLE_WINDOW = 128
+SPIKE_EVENT_LIMIT = 100
+SPIKE_MIN_BASELINE_SAMPLES = 8
+SPIKE_MIN_ELAPSED_MS = 50.0
+SPIKE_MIN_DELTA_MS = 50.0
+SPIKE_RATIO = 2.5
 
 
 class PipelineMetrics:
@@ -17,6 +26,8 @@ class PipelineMetrics:
         self._created_at = time.perf_counter()
         self._counters: dict[str, int | float] = {}
         self._durations: dict[str, dict[str, float]] = {}
+        self._duration_samples: dict[str, deque[float]] = {}
+        self._spikes: deque[dict] = deque(maxlen=SPIKE_EVENT_LIMIT)
 
     def inc(self, key: str, value: int | float = 1) -> None:
         with self._lock:
@@ -35,17 +46,25 @@ class PipelineMetrics:
             self._counters[key] = value
             return True
 
-    def observe_ms(self, key: str, elapsed_s: float) -> None:
+    def observe_ms(self, key: str, elapsed_s: float, context: dict | None = None) -> None:
         elapsed_ms = elapsed_s * 1000.0
         with self._lock:
             stat = self._durations.setdefault(
                 key,
                 {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
             )
+            samples = self._duration_samples.setdefault(
+                key,
+                deque(maxlen=SPIKE_SAMPLE_WINDOW),
+            )
+            spike = self._detect_spike(key, elapsed_ms, samples, context)
+            if spike is not None:
+                self._spikes.append(spike)
             stat["count"] += 1
             stat["total_ms"] += elapsed_ms
             stat["max_ms"] = max(stat["max_ms"], elapsed_ms)
             stat["last_ms"] = elapsed_ms
+            samples.append(elapsed_ms)
 
     def observe_min(self, key: str, value: int | float) -> None:
         with self._lock:
@@ -64,12 +83,54 @@ class PipelineMetrics:
         with self._lock:
             counters = dict(self._counters)
             durations = {key: dict(value) for key, value in self._durations.items()}
+            spikes = [dict(spike) for spike in self._spikes]
         for stat in durations.values():
             count = stat["count"]
             stat["avg_ms"] = stat["total_ms"] / count if count else 0.0
+        for spike in spikes:
+            spike["age_s"] = now - spike["timestamp_s"]
         counters["uptime_s"] = now - self._created_at
         counters["now_s"] = now
-        return {"counters": counters, "durations": durations}
+        return {"counters": counters, "durations": durations, "spikes": spikes}
+
+    def _detect_spike(
+        self,
+        key: str,
+        elapsed_ms: float,
+        samples: deque[float],
+        context: dict | None,
+    ) -> dict | None:
+        if len(samples) < SPIKE_MIN_BASELINE_SAMPLES:
+            return None
+        baseline_ms = self._median(samples)
+        if baseline_ms <= 0:
+            return None
+        delta_ms = elapsed_ms - baseline_ms
+        ratio = elapsed_ms / baseline_ms
+        if (
+            elapsed_ms < SPIKE_MIN_ELAPSED_MS
+            or delta_ms < SPIKE_MIN_DELTA_MS
+            or ratio < SPIKE_RATIO
+        ):
+            return None
+        return {
+            "timestamp_s": time.perf_counter(),
+            "metric": key,
+            "elapsed_ms": elapsed_ms,
+            "baseline_ms": baseline_ms,
+            "delta_ms": delta_ms,
+            "ratio": ratio,
+            "sample_count": len(samples),
+            "context": dict(context or {}),
+        }
+
+    @staticmethod
+    def _median(samples: deque[float]) -> float:
+        values = sorted(samples)
+        mid = len(values) // 2
+        if len(values) % 2:
+            return values[mid]
+        return (values[mid - 1] + values[mid]) / 2.0
 
 
 @dataclass(frozen=True)
@@ -84,11 +145,24 @@ class PipelineMetricsContext:
 
     metrics: PipelineMetrics
     key_prefix: tuple[str, ...] = ()
+    tags: dict[str, int | float | str] = field(default_factory=dict)
 
     def with_prefix(self, prefix: str) -> "PipelineMetricsContext":
         return PipelineMetricsContext(
             metrics=self.metrics,
             key_prefix=(*self.key_prefix, prefix),
+            tags=self.tags,
+        )
+
+    def with_tags(self, **tags: int | float | str | None) -> "PipelineMetricsContext":
+        merged = dict(self.tags)
+        for key, value in tags.items():
+            if value is not None:
+                merged[key] = value
+        return PipelineMetricsContext(
+            metrics=self.metrics,
+            key_prefix=self.key_prefix,
+            tags=merged,
         )
 
     def metric_key(self, key: str) -> str:
@@ -104,7 +178,7 @@ class PipelineMetricsContext:
         return self.metrics.set_once(self.metric_key(key), value)
 
     def observe_ms(self, key: str, elapsed_s: float) -> None:
-        self.metrics.observe_ms(self.metric_key(key), elapsed_s)
+        self.metrics.observe_ms(self.metric_key(key), elapsed_s, self.tags)
 
     def observe_min(self, key: str, value: int | float) -> None:
         self.metrics.observe_min(self.metric_key(key), value)
@@ -153,6 +227,16 @@ def pipeline_metrics_scope(prefix: str):
 
 
 @contextmanager
+def pipeline_metrics_tags(**tags: int | float | str | None):
+    context = current_pipeline_metrics().with_tags(**tags)
+    token = _CURRENT_PIPELINE_METRICS.set(context)
+    try:
+        yield context
+    finally:
+        _CURRENT_PIPELINE_METRICS.reset(token)
+
+
+@contextmanager
 def pipeline_metrics_scope_if_active(prefix: str):
     context = active_pipeline_metrics()
     if context is None:
@@ -162,6 +246,20 @@ def pipeline_metrics_scope_if_active(prefix: str):
     token = _CURRENT_PIPELINE_METRICS.set(scoped)
     try:
         yield scoped
+    finally:
+        _CURRENT_PIPELINE_METRICS.reset(token)
+
+
+@contextmanager
+def pipeline_metrics_tags_if_active(**tags: int | float | str | None):
+    context = active_pipeline_metrics()
+    if context is None:
+        yield None
+        return
+    tagged = context.with_tags(**tags)
+    token = _CURRENT_PIPELINE_METRICS.set(tagged)
+    try:
+        yield tagged
     finally:
         _CURRENT_PIPELINE_METRICS.reset(token)
 
