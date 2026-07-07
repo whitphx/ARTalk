@@ -51,6 +51,7 @@ class StreamingRenderer:
         gagavatar_flame=None,
         shape_id=None,
         device=None,
+        stage_sync=True,
     ):
         if mode == "mesh":
             if basic_vae is None or flame_model is None or mesh_renderer is None:
@@ -87,6 +88,11 @@ class StreamingRenderer:
             raise ValueError(f"Unknown mode: {mode!r}")
         self.mode = mode
         self._device = device
+        # Stage-boundary torch.cuda.synchronize() makes the per-stage timings
+        # in the *_profile paths attributable, but serializes GPU work that
+        # could otherwise overlap. Disable to measure production behavior;
+        # per-stage timings then only cover kernel launch, not execution.
+        self._stage_sync = bool(stage_sync)
 
     @property
     def device(self):
@@ -270,6 +276,8 @@ class StreamingRenderer:
             return rgb, timings
 
     def _sync_if_cuda(self):
+        if not self._stage_sync:
+            return
         device = torch.device(self._device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)

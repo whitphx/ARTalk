@@ -23,9 +23,11 @@ Single-session, single-GPU MVP — see ``docs/realtime.md`` Phase 4.
 
 import fractions
 import logging
+import os
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from functools import wraps
 import av
 import numpy as np
 import torch
+import torch.profiler
 
 from .metrics import (
     PipelineMetrics,
@@ -135,6 +138,10 @@ class ARTalkPipeline:
         render_batch_size=DEFAULT_RENDER_BATCH_SIZE,
         output_audio_prebuffer_seconds=DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS,
         output_segment_seconds=DEFAULT_OUTPUT_SEGMENT_SECONDS,
+        renderer_stage_sync=True,
+        profile_trace_dir=None,
+        profile_skip_chunks=1,
+        profile_max_chunks=2,
     ):
         self._device = device
         self._streamer = ARTalkStreamer(model, style_motion=style_motion)
@@ -148,7 +155,32 @@ class ARTalkPipeline:
             gagavatar_flame=gagavatar_flame,
             shape_id=shape_id,
             device=device,
+            stage_sync=renderer_stage_sync,
         )
+        self._renderer_stage_sync = bool(renderer_stage_sync)
+        # PyTorch Profiler capture is opt-in and chunk-scoped: profiling every
+        # 20 ms audio item would pay CUPTI start/stop costs continuously, so
+        # the worker only profiles items expected to cross the model's chunk
+        # boundary (the calls that run inference + rendering).
+        self._profile_run_dir = None
+        self._profile_skip_chunks = max(0, int(profile_skip_chunks))
+        self._profile_max_chunks = max(0, int(profile_max_chunks))
+        self._profile_chunks_seen = 0
+        self._profile_chunks_captured = 0
+        self._profiler_results: list[dict] = []
+        self._profiler_results_lock = threading.Lock()
+        self._profiler_last_error: str | None = None
+        if profile_trace_dir:
+            run_name = time.strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
+            self._profile_run_dir = os.path.join(str(profile_trace_dir), run_name)
+            os.makedirs(self._profile_run_dir, exist_ok=True)
+            logger.warning(
+                "[ARTalkPipeline] profiler traces will be written to %s "
+                "(skip=%d, max=%d)",
+                self._profile_run_dir,
+                self._profile_skip_chunks,
+                self._profile_max_chunks,
+            )
         self._resampler = av.AudioResampler(
             format="s16", layout="mono", rate=SAMPLE_RATE
         )
@@ -225,6 +257,8 @@ class ARTalkPipeline:
             metrics.set("output_segment_min_frames", self._output_segment_min_frames)
             metrics.set("render_res", self._render_res)
             metrics.set("render_batch_size", self._render_batch_size)
+            metrics.set("renderer_stage_sync", 1 if self._renderer_stage_sync else 0)
+            metrics.set("profiler_enabled", 1 if self._profile_run_dir else 0)
         self._initial_placeholder = np.zeros(
             (self._render_res, self._render_res, 3),
             dtype=np.uint8,
@@ -991,31 +1025,192 @@ class ARTalkPipeline:
                 self._worker_busy = True
                 metrics.set("worker_busy", 1)
                 try:
-                    if isinstance(item, QueuedAudioSamples):
-                        self._process_sample_chunk(
-                            item.samples,
-                            item.accepted_at,
-                        )
-                    elif isinstance(item, QueuedAudioFrame):
-                        self._process_input_frame(
-                            item.frame,
-                            item.accepted_at,
-                        )
-                    elif isinstance(item, np.ndarray):
-                        self._process_sample_chunk(
-                            item,
-                            time.perf_counter(),
-                        )
+                    if self._should_profile_item(item):
+                        self._process_worker_item_profiled(item)
                     else:
-                        self._process_input_frame(
-                            item,
-                            time.perf_counter(),
-                        )
+                        self._process_worker_item(item)
                 except Exception:
                     logger.exception("[ARTalkPipeline] worker error")
                 finally:
                     self._worker_busy = False
                     metrics.set("worker_busy", 0)
+
+    def _process_worker_item(self, item):
+        if isinstance(item, QueuedAudioSamples):
+            self._process_sample_chunk(
+                item.samples,
+                item.accepted_at,
+            )
+        elif isinstance(item, QueuedAudioFrame):
+            self._process_input_frame(
+                item.frame,
+                item.accepted_at,
+            )
+        elif isinstance(item, np.ndarray):
+            self._process_sample_chunk(
+                item,
+                time.perf_counter(),
+            )
+        else:
+            self._process_input_frame(
+                item,
+                time.perf_counter(),
+            )
+
+    def _estimate_item_samples_16k(self, item) -> int:
+        """Estimate how many 16 kHz samples ``item`` contributes post-resample."""
+        if isinstance(item, QueuedAudioSamples):
+            return int(item.samples.size)
+        if isinstance(item, np.ndarray):
+            return int(item.size)
+        frame = item.frame if isinstance(item, QueuedAudioFrame) else item
+        n_samples = getattr(frame, "samples", 0) or 0
+        rate = getattr(frame, "sample_rate", 0) or SAMPLE_RATE
+        return int(n_samples * SAMPLE_RATE / rate)
+
+    def _should_profile_item(self, item) -> bool:
+        if self._profile_run_dir is None:
+            return False
+        if self._profile_chunks_captured >= self._profile_max_chunks:
+            return False
+        buffered = self._streamer._audio_buffer.shape[0]
+        incoming = self._estimate_item_samples_16k(item)
+        if buffered + incoming < self._streamer.patch_audio_length:
+            return False
+        self._profile_chunks_seen += 1
+        return self._profile_chunks_seen > self._profile_skip_chunks
+
+    def _process_worker_item_profiled(self, item):
+        metrics = current_pipeline_metrics()
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.device(self._device).type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        # Profiler failures must never take the audio item down with them:
+        # process the item unprofiled when the profiler cannot start, and
+        # record the error so the UI can surface it instead of appearing to
+        # wait forever.
+        try:
+            prof = torch.profiler.profile(activities=activities)
+            prof.__enter__()
+        except Exception as exc:
+            logger.exception("[ARTalkPipeline] profiler start failed")
+            self._set_profiler_error(f"{type(exc).__name__}: {exc}")
+            self._process_worker_item(item)
+            return
+        stop_failed = False
+        try:
+            self._process_worker_item(item)
+        finally:
+            try:
+                prof.__exit__(None, None, None)
+            except Exception as exc:
+                logger.exception("[ARTalkPipeline] profiler stop failed")
+                self._set_profiler_error(f"{type(exc).__name__}: {exc}")
+                stop_failed = True
+        if stop_failed:
+            return
+        self._profile_chunks_captured += 1
+        # Export + summary can take seconds for a 4-second chunk trace; doing
+        # that on the worker thread stalls audio/video output right after the
+        # capture, so hand the finished profile off to a background thread.
+        threading.Thread(
+            target=self._export_profiler_capture,
+            args=(prof, self._profile_chunks_seen, self._profile_chunks_captured),
+            name="ARTalkProfilerExport",
+            daemon=True,
+        ).start()
+
+    def _export_profiler_capture(self, prof, chunk_index, capture_index):
+        with self.metrics_context():
+            metrics = current_pipeline_metrics()
+            trace_path = os.path.join(
+                self._profile_run_dir,
+                f"chunk-{chunk_index:03d}.json",
+            )
+            export_t0 = time.perf_counter()
+            try:
+                prof.export_chrome_trace(trace_path)
+            except Exception as exc:
+                logger.exception("[ARTalkPipeline] profiler trace export failed")
+                self._set_profiler_error(f"{type(exc).__name__}: {exc}")
+                return
+            metrics.observe_ms(
+                "profiler_trace_export", time.perf_counter() - export_t0
+            )
+            metrics.inc("profiler_traces_captured")
+            summary_t0 = time.perf_counter()
+            sort_by = (
+                "self_cuda_time_total"
+                if torch.device(self._device).type == "cuda"
+                else "self_cpu_time_total"
+            )
+            try:
+                summary_table = prof.key_averages().table(
+                    sort_by=sort_by, row_limit=30
+                )
+            except Exception:
+                logger.exception("[ARTalkPipeline] profiler summary build failed")
+                summary_table = ""
+            metrics.observe_ms(
+                "profiler_summary_build", time.perf_counter() - summary_t0
+            )
+            if summary_table:
+                # Persist next to the trace so UIs can show summaries from
+                # earlier pipeline instances (the in-memory results below die
+                # with this pipeline on session restarts).
+                summary_path = os.path.splitext(trace_path)[0] + "-summary.txt"
+                try:
+                    with open(summary_path, "w") as f:
+                        f.write(summary_table)
+                except OSError:
+                    logger.exception(
+                        "[ARTalkPipeline] profiler summary write failed"
+                    )
+            with self._profiler_results_lock:
+                self._profiler_results.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "trace_path": trace_path,
+                        "summary_table": summary_table,
+                        "captured_at_s": time.time(),
+                    }
+                )
+            logger.warning(
+                "[ARTalkPipeline] profiler trace exported (%d/%d): %s",
+                capture_index,
+                self._profile_max_chunks,
+                trace_path,
+            )
+
+    def _set_profiler_error(self, message: str) -> None:
+        with self._profiler_results_lock:
+            self._profiler_last_error = message
+
+    @property
+    def profiler_run_dir(self) -> str | None:
+        return self._profile_run_dir
+
+    @property
+    def profiler_max_chunks(self) -> int:
+        return self._profile_max_chunks
+
+    def profiler_status(self) -> dict:
+        """Snapshot of profiler configuration and capture progress."""
+        with self._profiler_results_lock:
+            last_error = self._profiler_last_error
+        return {
+            "run_dir": self._profile_run_dir,
+            "skip_chunks": self._profile_skip_chunks,
+            "max_chunks": self._profile_max_chunks,
+            "chunks_seen": self._profile_chunks_seen,
+            "chunks_captured": self._profile_chunks_captured,
+            "last_error": last_error,
+        }
+
+    def profiler_results(self) -> list[dict]:
+        """Snapshot of captured profiler summaries (oldest first)."""
+        with self._profiler_results_lock:
+            return list(self._profiler_results)
 
     def _process_input_frame(
         self,
@@ -1027,7 +1222,8 @@ class ARTalkPipeline:
         # video below) and fed to the streamer for motion inference.
         metrics = current_pipeline_metrics()
         with observe_pipeline_duration("resample"):
-            resampled = self._resampler.resample(frame)
+            with torch.profiler.record_function("artalk.resample"):
+                resampled = self._resampler.resample(frame)
         if not isinstance(resampled, list):
             resampled = [resampled]
         for rf in resampled:
@@ -1062,7 +1258,8 @@ class ARTalkPipeline:
         ).to(self._device)
         buf_before = self._streamer._audio_buffer.shape[0]
         streamer_t0 = time.perf_counter()
-        motion = self._streamer.feed(samples_t)
+        with torch.profiler.record_function("artalk.streamer_feed"):
+            motion = self._streamer.feed(samples_t)
         streamer_elapsed_s = time.perf_counter() - streamer_t0
         metrics.observe_ms("artalk_streamer_feed", streamer_elapsed_s)
         buf_after = self._streamer._audio_buffer.shape[0]
@@ -1113,7 +1310,8 @@ class ARTalkPipeline:
         )
 
         smoother_t0 = time.perf_counter()
-        smoothed = self._smoother.feed(motion)
+        with torch.profiler.record_function("artalk.smoother_feed"):
+            smoothed = self._smoother.feed(motion)
         smoother_elapsed_s = time.perf_counter() - smoother_t0
         metrics.observe_ms("smoother_feed", smoother_elapsed_s)
         metrics.observe_ms("post_model_smoother_feed", smoother_elapsed_s)
@@ -1225,13 +1423,14 @@ class ARTalkPipeline:
                     segment_excess_s,
                 )
                 publish_t0 = time.perf_counter()
-                self._publish_output_segment(
-                    segment_frames,
-                    audio_slice,
-                    motion_produced_at,
-                    segment_render_started_at,
-                    segment_media_offset_s,
-                )
+                with torch.profiler.record_function("artalk.publish_segment"):
+                    self._publish_output_segment(
+                        segment_frames,
+                        audio_slice,
+                        motion_produced_at,
+                        segment_render_started_at,
+                        segment_media_offset_s,
+                    )
                 segment_metrics.observe_ms(
                     "post_model_publish_segment",
                     time.perf_counter() - publish_t0,
@@ -1263,9 +1462,10 @@ class ARTalkPipeline:
                 video_queue_depth=self._video_queue_depth(),
                 audio_out_buffer_s=self._audio_out_buffer.size / SAMPLE_RATE,
             ) as render_metrics:
-                rgb_batch, render_timings = self._renderer.render_batch_profile(
-                    motion_batch
-                )
+                with torch.profiler.record_function("artalk.render_batch"):
+                    rgb_batch, render_timings = self._renderer.render_batch_profile(
+                        motion_batch
+                    )
                 for key, elapsed_s in render_timings.items():
                     render_metrics.observe_ms(key, elapsed_s)
                 render_metrics.observe_ms(
@@ -1275,14 +1475,15 @@ class ARTalkPipeline:
                 render_metrics.inc("render_batches")
                 render_metrics.inc("render_batch_frames", motion_batch.shape[0])
                 convert_t0 = time.perf_counter()
-                arr_batch = (
-                    (rgb_batch * 255.0)
-                    .clamp_(0, 255)
-                    .to(torch.uint8)
-                    .permute(0, 2, 3, 1)
-                    .contiguous()
-                    .numpy()
-                )
+                with torch.profiler.record_function("artalk.rgb_batch_to_numpy"):
+                    arr_batch = (
+                        (rgb_batch * 255.0)
+                        .clamp_(0, 255)
+                        .to(torch.uint8)
+                        .permute(0, 2, 3, 1)
+                        .contiguous()
+                        .numpy()
+                    )
                 render_metrics.observe_ms(
                     "rgb_batch_to_numpy",
                     time.perf_counter() - convert_t0,
