@@ -60,6 +60,10 @@ AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 AUDIO_SAMPLES_PER_VIDEO_FRAME = SAMPLE_RATE // FPS
 DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS = 1.00
 DEFAULT_OUTPUT_SEGMENT_SECONDS = 1.00
+# A new "turn" starts when real (non-filler) audio arrives after this long
+# without any. Matches the silence pump's idle threshold so filler injection
+# and turn boundaries agree.
+TURN_GAP_S = 1.00
 
 
 @dataclass
@@ -72,6 +76,7 @@ class QueuedAudioFrame:
 class QueuedAudioSamples:
     samples: np.ndarray
     accepted_at: float
+    is_filler: bool = False
 
 
 @dataclass
@@ -108,6 +113,7 @@ class RenderedVideoFrame:
     audio_midpoint_accepted_at: float | None = None
     published_at: float | None = None
     frame_index: int | None = None
+    turn_start_accepted_at: float | None = None
 
 
 def with_pipeline_metrics(method):
@@ -213,6 +219,9 @@ class ARTalkPipeline:
         # for). When motion fires we move the matching prefix into
         # _audio_out_buffer.
         self._pending_audio_for_output: list[PendingAudioChunk] = []
+        # Worker-thread-only turn tracking (see TURN_GAP_S).
+        self._last_real_accepted_at: float | None = None
+        self._turn_start_accepted_at: float | None = None
         self._stop_event = threading.Event()
         self._worker_busy = False
         self._dbg_calls = 0
@@ -296,13 +305,16 @@ class ARTalkPipeline:
         metrics.set("audio_in_queue_depth", depth)
 
     @with_pipeline_metrics
-    def push_audio_samples(self, samples_int16: np.ndarray) -> None:
+    def push_audio_samples(
+        self, samples_int16: np.ndarray, *, is_filler: bool = False
+    ) -> None:
         """Queue already-resampled 16 kHz mono int16 samples.
 
         This is useful for app-level glue code that synthesizes filler audio
         between upstream audio chunks. The samples still flow through the
         pipeline worker so ARTalkStreamer, smoothing, and rendering state remain
-        single-threaded.
+        single-threaded. ``is_filler`` marks synthesized padding so it does not
+        count as real input for turn-latency tracking.
         """
         samples = np.asarray(samples_int16, dtype=np.int16)
         if samples.ndim != 1:
@@ -315,7 +327,11 @@ class ARTalkPipeline:
         metrics.inc("audio_sample_chunks_pushed")
         metrics.inc("audio_samples_pushed", samples.size)
         self._audio_in_queue.put(
-            QueuedAudioSamples(samples=samples.copy(), accepted_at=accepted_at)
+            QueuedAudioSamples(
+                samples=samples.copy(),
+                accepted_at=accepted_at,
+                is_filler=is_filler,
+            )
         )
         depth = self._audio_in_queue.qsize()
         metrics.set("audio_in_queue_depth", depth)
@@ -323,7 +339,10 @@ class ARTalkPipeline:
     def push_silence(self, duration_s: float) -> None:
         n_samples = max(0, int(round(duration_s * SAMPLE_RATE)))
         if n_samples:
-            self.push_audio_samples(np.zeros(n_samples, dtype=np.int16))
+            self.push_audio_samples(
+                np.zeros(n_samples, dtype=np.int16),
+                is_filler=True,
+            )
 
     def output_buffer_snapshot(self) -> dict[str, int]:
         with self._audio_out_lock:
@@ -473,10 +492,13 @@ class ARTalkPipeline:
         # frames can be older than the audio clock. Drop those stale frames and
         # serve the latest frame at or before the current audio-derived index.
         dropped_for_sync = 0
+        turn_start_accepted_at: float | None = None
         with self._video_queue_lock:
             selected: tuple[int, RenderedVideoFrame] | None = None
             while self._video_queue and self._video_queue[0][0] <= target_index:
                 selected = self._video_queue.popleft()
+                if turn_start_accepted_at is None:
+                    turn_start_accepted_at = selected[1].turn_start_accepted_at
                 if self._video_queue and self._video_queue[0][0] <= target_index:
                     dropped_for_sync += 1
             depth = len(self._video_queue)
@@ -486,7 +508,12 @@ class ARTalkPipeline:
         metrics.set("video_queue_depth", depth)
         if selected is None:
             return None, None
-        return selected[1], selected[0]
+        frame = selected[1]
+        # If the tagged turn-start frame was among the sync-dropped ones,
+        # the served frame inherits the tag so the turn is still recorded.
+        if frame.turn_start_accepted_at is None and turn_start_accepted_at is not None:
+            frame.turn_start_accepted_at = turn_start_accepted_at
+        return frame, selected[0]
 
     def _record_served_frame_latency(self, frame: RenderedVideoFrame) -> None:
         if frame.audio_midpoint_accepted_at is None:
@@ -508,6 +535,11 @@ class ARTalkPipeline:
         metrics.observe_ms("frame_render_to_serve_latency", render_to_serve_s)
         metrics.observe_min("min_frame_audio_to_video_served_latency_s", served_latency_s)
         metrics.observe_max("max_frame_audio_to_video_served_latency_s", served_latency_s)
+        if frame.turn_start_accepted_at is not None:
+            turn_latency_s = served_at - frame.turn_start_accepted_at
+            metrics.observe_ms("turn_first_frame_latency", turn_latency_s)
+            metrics.set("last_turn_first_frame_latency_s", turn_latency_s)
+            metrics.inc("turns_served")
 
     def _record_served_video_lag(
         self,
@@ -764,6 +796,14 @@ class ARTalkPipeline:
         for frame, accepted_at in zip(frames, frame_timestamps):
             frame.audio_midpoint_accepted_at = accepted_at
             frame.published_at = published_at
+        if self._turn_start_accepted_at is not None:
+            # Tag the first frame whose audio reaches the pending turn start;
+            # earlier frames in the segment cover pre-turn filler audio.
+            for frame, accepted_at in zip(frames, frame_timestamps):
+                if accepted_at >= self._turn_start_accepted_at:
+                    frame.turn_start_accepted_at = self._turn_start_accepted_at
+                    self._turn_start_accepted_at = None
+                    break
         publish_video_t0 = time.perf_counter()
         with self._video_queue_lock:
             for frame in frames:
@@ -1099,6 +1139,7 @@ class ARTalkPipeline:
             self._process_sample_chunk(
                 item.samples,
                 item.accepted_at,
+                is_filler=item.is_filler,
             )
         elif isinstance(item, QueuedAudioFrame):
             self._process_input_frame(
@@ -1300,7 +1341,16 @@ class ARTalkPipeline:
         self,
         samples_int16: np.ndarray,
         accepted_at: float,
+        is_filler: bool = False,
     ) -> None:
+        if not is_filler:
+            if (
+                self._last_real_accepted_at is None
+                or accepted_at - self._last_real_accepted_at > TURN_GAP_S
+            ):
+                self._turn_start_accepted_at = accepted_at
+                current_pipeline_metrics().inc("turns_started")
+            self._last_real_accepted_at = accepted_at
         self._pending_audio_for_output.append(
             PendingAudioChunk(
                 samples=samples_int16,
