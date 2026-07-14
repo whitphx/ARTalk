@@ -609,6 +609,42 @@ class ARTalkPipeline:
             except queue.Empty:
                 return
 
+    @with_pipeline_metrics
+    def flush_output(self):
+        """Drop queued-but-unplayed output and skip the media clock past it.
+
+        For barge-in: when the user interrupts, already-published response
+        audio/video should stop playing immediately. The flushed audio is
+        credited to the served-samples clock so that frame indices published
+        afterwards stay aligned with it — without the credit the clock could
+        never reach them and video would freeze permanently. Only
+        callback-side state is touched, so this is safe to call from any
+        thread; audio already inside the worker (streamer buffer plus the
+        chunk currently rendering) still publishes, bounded by one model
+        chunk of stale content.
+        """
+        metrics = current_pipeline_metrics()
+        self._drain_queue(self._audio_in_queue)
+        with self._audio_out_lock:
+            flushed_samples = int(self._audio_out_buffer.size)
+            self._audio_out_buffer = np.zeros(0, dtype=np.int16)
+            self._synced_audio_samples_served += flushed_samples
+            synced_audio_samples = self._synced_audio_samples_served
+        with self._video_queue_lock:
+            flushed_frames = len(self._video_queue)
+            self._video_queue.clear()
+        metrics.inc("output_flushes")
+        metrics.inc("flushed_audio_samples", flushed_samples)
+        metrics.inc("flushed_video_frames", flushed_frames)
+        metrics.set("audio_out_buffer_samples", 0)
+        metrics.set("audio_out_buffer_seconds", 0.0)
+        metrics.set("video_queue_depth", 0)
+        metrics.set("synced_audio_samples_served", synced_audio_samples)
+        metrics.set(
+            "synced_audio_frame_index",
+            synced_audio_samples // AUDIO_SAMPLES_PER_VIDEO_FRAME,
+        )
+
     def _pop_pending_audio_for_output(self, n_samples: int) -> list[PendingAudioChunk]:
         # ARTalk consumes audio in large model chunks before it can produce
         # motion. Keep the raw input audio staged until the corresponding
@@ -740,10 +776,33 @@ class ARTalkPipeline:
                 self._video_queue.append((frame_index, frame))
                 last_frame_index = frame_index
             video_depth = len(self._video_queue)
+            front_frame_index = self._video_queue[0][0] if self._video_queue else None
         metrics.observe_ms(
             "post_model_publish_video_queue",
             time.perf_counter() - publish_video_t0,
         )
+        if dropped_video_frames and front_frame_index is not None:
+            # The video queue is bounded but the audio buffer is not; without
+            # this, audio paired with the evicted frames still plays and the
+            # video freezes until the clock reaches the surviving frames.
+            # Fast-forward playback to the surviving front frame instead.
+            with self._audio_out_lock:
+                skip = (
+                    front_frame_index * AUDIO_SAMPLES_PER_VIDEO_FRAME
+                    - self._synced_audio_samples_served
+                )
+                skip = min(max(skip, 0), int(self._audio_out_buffer.size))
+                if skip:
+                    self._audio_out_buffer = self._audio_out_buffer[skip:]
+                    self._synced_audio_samples_served += skip
+                synced_audio_samples = self._synced_audio_samples_served
+            if skip:
+                metrics.inc("audio_samples_skipped_for_dropped_video", skip)
+                metrics.set("synced_audio_samples_served", synced_audio_samples)
+                metrics.set(
+                    "synced_audio_frame_index",
+                    synced_audio_samples // AUDIO_SAMPLES_PER_VIDEO_FRAME,
+                )
         publish_audio_t0 = time.perf_counter()
         with self._audio_out_lock:
             if audio.size:
