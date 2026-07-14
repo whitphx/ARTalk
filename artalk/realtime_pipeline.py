@@ -43,6 +43,7 @@ from .metrics import (
     current_pipeline_metrics,
     observe_pipeline_duration,
     pipeline_metrics_context,
+    pipeline_metrics_scope,
     pipeline_metrics_tags,
 )
 from .rendering import StreamingRenderer
@@ -64,6 +65,11 @@ DEFAULT_OUTPUT_SEGMENT_SECONDS = 1.00
 # without any. Matches the silence pump's idle threshold so filler injection
 # and turn boundaries agree.
 TURN_GAP_S = 1.00
+
+# First-use costs (CUDA allocations, cuDNN autotuning, encoder first pass)
+# are process-global, so one warm-up per shape configuration per process is
+# enough; pipelines recreated on settings changes skip it.
+_WARMED_CONFIGS: set[tuple] = set()
 
 
 @dataclass
@@ -273,9 +279,16 @@ class ARTalkPipeline:
             dtype=np.uint8,
         )
         self._placeholder = self._initial_placeholder
-        with self.metrics_context():
-            if self._renderer.mode == "gagavatar":
-                self._warm_up_renderer()
+        warm_key = (
+            str(device),
+            self._renderer.mode,
+            self._render_res,
+            self._render_batch_size,
+        )
+        if warm_key not in _WARMED_CONFIGS:
+            with self.metrics_context():
+                self._warm_up_pipeline()
+            _WARMED_CONFIGS.add(warm_key)
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="ARTalkPipelineWorker",
@@ -449,8 +462,27 @@ class ARTalkPipeline:
                 metrics.inc("audio_short_buffer_frames")
                 metrics.inc("audio_short_buffer_samples", underrun)
             else:
-                metrics.inc("audio_playback_underrun_frames")
-                metrics.inc("audio_playback_underrun_samples", underrun)
+                # Since the silence pump stopped topping up the buffer during
+                # idle, an empty buffer usually means idle, not starvation.
+                # Count an underrun only while content is still in flight so
+                # the counter keeps meaning "playback starved mid-content".
+                last_real = self._last_real_accepted_at
+                content_in_flight = (
+                    self._audio_in_queue.qsize() > 0
+                    or self._worker_busy
+                    or self._video_queue_depth() > 0
+                    or (
+                        last_real is not None
+                        and time.perf_counter() - last_real
+                        < self._streamer.patch_audio_length / SAMPLE_RATE
+                    )
+                )
+                if content_in_flight:
+                    metrics.inc("audio_playback_underrun_frames")
+                    metrics.inc("audio_playback_underrun_samples", underrun)
+                else:
+                    metrics.inc("audio_idle_silence_frames")
+                    metrics.inc("audio_idle_silence_samples", underrun)
         metrics.set("audio_playback_started", 1 if self._playback_started else 0)
         metrics.set("synced_audio_samples_served", synced_audio_samples)
         metrics.set(
@@ -1084,30 +1116,40 @@ class ARTalkPipeline:
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
 
-    def _warm_up_renderer(self):
-        metrics = current_pipeline_metrics()
-        motion = torch.zeros(
-            self._streamer.motion_dim,
-            dtype=self._streamer.dtype,
-            device=self._streamer.device,
-        )
-        with observe_pipeline_duration("renderer_warmup"):
-            rgb, timings = self._renderer.render_frame_profile(motion)
-            convert_t0 = time.perf_counter()
-            (
-                (rgb * 255.0)
-                .clamp_(0, 255)
-                .to(torch.uint8)
-                .permute(1, 2, 0)
-                .contiguous()
-                .numpy()
-            )
-            metrics.observe_ms(
-                "warmup_rgb_tensor_to_numpy",
-                time.perf_counter() - convert_t0,
-            )
-        for key, elapsed_s in timings.items():
-            metrics.observe_ms(f"warmup_{key}", elapsed_s)
+    def _warm_up_pipeline(self):
+        """Run one silent model chunk through the full streamer → smoother →
+        renderer path and discard the output.
+
+        Pays first-use costs (CUDA allocations, cuDNN autotuning, audio
+        encoder first pass) at startup instead of during the session's first
+        turn. Output queues are never touched, and the streamer/smoother are
+        reset afterwards so real inference starts from the same state as an
+        un-warmed pipeline.
+        """
+        with observe_pipeline_duration("pipeline_warmup"):
+            with pipeline_metrics_scope("warmup"):
+                silence = torch.zeros(
+                    self._streamer.patch_audio_length,
+                    dtype=torch.float32,
+                )
+                with observe_pipeline_duration("streamer_feed"):
+                    motion = self._streamer.feed(silence)
+                with observe_pipeline_duration("smoother_feed"):
+                    smoothed = self._smoother.feed(motion)
+                with observe_pipeline_duration("render_chunks"):
+                    for start in range(0, smoothed.shape[0], self._render_batch_size):
+                        batch = smoothed[start : start + self._render_batch_size]
+                        rgb_batch, _ = self._renderer.render_batch_profile(batch)
+                        (
+                            (rgb_batch * 255.0)
+                            .clamp_(0, 255)
+                            .to(torch.uint8)
+                            .permute(0, 2, 3, 1)
+                            .contiguous()
+                            .numpy()
+                        )
+        self._streamer.reset()
+        self._smoother.reset()
 
     def _worker_loop(self):
         with self.metrics_context():
