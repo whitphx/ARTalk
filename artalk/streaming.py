@@ -222,13 +222,16 @@ class CausalSavgolSmoother:
       * pose channels (``[100:103]``) override: ``window_length=9``,
         ``polyorder=3``
 
-    Savgol with the default ``mode='interp'`` is symmetric and
-    deterministic, so re-applying it to a growing buffer yields output
-    that is **bit-exact** with the one-shot path: interior frames
-    depend only on a fixed-size neighborhood that becomes
-    context-independent once both halves of the window are buffered,
-    and left/right boundary frames are reproduced by ``finish()``
-    re-running savgol on the full final buffer.
+    Savgol with the default ``mode='interp'`` is deterministic and
+    local, so the streaming output is **bit-exact** with the one-shot
+    path while filtering only a small window per feed: interior frames
+    depend only on ``DELAY`` frames of context on each side, and the
+    edge-fitted boundary frames are computed from slices whose edges
+    coincide with the true sequence edges (the first frames are emitted
+    from a slice starting at frame 0; ``finish()`` filters a slice that
+    contains the final ``POSE_WINDOW`` frames). Frames that can no
+    longer influence any future output are dropped, so per-feed cost
+    and retained memory stay bounded regardless of session length.
 
     Each emitted frame is delayed by ``(POSE_WINDOW - 1) // 2 = 4``
     frames (160 ms at 25 fps), on top of the AR model's 4-second chunk
@@ -250,8 +253,14 @@ class CausalSavgolSmoother:
         self.reset()
 
     def reset(self):
-        self._buffer = None
+        # ``_tail`` holds frames [``_tail_start``, n_seen) — the suffix of
+        # the full sequence that can still influence future output.
+        self._tail = None
+        self._tail_start = 0
         self._n_emitted = 0
+
+    def _n_seen(self):
+        return self._tail_start + self._tail.shape[0]
 
     def feed(self, motion_frames):
         if motion_frames.dim() != 2:
@@ -260,41 +269,58 @@ class CausalSavgolSmoother:
             )
         if motion_frames.shape[0] == 0:
             return motion_frames
-        if self._buffer is None:
-            self._buffer = motion_frames
+        if self._tail is None:
+            self._tail = motion_frames
         else:
-            self._buffer = torch.cat([self._buffer, motion_frames], dim=0)
-        n = self._buffer.shape[0]
+            self._tail = torch.cat([self._tail, motion_frames], dim=0)
+        n_seen = self._n_seen()
         empty = motion_frames.new_zeros(0, motion_frames.shape[1])
-        if n < self.POSE_WINDOW:
+        if n_seen < self.POSE_WINDOW:
             return empty
-        n_stable = n - self.DELAY
+        n_stable = n_seen - self.DELAY
         if n_stable <= self._n_emitted:
             return empty
-        smoothed = self._apply_savgol(self._buffer)
-        out = smoothed[self._n_emitted:n_stable]
+        out = self._smooth_range(self._n_emitted, n_stable)
         self._n_emitted = n_stable
+        # Future output needs DELAY frames of context before the next
+        # emitted frame, and finish() needs the last POSE_WINDOW frames
+        # for its right-edge polynomial fit.
+        keep_from = min(self._n_emitted - self.DELAY, n_seen - self.POSE_WINDOW)
+        if keep_from > self._tail_start:
+            self._tail = self._tail[keep_from - self._tail_start :]
+            self._tail_start = keep_from
         return out
 
     def finish(self):
-        if self._buffer is None:
+        if self._tail is None:
             raise RuntimeError(
                 "CausalSavgolSmoother.finish called before any feed; "
                 "no motion_dim known."
             )
-        n = self._buffer.shape[0]
-        if self._n_emitted >= n:
-            out = self._buffer.new_zeros(0, self._buffer.shape[1])
-        elif n < self.POSE_WINDOW:
+        n_seen = self._n_seen()
+        if self._n_emitted >= n_seen:
+            out = self._tail.new_zeros(0, self._tail.shape[1])
+        elif n_seen < self.POSE_WINDOW:
             # Buffer too short to apply the 9-tap pose filter.
             # Fall back to raw frames; one-shot inference would also
             # fail on inputs this short.
-            out = self._buffer[self._n_emitted:]
+            out = self._tail[self._n_emitted - self._tail_start :]
         else:
-            smoothed = self._apply_savgol(self._buffer)
-            out = smoothed[self._n_emitted:]
-        self._n_emitted = n
+            out = self._smooth_range(self._n_emitted, n_seen)
+        self._n_emitted = n_seen
         return out
+
+    def _smooth_range(self, start, end):
+        """Smoothed frames [``start``, ``end``), bit-exact with filtering
+        the full sequence."""
+        n_seen = self._n_seen()
+        lo = max(start - self.DELAY, 0)
+        if end > n_seen - self.DELAY:
+            # The range includes right-boundary frames, whose edge fit
+            # must see the true final POSE_WINDOW frames.
+            lo = min(lo, max(n_seen - self.POSE_WINDOW, 0))
+        smoothed = self._apply_savgol(self._tail[lo - self._tail_start :])
+        return smoothed[start - lo : end - lo]
 
     @classmethod
     def _apply_savgol(cls, buffer):
