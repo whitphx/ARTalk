@@ -125,70 +125,22 @@ that is the right notion of equivalence for this stage.
 
 ### Phase 4 — WebRTC transport
 
-`streamlit_app.py` (root) loads the model + FLAME pieces once
-(cached via `st.cache_resource`), builds a per-session
-`ARTalkPipeline` in `st.session_state`, and runs `webrtc_streamer`
-in `SENDRECV` mode (audio in via `audio_frame_callback`, video out
-via a custom `MediaStreamTrack` source). The pipeline lives in
-`app/realtime_pipeline.py`.
+The WebRTC application layer lives in a separate repository,
+[artalk-streamlit-realtime](https://github.com/whitphx/artalk-streamlit-realtime),
+which installs ARTalk as a package. It runs `webrtc_streamer` in
+`SENDRECV` mode (audio in via an audio sink track, synchronized audio
+and video out via source-track callbacks), builds a per-session
+`ARTalkPipeline` in `st.session_state`, and adds the app-layer glue
+that is transport-specific by design: idle silence pumping to flush
+the model's final partial chunk, the OpenAI Realtime bridge for
+interactive mode, and the diagnostics UI over
+`ARTalkPipeline.metrics_snapshot()`.
 
-The audio callback resamples each browser frame to 16 kHz mono int16
-(via `av.AudioResampler`), pushes the samples through
-`ARTalkStreamer → CausalSavgolSmoother → StreamingRenderer`, and
-enqueues rendered RGB frames into a `queue.Queue`. The custom video
-track pulls from that queue (in an executor so we don't block the
-asyncio loop) and falls back to a black placeholder when no frame is
-ready, so the outbound track keeps producing frames at the timestamp
-pace aiortc expects.
-
-#### Design decisions
-
-- **Library: streamlit-webrtc.** Started with FastRTC; couldn't get
-  inbound audio frames to reach the handler in audio-video mode in
-  time. Switched to streamlit-webrtc, which the project owner
-  authored and can patch upstream if a limitation is hit. The
-  asymmetric "audio in, video out" pattern maps onto streamlit-webrtc
-  as `audio_frame_callback` (input side) plus a custom
-  `source_video_track` (output side).
-- **Per-session pipeline in `st.session_state`** so the streamer /
-  smoother / renderer state survives Streamlit script reruns. The
-  pipeline holds GPU state; current scope is single-session,
-  single-GPU.
-- **Bounded video queue with drop-oldest backpressure.** A
-  `queue.Queue(maxsize=200)` (~8 s at 25 fps) absorbs the
-  100-frame-per-4 s render bursts; when full, oldest frame is
-  dropped to keep the queue from growing unboundedly.
-- **Black placeholder frame** while waiting for the first real
-  render (and during transient gaps). Keeps the outbound video
-  track alive so the browser doesn't time out the WebRTC offer.
-- **Audio is echoed back** as the outbound audio track (the
-  callback returns the original frame). A 4 s-lag-aligned audio
-  pipeline is left for a future iteration.
-- **MVP scope**: mesh mode, no style motion, no UI configurability.
-  GAGAvatar mode, style selection, TTS input come in later
-  iterations.
-- **`streamlit` and `streamlit-webrtc` declared in `environment.yml`**
-  (pip section, `>=1.40` and `>=0.62` respectively). `fastrtc` was
-  removed from the dep list along with the FastRTC implementation.
-
-#### Running
-
-```bash
-streamlit run streamlit_app.py        # default: cuda
-streamlit run streamlit_app.py -- --device cpu
-```
-
-Streamlit serves on port 8501 by default. Browser microphone access
-requires a secure context (HTTPS or `http://localhost`), so on a
-remote GPU forward the port:
-
-```bash
-ssh -L 8501:localhost:8501 <gpu-host>
-```
-
-then open `http://localhost:8501` on the workstation, grant mic
-permission in the streamlit-webrtc widget, click "Start", speak,
-and the avatar starts moving ~4 seconds later.
+This repository provides everything below that line:
+`ARTalkStreamer → CausalSavgolSmoother → StreamingRenderer` wired
+together by `artalk/realtime_pipeline.py`, whose
+audio-clock-synchronized output callbacks are what the transport
+serves.
 
 ## Future (deferred / out of branch scope)
 
