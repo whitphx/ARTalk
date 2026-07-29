@@ -232,6 +232,11 @@ class ARTalkPipeline:
         # for). When motion fires we move the matching prefix into
         # _audio_out_buffer.
         self._pending_audio_for_output: list[PendingAudioChunk] = []
+        # Device-wide utilization (includes other tenants' processes) sampled
+        # so stalls can be attributed to GPU contention; None if pynvml is
+        # unavailable.
+        self._gpu_sampling_ok = torch.device(device).type == "cuda"
+        self._last_gpu_sample_s = 0.0
         # Worker-thread-only turn tracking (see TURN_GAP_S).
         self._last_real_accepted_at: float | None = None
         self._turn_start_accepted_at: float | None = None
@@ -1158,9 +1163,35 @@ class ARTalkPipeline:
         self._streamer.reset()
         self._smoother.reset()
 
+    def _gpu_utilization_percent(self) -> int | None:
+        if not self._gpu_sampling_ok:
+            return None
+        try:
+            return int(torch.cuda.utilization(self._device))
+        except Exception:
+            self._gpu_sampling_ok = False
+            return None
+
+    def _sample_gpu_status(self):
+        now = time.perf_counter()
+        if now - self._last_gpu_sample_s < 1.0:
+            return
+        self._last_gpu_sample_s = now
+        util = self._gpu_utilization_percent()
+        if util is None:
+            return
+        metrics = current_pipeline_metrics()
+        metrics.set("gpu_utilization_percent", util)
+        metrics.observe_max("max_gpu_utilization_percent", util)
+        try:
+            metrics.set("gpu_sm_clock_mhz", int(torch.cuda.clock_rate(self._device)))
+        except Exception:
+            pass
+
     def _worker_loop(self):
         with self.metrics_context():
             while not self._stop_event.is_set():
+                self._sample_gpu_status()
                 try:
                     item = self._audio_in_queue.get(timeout=0.1)
                 except queue.Empty:
@@ -1635,6 +1666,7 @@ class ARTalkPipeline:
                 audio_in_queue_depth=self._audio_in_queue.qsize(),
                 video_queue_depth=self._video_queue_depth(),
                 audio_out_buffer_s=self._audio_out_buffer.size / SAMPLE_RATE,
+                gpu_util_pct=self._gpu_utilization_percent(),
             ) as render_metrics:
                 with torch.profiler.record_function("artalk.render_batch"):
                     rgb_batch, render_timings = self._renderer.render_batch_profile(
