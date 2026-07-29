@@ -205,6 +205,13 @@ class ARTalkPipeline:
         self._video_queue: deque[tuple[int, RenderedVideoFrame]] = deque()
         self._video_queue_lock = threading.Lock()
         self._video_queue_max = 200
+        # Rendering runs faster than realtime while upstream audio arrives in
+        # bursts, so without backpressure the worker renders straight into the
+        # queue cap and every publish evicts already-rendered media — audible
+        # as skipped fractions of audio. Pause rendering at the high-water
+        # mark instead and let playback drain the queue; eviction remains only
+        # as a last-resort safety.
+        self._video_queue_high_water = 150
         self._next_video_frame_index = 0
         self._last_video_frame_index_served = -1
         self._audio_in_queue: queue.Queue = queue.Queue()
@@ -1591,6 +1598,22 @@ class ARTalkPipeline:
             segment_render_started_at = None
 
         for start in range(0, smoothed.shape[0], self._render_batch_size):
+            backpressure_t0 = None
+            while (
+                self._video_queue_depth() >= self._video_queue_high_water
+                and not self._stop_event.is_set()
+            ):
+                if backpressure_t0 is None:
+                    backpressure_t0 = time.perf_counter()
+                    metrics.inc("render_backpressure_waits")
+                time.sleep(0.05)
+            if backpressure_t0 is not None:
+                metrics.observe_ms(
+                    "render_backpressure_wait",
+                    time.perf_counter() - backpressure_t0,
+                )
+            if self._stop_event.is_set():
+                return
             motion_batch = smoothed[start : start + self._render_batch_size]
             render_t0 = time.perf_counter()
             if segment_render_started_at is None:
