@@ -167,3 +167,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+!artalk/assets_manifest.json

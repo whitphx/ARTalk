@@ -21,7 +21,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     try:
         import tomli as tomllib
-    except ModuleNotFoundError:  # pragma: no cover - dependency-free fallback
+    except ModuleNotFoundError:
         tomllib = None
 
 
@@ -113,10 +113,12 @@ def find_pyproject(start: Path) -> Path:
 
 
 def load_pyproject(path: Path) -> dict[str, Any]:
-    if tomllib is not None:
-        with path.open("rb") as f:
-            return tomllib.load(f)
-    return parse_asset_tables(path.read_text())
+    if tomllib is None:
+        raise AssetConfigError(
+            f"Reading {path} requires Python >= 3.11 or the tomli package."
+        )
+    with path.open("rb") as f:
+        return tomllib.load(f)
 
 
 def resolve_config_path(value: str | Path, base_dir: Path) -> Path:
@@ -124,31 +126,6 @@ def resolve_config_path(value: str | Path, base_dir: Path) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
-
-
-def parse_asset_tables(text: str) -> dict[str, Any]:
-    data: dict[str, Any] = {"tool": {}}
-    current: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = [part.strip() for part in line[1:-1].split(".")]
-            continue
-        if current not in (["tool", "artalk", "assets"], ["tool", "gagavatar", "assets"]):
-            continue
-        if "=" not in line:
-            continue
-        key, value = [part.strip() for part in line.split("=", 1)]
-        value = value.split("#", 1)[0].strip()
-        if len(value) < 2 or value[0] not in ("'", '"') or value[-1] != value[0]:
-            continue
-        table: dict[str, Any] = data
-        for part in current:
-            table = table.setdefault(part, {})
-        table[key] = value[1:-1]
-    return data
 
 
 def load_asset_manifest() -> dict[str, Any]:
@@ -220,9 +197,10 @@ def asset_download_url(asset: dict[str, Any]) -> str:
     return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}?download=true"
 
 
-def download_file(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output, length=1024 * 1024)
+def download_file(url: str, destination: Path, timeout_s: float = 60.0) -> None:
+    with urllib.request.urlopen(url, timeout=timeout_s) as response:
+        with destination.open("wb") as output:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
 
 
 def verify_asset(path: Path, asset: dict[str, Any]) -> None:
