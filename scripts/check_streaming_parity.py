@@ -168,17 +168,25 @@ def main():
     )
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument(
+        "--audio-encoder", default="wav2vec", type=str,
+        help="ARTalk audio encoder architecture name.",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None, type=str,
+        help="checkpoint path override (default: ./assets/ARTalk_<audio-encoder>.pt)",
+    )
+    parser.add_argument(
         "--style", default=None, type=str,
         help="optional style id under assets/style_motion (e.g. natural_0)",
     )
     args = parser.parse_args()
 
     device = args.device
-    audio_encoder = "wav2vec"
+    audio_encoder = args.audio_encoder
 
-    ckpt = torch.load(
-        f"./assets/ARTalk_{audio_encoder}.pt", map_location="cpu", weights_only=True
-    )
+    checkpoint_path = args.checkpoint or f"./assets/ARTalk_{audio_encoder}.pt"
+    print(f"checkpoint: {checkpoint_path} (audio encoder: {audio_encoder})")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     configs = json.load(open("./assets/config.json"))
     configs["AR_CONFIG"]["AUDIO_ENCODER"] = audio_encoder
     model = BitwiseARModel(configs).to(device)
