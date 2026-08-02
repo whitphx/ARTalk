@@ -52,6 +52,7 @@ class StreamingRenderer:
         shape_id=None,
         device=None,
         stage_sync=True,
+        output_uint8=False,
     ):
         if mode == "mesh":
             if basic_vae is None or flame_model is None or mesh_renderer is None:
@@ -93,6 +94,23 @@ class StreamingRenderer:
         # could otherwise overlap. Disable to measure production behavior;
         # per-stage timings then only cover kernel launch, not execution.
         self._stage_sync = bool(stage_sync)
+        # Scale/clamp/permute to HWC uint8 on the GPU before the
+        # device-to-host copy: 4x less PCIe traffic than float32 and no
+        # CPU-side conversion. Batch outputs are then (T, H, W, 3) uint8
+        # instead of (T, 3, H, W) float.
+        self._output_uint8 = bool(output_uint8)
+
+    def _batch_to_output(self, rgb_batch):
+        if not self._output_uint8:
+            return rgb_batch.cpu()
+        return (
+            (rgb_batch * 255.0)
+            .clamp_(0, 255)
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+            .cpu()
+        )
 
     @property
     def device(self):
@@ -220,7 +238,7 @@ class StreamingRenderer:
             self._observe_active("pytorch3d_forward_batch", timings["avatar_forward_batch"])
 
             t0 = time.perf_counter()
-            rgb = rgb.cpu()
+            rgb = self._batch_to_output(rgb)
             timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
             self._observe_active("gpu_to_cpu_batch", timings["avatar_gpu_to_cpu_batch"])
             self._record_cuda_memory()
@@ -269,7 +287,7 @@ class StreamingRenderer:
             self._observe_active("forward_batch", timings["avatar_forward_batch"])
 
             t0 = time.perf_counter()
-            rgb = rgb.cpu()
+            rgb = self._batch_to_output(rgb)
             timings["avatar_gpu_to_cpu_batch"] = time.perf_counter() - t0
             self._observe_active("gpu_to_cpu_batch", timings["avatar_gpu_to_cpu_batch"])
             self._record_cuda_memory()

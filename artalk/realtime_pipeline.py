@@ -166,6 +166,7 @@ class ARTalkPipeline:
         output_audio_prebuffer_seconds=DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS,
         output_segment_seconds=DEFAULT_OUTPUT_SEGMENT_SECONDS,
         renderer_stage_sync=True,
+        renderer_output_uint8=False,
         profile_trace_dir=None,
         profile_skip_chunks=1,
         profile_max_chunks=2,
@@ -183,6 +184,7 @@ class ARTalkPipeline:
             shape_id=shape_id,
             device=device,
             stage_sync=renderer_stage_sync,
+            output_uint8=renderer_output_uint8,
         )
         self._renderer_stage_sync = bool(renderer_stage_sync)
         # PyTorch Profiler capture is opt-in and chunk-scoped: profiling every
@@ -1174,16 +1176,26 @@ class ARTalkPipeline:
                     for start in range(0, smoothed.shape[0], self._render_batch_size):
                         batch = smoothed[start : start + self._render_batch_size]
                         rgb_batch, _ = self._renderer.render_batch_profile(batch)
-                        (
-                            (rgb_batch * 255.0)
-                            .clamp_(0, 255)
-                            .to(torch.uint8)
-                            .permute(0, 2, 3, 1)
-                            .contiguous()
-                            .numpy()
-                        )
+                        self._rgb_batch_to_arrays(rgb_batch)
         self._streamer.reset()
         self._smoother.reset()
+
+    def _rgb_batch_to_arrays(self, rgb_batch):
+        """Batch tensor from the renderer -> (T, H, W, 3) uint8 ndarray.
+
+        With renderer_output_uint8 the renderer already converted on the GPU
+        and this is a plain view; otherwise convert the float batch here.
+        """
+        if rgb_batch.dtype == torch.uint8:
+            return rgb_batch.numpy()
+        return (
+            (rgb_batch * 255.0)
+            .clamp_(0, 255)
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+            .numpy()
+        )
 
     def _gpu_utilization_percent(self) -> int | None:
         if not self._gpu_sampling_ok:
@@ -1715,14 +1727,7 @@ class ARTalkPipeline:
                 render_metrics.inc("render_batch_frames", motion_batch.shape[0])
                 convert_t0 = time.perf_counter()
                 with torch.profiler.record_function("artalk.rgb_batch_to_numpy"):
-                    arr_batch = (
-                        (rgb_batch * 255.0)
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                        .permute(0, 2, 3, 1)
-                        .contiguous()
-                        .numpy()
-                    )
+                    arr_batch = self._rgb_batch_to_arrays(rgb_batch)
                 render_metrics.observe_ms(
                     "rgb_batch_to_numpy",
                     time.perf_counter() - convert_t0,
