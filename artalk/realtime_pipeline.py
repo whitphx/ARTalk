@@ -1177,6 +1177,19 @@ class ARTalkPipeline:
                         batch = smoothed[start : start + self._render_batch_size]
                         rgb_batch, _ = self._renderer.render_batch_profile(batch)
                         self._rgb_batch_to_arrays(rgb_batch)
+                    # Steady-state chunks emit frames_per_chunk frames, whose
+                    # tail renders as a smaller remainder batch. That batch
+                    # shape must be warmed too (cuDNN autotune, and
+                    # torch.compile recompiles per shape — a cold remainder
+                    # would stall the first real chunk mid-session).
+                    remainder = (
+                        self._streamer.frames_per_chunk % self._render_batch_size
+                    )
+                    if remainder and smoothed.shape[0] >= remainder:
+                        rgb_batch, _ = self._renderer.render_batch_profile(
+                            smoothed[:remainder]
+                        )
+                        self._rgb_batch_to_arrays(rgb_batch)
         self._streamer.reset()
         self._smoother.reset()
 
