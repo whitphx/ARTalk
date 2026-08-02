@@ -167,6 +167,7 @@ class ARTalkPipeline:
         output_segment_seconds=DEFAULT_OUTPUT_SEGMENT_SECONDS,
         renderer_stage_sync=True,
         renderer_output_uint8=False,
+        warm_key_extra="",
         profile_trace_dir=None,
         profile_skip_chunks=1,
         profile_max_chunks=2,
@@ -308,11 +309,16 @@ class ARTalkPipeline:
             dtype=np.uint8,
         )
         self._placeholder = self._initial_placeholder
+        # warm_key_extra lets callers distinguish renderer variants the
+        # pipeline cannot see (precision, compiled/captured modules): each
+        # variant pays its own first-use costs, which must happen in warm-up
+        # rather than on the first live chunk.
         warm_key = (
             str(device),
             self._renderer.mode,
             self._render_res,
             self._render_batch_size,
+            str(warm_key_extra),
         )
         if warm_key not in _WARMED_CONFIGS:
             with self.metrics_context():
