@@ -86,6 +86,21 @@ class QueuedAudioSamples:
 
 
 @dataclass
+class ChunkFlushRequest:
+    """Complete the streamer's partial chunk with exact silence padding.
+
+    Queued FIFO like audio, so by the time the worker processes it every
+    previously pushed sample is already in the streamer buffer and the
+    padding is exact. Callers that know a turn is finished (e.g. the
+    OpenAI bridge on response.output_audio.done) use this instead of
+    waiting for the silence pump's realtime-paced trickle, which arrives
+    seconds too late for sub-chunk tails.
+    """
+
+    requested_at: float
+
+
+@dataclass
 class PendingAudioChunk:
     samples: np.ndarray
     accepted_at: float
@@ -368,6 +383,13 @@ class ARTalkPipeline:
                 np.zeros(n_samples, dtype=np.int16),
                 is_filler=True,
             )
+
+    @with_pipeline_metrics
+    def request_chunk_flush(self) -> None:
+        """Ask the worker to pad the in-progress partial chunk to the model
+        chunk boundary with silence, so its trailing audio renders now."""
+        current_pipeline_metrics().inc("chunk_flush_requests")
+        self._audio_in_queue.put(ChunkFlushRequest(requested_at=time.perf_counter()))
 
     def output_buffer_snapshot(self) -> dict[str, int]:
         with self._audio_out_lock:
@@ -1215,7 +1237,18 @@ class ARTalkPipeline:
                     metrics.set("worker_busy", 0)
 
     def _process_worker_item(self, item):
-        if isinstance(item, QueuedAudioSamples):
+        if isinstance(item, ChunkFlushRequest):
+            buffered = int(self._streamer._audio_buffer.shape[0])
+            if buffered == 0:
+                return
+            pad = self._streamer.patch_audio_length - buffered
+            current_pipeline_metrics().inc("chunk_flush_padded_samples", pad)
+            self._process_sample_chunk(
+                np.zeros(pad, dtype=np.int16),
+                time.perf_counter(),
+                is_filler=True,
+            )
+        elif isinstance(item, QueuedAudioSamples):
             self._process_sample_chunk(
                 item.samples,
                 item.accepted_at,
