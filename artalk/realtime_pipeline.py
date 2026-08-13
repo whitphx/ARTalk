@@ -152,7 +152,8 @@ class ARTalkPipeline:
     def __init__(
         self,
         *,
-        model,
+        model=None,
+        streamer=None,
         flame_model,
         mesh_renderer,
         device,
@@ -173,11 +174,18 @@ class ARTalkPipeline:
         profile_max_chunks=2,
     ):
         self._device = device
-        self._streamer = ARTalkStreamer(model, style_motion=style_motion)
+        # A caller-supplied streamer lets other motion models drive the
+        # pipeline; it only has to match ARTalkStreamer's feed/finish/reset
+        # surface and emit ARTalk-layout motion frames.
+        if streamer is None:
+            if model is None:
+                raise ValueError("either model or streamer is required")
+            streamer = ARTalkStreamer(model, style_motion=style_motion)
+        self._streamer = streamer
         self._smoother = CausalSavgolSmoother()
         self._renderer = StreamingRenderer(
             mode=renderer_mode,
-            basic_vae=model.basic_vae,
+            basic_vae=model.basic_vae if model is not None else None,
             flame_model=flame_model,
             mesh_renderer=mesh_renderer,
             gagavatar=gagavatar,
