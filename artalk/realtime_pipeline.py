@@ -347,6 +347,13 @@ class ARTalkPipeline:
     def metrics_snapshot(self) -> dict:
         return self._metrics.snapshot()
 
+    @property
+    def last_served_frame(self) -> np.ndarray:
+        """The most recent frame handed to the outbound track, as (H, W, 3)
+        uint8. Capturing it alongside diagnostics answers whether the pixels
+        the server sent match the motion it computed."""
+        return self._placeholder
+
     @with_pipeline_metrics
     def push_audio_frame(self, frame: av.AudioFrame):
         """Fast: enqueue the raw frame, return. The worker handles
