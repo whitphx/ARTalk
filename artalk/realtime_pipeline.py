@@ -23,6 +23,7 @@ Single-session, single-GPU MVP — see ``docs/realtime.md`` Phase 4.
 
 import fractions
 import logging
+import math
 import os
 import queue
 import threading
@@ -1287,13 +1288,30 @@ class ARTalkPipeline:
             buffered = int(self._streamer._audio_buffer.shape[0])
             if buffered == 0:
                 return
-            pad = self._streamer.patch_audio_length - buffered
-            current_pipeline_metrics().inc("chunk_flush_padded_samples", pad)
+            chunk_samples = self._streamer.patch_audio_length
+            pad = chunk_samples - buffered
+            metrics = current_pipeline_metrics()
+            metrics.inc("chunk_flush_padded_samples", pad)
+            # The model needs a whole chunk, but only the frames covering
+            # real audio are worth publishing: the rest decode to an idle
+            # face, and rendering them costs as much as a full chunk of
+            # speech while leaving the avatar idling after every response.
+            turn_end_frames = math.ceil(buffered / AUDIO_SAMPLES_PER_VIDEO_FRAME)
+            metrics.inc(
+                "chunk_flush_skipped_frames",
+                self._streamer.frames_per_chunk - turn_end_frames,
+            )
             self._process_sample_chunk(
                 np.zeros(pad, dtype=np.int16),
                 time.perf_counter(),
                 is_filler=True,
+                turn_end_frames=turn_end_frames,
             )
+            # Drop the pad that no published frame pairs with; left staged it
+            # would shift the next chunk's audio against its video.
+            unpaired = chunk_samples - turn_end_frames * AUDIO_SAMPLES_PER_VIDEO_FRAME
+            if unpaired > 0:
+                self._pop_pending_audio_for_output(unpaired)
         elif isinstance(item, QueuedAudioSamples):
             self._process_sample_chunk(
                 item.samples,
@@ -1501,6 +1519,7 @@ class ARTalkPipeline:
         samples_int16: np.ndarray,
         accepted_at: float,
         is_filler: bool = False,
+        turn_end_frames: int | None = None,
     ) -> None:
         if not is_filler:
             if (
@@ -1516,9 +1535,16 @@ class ARTalkPipeline:
                 accepted_at=accepted_at,
             )
         )
-        self._process_audio_chunk(samples_int16)
+        self._process_audio_chunk(samples_int16, turn_end_frames=turn_end_frames)
 
-    def _process_audio_chunk(self, samples_int16: np.ndarray):
+    def _process_audio_chunk(
+        self,
+        samples_int16: np.ndarray,
+        turn_end_frames: int | None = None,
+    ):
+        """``turn_end_frames`` marks a chunk that completes a turn: publish
+        only that many frames and drain the smoother, so the chunk's trailing
+        padding never reaches the renderer."""
         metrics = current_pipeline_metrics()
         metrics.set_once("first_audio_process_s", time.perf_counter())
         samples_t = torch.from_numpy(
@@ -1529,6 +1555,8 @@ class ARTalkPipeline:
         with torch.profiler.record_function("artalk.streamer_feed"):
             motion = self._streamer.feed(samples_t)
         streamer_elapsed_s = time.perf_counter() - streamer_t0
+        if turn_end_frames is not None:
+            motion = motion[:turn_end_frames]
         metrics.observe_ms("artalk_streamer_feed", streamer_elapsed_s)
         buf_after = self._streamer._audio_buffer.shape[0]
         metrics.inc("streamer_feed_calls")
@@ -1580,6 +1608,8 @@ class ARTalkPipeline:
         smoother_t0 = time.perf_counter()
         with torch.profiler.record_function("artalk.smoother_feed"):
             smoothed = self._smoother.feed(motion)
+            if turn_end_frames is not None:
+                smoothed = torch.cat([smoothed, self._smoother.finish()], dim=0)
         smoother_elapsed_s = time.perf_counter() - smoother_t0
         metrics.observe_ms("smoother_feed", smoother_elapsed_s)
         metrics.observe_ms("post_model_smoother_feed", smoother_elapsed_s)
