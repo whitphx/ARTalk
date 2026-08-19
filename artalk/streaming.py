@@ -4,10 +4,9 @@
 """Streaming pieces for ARTalk inference.
 
 This module hosts two streaming-friendly counterparts to the one-shot
-inference pipeline; see ``docs/realtime.md`` for the broader phase plan
-and design rationale.
+inference pipeline; see ``docs/realtime.md`` for the design rationale.
 
-* :class:`ARTalkStreamer` (Phase 1) — streaming wrapper around
+* :class:`ARTalkStreamer` — streaming wrapper around
   ``BitwiseARModel.inference``. The released model processes audio in
   fixed 4-second / 100-frame chunks, and chunk-to-chunk state (previous
   code bits and the rolling attention-feature buffer) is the only thing
@@ -15,7 +14,7 @@ and design rationale.
   computation as a stateful ``feed`` / ``finish`` API. Output is
   bit-exact with one-shot ``BitwiseARModel.inference``.
 
-* :class:`CausalSavgolSmoother` (Phase 2) — streaming counterpart to
+* :class:`CausalSavgolSmoother` — streaming counterpart to
   ``ARTAvatarInferEngine.smooth_motion_savgol``. Adds a 4-frame
   (160 ms at 25 fps) emission delay in exchange for output that is
   bit-exact with the one-shot smoother.
@@ -23,9 +22,8 @@ and design rationale.
 ``scripts/check_streaming_parity.py`` asserts both parity properties.
 
 Other engine post-processing (eye-channel zeroing, ``fix_pose``,
-``clip_length`` truncation) is not yet streaming-aware and lives at
-the engine layer; it will be folded into a streaming engine wrapper
-in Phase 3.
+``clip_length`` truncation) is not streaming-aware and stays at the
+engine layer.
 """
 
 import math
@@ -237,9 +235,9 @@ class CausalSavgolSmoother:
     frames (160 ms at 25 fps), on top of the AR model's 4-second chunk
     lag.
 
-    See ``docs/realtime.md`` (Phase 2) for the alternative approaches
-    that were considered (causal IIR/EMA, no smoothing) and why this
-    one was chosen.
+    See ``docs/realtime.md`` for the alternative approaches that were
+    considered (causal IIR/EMA, no smoothing) and why this one was
+    chosen.
     """
 
     POSE_SLICE = slice(100, 103)
