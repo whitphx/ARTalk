@@ -313,10 +313,12 @@ class ARTalkPipeline:
             metrics.set("render_batch_size", self._render_batch_size)
             metrics.set("renderer_stage_sync", 1 if self._renderer_stage_sync else 0)
             metrics.set("profiler_enabled", 1 if self._profile_run_dir else 0)
-        self._initial_placeholder = np.zeros(
-            (self._render_res, self._render_res, 3),
-            dtype=np.uint8,
-        )
+        # The outbound track needs a frame long before any audio has been
+        # rendered. Showing the avatar at rest rather than black means it is
+        # on screen as soon as the pipeline is ready, instead of appearing
+        # only once the first response arrives.
+        with self.metrics_context():
+            self._initial_placeholder = self._render_resting_frame()
         self._placeholder = self._initial_placeholder
         # warm_key_extra lets callers distinguish renderer variants the
         # pipeline cannot see (precision, compiled/captured modules): each
@@ -1214,6 +1216,14 @@ class ARTalkPipeline:
                         self._rgb_batch_to_arrays(rgb_batch)
         self._streamer.reset()
         self._smoother.reset()
+
+    @torch.no_grad()
+    def _render_resting_frame(self) -> np.ndarray:
+        motion = torch.zeros(
+            1, self._streamer.motion_dim, device=self._device, dtype=torch.float32
+        )
+        rgb_batch, _ = self._renderer.render_batch_profile(motion)
+        return self._rgb_batch_to_arrays(rgb_batch)[0]
 
     def _rgb_batch_to_arrays(self, rgb_batch):
         """Batch tensor from the renderer -> (T, H, W, 3) uint8 ndarray.
