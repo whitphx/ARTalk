@@ -1,0 +1,70 @@
+# Stage 2 of the 1 s chunk experiment (docs/chunk-size-retraining.md).
+# PREV_LENGTH 75 gives the generator three previous chunks of context,
+# restoring the temporal window the shorter chunk loses; the runtime
+# equivalent is prev_ratio 3. VAE_PATH points at the stage-1 checkpoint.
+PIPELINE: 'ar_trainer.ARTrainer'
+WANDB_ENTITY: null
+WANDB_PROJECT: 'ARTalk-1s'
+DUMP_DIR: './outputs'
+
+
+DATASET:
+  NAME: 'ARTalkData'
+  LOADER: 'artalk_data.ARTalkData'
+  CLIP_LENGTH: 25
+  PREV_LENGTH: 75
+  STYLE_LENGTH: 100
+  MOTION_FPS: 25
+  AUDIO_SAMPLE_RATE: 16000
+  DATA_PATH: '/path/to/artalk-1s-data/data_lmdb'
+  META_PATH: '/path/to/artalk-1s-data/metadata.json'
+
+
+MODEL:
+  NAME: 'ARTalkGen'
+  LOADER: 'artalk_gen.ARTalkGen'
+  AUDIO_ENCODER: 'wav2vec'
+  T_DEPTH: 8
+  T_NUM_HEAD: 8
+  T_EMBED_DIM: 512
+
+  FLIP_QUANT: 0.3
+  PREV_FREE: 0.1
+  AUDIO_FREE: 0.1
+  STYLE_FREE: 0.1
+
+  PRETRAIN_PATH: null
+
+  VAE_CONFIG:
+    LOADER: 'artalk_codec.ARTalkCodec'
+    MOTION_DIM: 106
+    V_CODE_DIM: 32
+    V_PATCH_NUMS: [1, 5, 25]
+    T_DEPTH: 8
+    T_NUM_HEADS: 8
+    T_HIDDEN_DIM: 512
+    STATS_PATH: '/path/to/artalk-1s-data/metadata_stats.json'
+    VAE_PATH: '/path/to/outputs/ARTalkCodec_ARTalk/<run>/checkpoints/iter_200000.pt'
+
+
+TRAINER:
+  # TRAIN LOOP
+  BATCH_SIZE: 128
+  TRAIN_ITER: 200000
+  CHECK_INTERVAL: 20000
+
+  # OPTIMIZER
+  NAME: 'Adam'
+  WARMUP_ITER: 1000
+  LR_DECAY_RATE: 0.1
+  LR_DECAY_ITER: 200000
+  LEARNING_RATE: 1.0e-4
+
+  # EMA
+  USING_EMA: True
+  EMA_DECAY: 0.9999
+  EMA_UPDATE_FREQ: 1
+
+
+LOSS_KWARGS:
+  CE_WEIGHT: 1.0
