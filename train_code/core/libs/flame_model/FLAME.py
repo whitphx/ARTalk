@@ -170,9 +170,14 @@ class FLAMEModel(nn.Module):
     def get_flame_verts(self, motion_code, shape_code=None, with_headpose=True):
         """Helper method for training pipeline: motion_code [B, L, 108] -> vertices [B, L, V, 3]"""
         assert motion_code.dim() == 3
-        assert motion_code.shape[-1] == 108
+        assert motion_code.shape[-1] in (106, 108)
         batch_size, motion_length, _ = motion_code.shape
-        exp_code, gpose_code, jaw_code, eyepose_code = motion_code.split([100, 3, 1, 4], dim=-1)
+        if motion_code.shape[-1] == 108:
+            exp_code, gpose_code, jaw_code, eyepose_code = motion_code.split([100, 3, 1, 4], dim=-1)
+        else:
+            # motion106: exp100 + gpose3 + jaw3, no eye code.
+            exp_code, gpose_code, jaw_code = motion_code.split([100, 3, 3], dim=-1)
+            eyepose_code = motion_code.new_zeros(batch_size, motion_length, 6)
         if not with_headpose:
             gpose_code = torch.zeros_like(gpose_code)
         if shape_code is not None:
