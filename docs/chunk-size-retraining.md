@@ -90,6 +90,14 @@ are re-exported. Clips at or under 102 frames are dropped to match the
 loader's own minimum (0.1% of rows), and pairs whose audio and motion
 lengths disagree by more than five frames are rejected.
 
+One property of this data to know before comparing against the released
+model: the global head rotation (dims 100-102) is exactly zero in every
+clip — the source processing folds head motion into the per-frame
+tracking transform. The retrained model will therefore hold the head
+still. The photoreal render path zeroes head pose anyway, so the app is
+unaffected; the mesh preview loses the released model's head sway, and
+head-motion terms drop out of both the losses and the evaluation.
+
 Smoke-check the pipeline with `--limit 200` before the full build. The
 source data is on the shared `/data` mount; the full build is I/O-bound
 and safe to run on any host that mounts it.
