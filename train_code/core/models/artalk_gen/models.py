@@ -22,7 +22,14 @@ class ARTalkGen(nn.Module):
         if init_submodule:
             vae_ckpt = torch.load(model_cfg.VAE_CONFIG.VAE_PATH, map_location="cpu", weights_only=True)
             print("Loading vae from {}...".format(model_cfg.VAE_CONFIG.VAE_PATH))
-            base_codec.load_state_dict(vae_ckpt["model"], strict=True)
+            # The trainer's EMA snapshots omit the FLAME constants, which the
+            # codec loads from the asset file; nothing else may be absent.
+            missing, unexpected = base_codec.load_state_dict(vae_ckpt["model"], strict=False)
+            stray = [k for k in missing if not k.startswith("face_decoder.")]
+            if stray or unexpected:
+                raise RuntimeError(
+                    f"VAE checkpoint mismatch: missing={stray}, unexpected={unexpected}"
+                )
         base_codec.eval()
         for param in base_codec.parameters():
             param.requires_grad = False
