@@ -160,7 +160,9 @@ class ARTalkGen(nn.Module):
         sos_token = self.sos_embed.expand(batch_size * 2, 1, -1)
         audio_uncond = audio_feats[0].new_zeros(audio_feats[0].shape)
         style_uncond = style_motion_code.new_zeros(style_motion_code.shape)
-        prev_uncond = audio.new_zeros(batch_size, patch_len, self.motion_dim)
+        # The unconditional branch mirrors PREV_FREE training: the whole
+        # given context window zeroed, whatever its length.
+        prev_uncond = torch.zeros_like(prev_motion_code)
         prev_motion_code = torch.cat([prev_motion_code, prev_uncond], dim=0)
         audio_feats = [torch.cat([ac, audio_uncond], dim=0) for ac in audio_feats]
         style_motion_code = torch.cat([style_motion_code, style_uncond], dim=0)
