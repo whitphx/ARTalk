@@ -51,13 +51,15 @@ frame-level architecture, which is what the scaffold builds.
    t+k (k = 2-5 frames, 80-200 ms) is a standard streaming trade and should
    be a config axis, not a constant. Cold-start handling already tolerates
    the added delay.
-3. **106-D data contract.** The scaffold documents a 108-D contract; the
-   dataset built for the 1 s retrain (47 GB LMDB, identity-grouped split,
-   106-D, `~/data/artalk-1s-data`) is the data that exists. The stream
-   wrapper hard-rejects FLAME losses unless 108-D, and this checkout's FLAME
-   still asserts 108; the packaging worktree already carries the 106-D fixes
-   (`945a294`) and the same three-line change applies here. `MotionLayout`
-   itself is dimension-agnostic.
+3. **Data layout: build 108-D data rather than porting the scaffold to
+   106.** The scaffold's 108-D contract matches the author's newer,
+   recommended layout (his answer: train_code post-dates the released
+   model by a year and should be the reference). The source pkls carry
+   real eye motion that 106 drops, so the right move is a second LMDB
+   built with the builder's `--layout 108` — same split hashing, so the
+   held-out identities stay identical across layouts — rather than
+   stripping the scaffold's eye dims. The 106 dataset remains for the
+   chunk models.
 4. **Deterministic regression head.** The known failure mode is muted,
    over-smoothed motion. The velocity/jerk metrics will detect it; the spec
    below stages the escalation (velocity-weighted losses -> lookahead ->

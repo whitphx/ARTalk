@@ -9,9 +9,13 @@ Input: JSONL manifests whose rows point at a 16 kHz mono wav and a
   metadata_stats.json   {"motion_mean": [106], "motion_std": [106]} from train only
   split_report.json     what went where and why, for the paper trail
 
-motion106 is ``concat(expcode[0:100], posecode[0:6])`` per frame, matching
-the delivered manifests' README and the released checkpoints (the training
-configs' 108-dim layout belongs to a different data revision).
+Two motion layouts are supported. ``--layout 106``
+(``concat(expcode[0:100], posecode[0:6])``) matches the released
+checkpoints and the manifests' README. ``--layout 108``
+(``exp100 + gpose3 + jaw1 + eye4``) is the training code's newer layout,
+which the author recommends; it keeps only the primary jaw component but
+adds per-eye pitch/yaw from ``eyecode``, which carries real blink and
+gaze motion in this data.
 
 The split is grouped by identity so no speaker straddles train and
 held-out: clips sharing a source video id form one group, and groups are
@@ -37,7 +41,6 @@ from core.libs.utils_lmdb import LMDBEngine  # noqa: E402
 import torch
 import torchaudio
 
-MOTION_DIM = 106
 SAMPLE_RATE = 16_000
 FPS = 25
 # The dataset loader keeps only clips longer than max(100, CLIP_LENGTH) + 1
@@ -71,16 +74,23 @@ def assign_split(identity: str, val_pct: float, test_pct: float) -> str:
     return "train"
 
 
-def load_motion106(pkl_path: str) -> np.ndarray:
+def load_motion(pkl_path: str, motion_dim: int) -> np.ndarray:
     with open(pkl_path, "rb") as fh:
         frames = pickle.load(fh)
     # Frame keys end in _<index>; numeric order, not lexicographic.
     keys = sorted(frames.keys(), key=lambda k: int(k.rsplit("_", 1)[1]))
-    out = np.empty((len(keys), MOTION_DIM), dtype=np.float32)
+    out = np.empty((len(keys), motion_dim), dtype=np.float32)
     for i, key in enumerate(keys):
         f = frames[key]
         out[i, :100] = f["expcode"]
-        out[i, 100:] = f["posecode"]
+        if motion_dim == 106:
+            out[i, 100:] = f["posecode"]
+        else:
+            out[i, 100:103] = f["posecode"][:3]
+            out[i, 103] = f["posecode"][3]
+            # Per-eye pitch/yaw; the FLAME helper re-expands 4 -> 6 by
+            # zeroing each eye's third rotation component.
+            out[i, 104:108] = f["eyecode"][[0, 1, 3, 4]]
     return out
 
 
@@ -100,6 +110,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--val-pct", default=0.02, type=float)
     ap.add_argument("--test-pct", default=0.02, type=float)
+    ap.add_argument("--layout", type=int, choices=(106, 108), default=106)
     ap.add_argument("--limit", type=int, default=None, help="First N rows only (smoke runs).")
     args = ap.parse_args()
 
@@ -116,15 +127,15 @@ def main() -> None:
     metadata = defaultdict(list)
     split_report = defaultdict(lambda: defaultdict(int))
     stats_count = 0
-    stats_sum = np.zeros(MOTION_DIM, dtype=np.float64)
-    stats_sqsum = np.zeros(MOTION_DIM, dtype=np.float64)
+    stats_sum = np.zeros(args.layout, dtype=np.float64)
+    stats_sqsum = np.zeros(args.layout, dtype=np.float64)
     skipped = defaultdict(int)
 
     for i, r in enumerate(items):
         identity = identity_key(r["dataset"], r["sample_id"])
         split = assign_split(identity, args.val_pct, args.test_pct)
         try:
-            motion = load_motion106(r["gt_smoothed_pkl_path"])
+            motion = load_motion(r["gt_smoothed_pkl_path"], args.layout)
             audio = load_audio(r["audio_path"])
         except (OSError, ValueError, KeyError) as exc:
             skipped[f"load error ({type(exc).__name__})"] += 1

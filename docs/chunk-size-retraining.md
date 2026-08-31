@@ -52,12 +52,19 @@ Audio conditioning needs no architecture change: the encoder output is
 
 ## Formerly open items, now resolved
 
-1. **Motion dimension — resolved: 106.** The released checkpoint is
-   106-dim end to end (`basic_vae.decoder.out_mapping` is `(106, 512)`,
-   `motion_mean`/`motion_std` are `(106,)`), matching the manifests. The
-   108-dim training configs belong to a different data revision whose raw
-   `motioncode` is wider and sliced in the loader; the loader now skips
-   that slice when the stored code is already model-sized.
+1. **Motion dimension — resolved, with a layout choice.** The released
+   checkpoint is 106-dim end to end (`basic_vae.decoder.out_mapping` is
+   `(106, 512)`), matching the manifests' README. The training code's
+   108-dim layout (`exp100 + gpose3 + jaw1 + eye4`) is the author's
+   *newer, recommended* setting, released about a year after the original
+   codebase. The source data supports both: its `eyecode` carries real
+   blink/gaze motion (per-clip |max| 0.15-0.24) that the 106 layout
+   drops, while 108 drops the two residual jaw components (|max| up to
+   0.18; the primary jaw-open survives). This experiment trained at 106
+   for comparability with the released model; the LMDB builder now takes
+   `--layout 108` for the recommended-layout variant. Seeing the eye
+   motion live additionally requires the render paths to stop zeroing
+   eye pose.
 2. **Scale ladder — resolved: `[1, 5, 25, 50, 100]`.** Read off the
    released checkpoint's `lvl_idx` buffer (level counts 1/5/25/50/100,
    sum 181 = `pos_embed` length). The 1 s ladder `[1, 5, 25]` is that
