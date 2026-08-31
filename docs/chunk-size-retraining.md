@@ -147,6 +147,44 @@ warm start from the released generator proves useful (embedding shapes
 that depend on patch count will not transfer; expect scratch to be the
 honest baseline).
 
+## Candidate extensions (not in the baseline run)
+
+Two ideas from a survey of realtime VLA work, kept out of the first run
+so the chunk-size result stays interpretable on its own.
+
+### Train on the chunk compositions that actually get deployed
+
+StreamPI randomizes frame intervals during training to close the gap
+between clean synchronous training and ragged asynchronous deployment.
+Our frame interval is fixed at 25 fps, so that technique does not carry
+over directly, but the mismatch it targets does exist here in another
+form:
+
+- Every turn ends on a partial chunk that the runtime zero-pads to full
+  length, so a large share of deployed chunks are part speech and part
+  silence. Random crops of continuous speech never look like that.
+- Every turn begins with a previous-context chunk of pure silence,
+  because the idle padding runs between turns.
+
+The second case looks benign: a speech chunk decoded after a silence
+chunk measured the same movement energy as one decoded fresh (mean
+frame difference 0.374 against 0.350). The first is untested. Drawing
+some training clips with a zero-padded tail would cover it without
+collecting anything new.
+
+### Interruption sequences, but only alongside a runtime change
+
+ReSteer reports that following an instruction and switching instruction
+mid-execution are separate capabilities, and that the second needs data
+built for it. The avatar equivalent is barge-in, where speech is cut off
+mid-utterance.
+
+Worth settling before generating any such data: the runtime discards the
+remaining motion on barge-in rather than playing a transition, so a
+model trained to close its mouth gracefully would have nowhere to show
+it. This is only worth collecting together with a runtime change that
+renders a short closing continuation instead of hard-cutting.
+
 ## Evaluation
 
 Offline (against the frozen test split):
