@@ -46,7 +46,9 @@ def main() -> None:
         if args.frame_package_dir is None:
             raise SystemExit("--frame-package-dir is required for --model-kind frame")
         model = load_frame_model(args.frame_package_dir, args.checkpoint, args.device)
-        new_streamer = FrameModelStreamer(model)
+        # Native layout: a 108-trained model is scored against 108 ground
+        # truth with its eye channel intact.
+        new_streamer = FrameModelStreamer(model, native_layout=True)
     else:
         from artalk_streamlit_realtime.artalk1s import ARTalk1sStreamer, load_artalk1s_model
 
