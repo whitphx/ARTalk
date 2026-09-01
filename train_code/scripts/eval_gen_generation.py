@@ -75,7 +75,10 @@ def main() -> None:
         rec = engine[key]
         frames = (length // 100) * 100
         gt = torch.from_numpy(rec["motioncode"]).float()[:frames]
-        audio = torch.from_numpy(rec["audio"]).float()[: frames * 640]
+        # Stored audio can run a few frames shorter than the motion track;
+        # pad to the frame grid exactly as the training loader does.
+        audio = torch.from_numpy(rec["audio"]).float()
+        audio = torch.nn.functional.pad(audio, (0, max(0, frames * 640 - audio.shape[0])))[: frames * 640]
         gt_verts = verts_of(gt)
         gt_vel = (gt_verts[1:] - gt_verts[:-1]).norm(dim=-1).mean()
 
