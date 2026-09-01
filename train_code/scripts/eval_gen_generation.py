@@ -27,6 +27,9 @@ from core.models.modules.metrics import calc_val_metrics  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True, type=Path)
+    ap.add_argument("--model-kind", choices=("artalk1s", "frame"), default="artalk1s")
+    ap.add_argument("--frame-package-dir", type=Path, default=None,
+                    help="artalk_frame package location for --model-kind frame")
     ap.add_argument("--data", required=True, type=Path)
     ap.add_argument("--app-repo", required=True, type=Path,
                     help="artalk-streamlit-realtime checkout (provides the adapter)")
@@ -37,10 +40,20 @@ def main() -> None:
     args = ap.parse_args()
 
     sys.path.insert(0, str(args.app_repo))
-    from artalk_streamlit_realtime.artalk1s import ARTalk1sStreamer, load_artalk1s_model
+    if args.model_kind == "frame":
+        from artalk_streamlit_realtime.framemodel import FrameModelStreamer, load_frame_model
 
-    model = load_artalk1s_model(Path(__file__).resolve().parent.parent, args.checkpoint, args.device)
-    new_streamer = ARTalk1sStreamer(model)
+        if args.frame_package_dir is None:
+            raise SystemExit("--frame-package-dir is required for --model-kind frame")
+        model = load_frame_model(args.frame_package_dir, args.checkpoint, args.device)
+        new_streamer = FrameModelStreamer(model)
+    else:
+        from artalk_streamlit_realtime.artalk1s import ARTalk1sStreamer, load_artalk1s_model
+
+        model = load_artalk1s_model(
+            Path(__file__).resolve().parent.parent, args.checkpoint, args.device
+        )
+        new_streamer = ARTalk1sStreamer(model)
     # init_submodule=False codecs carry no FLAME; build one for scoring.
     from core.libs.flame_model import FLAMEModel
 
