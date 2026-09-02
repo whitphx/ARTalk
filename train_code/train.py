@@ -3,7 +3,12 @@
 
 import argparse
 import os
+import sys
 import warnings
+from pathlib import Path
+
+# Models under core/ may import the repo-root artalk_frame package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import accelerate
 import ipdb
