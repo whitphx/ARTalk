@@ -23,6 +23,13 @@ class ARTalkCodec(nn.Module):
         self.motion_dim = model_cfg.MOTION_DIM
         self.patch_nums = model_cfg.V_PATCH_NUMS
         self.stats_path = model_cfg.STATS_PATH
+        # Per-frame codec: every frame is encoded, quantized and decoded on
+        # its own (patch_nums must be [1]), so the codec is causal by
+        # construction while training still sees whole windows for the
+        # velocity and smoothness losses.
+        self.frame_independent = bool(getattr(model_cfg, "FRAME_INDEPENDENT", False))
+        if self.frame_independent and list(self.patch_nums) != [1]:
+            raise ValueError("FRAME_INDEPENDENT requires V_PATCH_NUMS [1]")
 
         self.encoder = TransformerEncoder(
             inp_dim=self.motion_dim,
@@ -61,11 +68,15 @@ class ARTalkCodec(nn.Module):
             gt_motion_code = rearrange(gt_motion_code, "b mb l c -> (b mb) l c")
         # encode
         enc_in = self.norm_with_stats(gt_motion_code)
+        if self.frame_independent:
+            enc_in = rearrange(enc_in, "b l c -> (b l) 1 c")
         enc_out = self.encoder(enc_in)
         # quantize
         vq_out, _, vq_loss = self.quantize(enc_out)
         # decode
         dec_out = self.decoder(vq_out)
+        if self.frame_independent:
+            dec_out = rearrange(dec_out, "(b l) 1 c -> b l c", b=gt_motion_code.shape[0])
         pred_motion_code = self.unnorm_with_stats(dec_out)
         return {
             "gt_motion_code": gt_motion_code,
@@ -78,6 +89,9 @@ class ARTalkCodec(nn.Module):
         if motion_code.dim() == 4:
             motion_code = rearrange(motion_code, "b mb l c -> (b mb) l c")
         batch_size, code_len, code_dim = motion_code.shape
+        if self.frame_independent:
+            pred_motion_code = self.vqidx_to_motion(self.quant_to_vqidx(motion_code))
+            return {"pred_motion_code": pred_motion_code, "gt_motion_code": motion_code}
         # motion batchs
         pad_len = math.ceil(code_len / self.patch_nums[-1]) * self.patch_nums[-1]
         pad_code = motion_code.new_zeros(batch_size, pad_len - code_len, code_dim)
@@ -177,14 +191,23 @@ class ARTalkCodec(nn.Module):
     @torch.no_grad()
     def quant_to_vqidx(self, motion_code):
         enc_in = self.norm_with_stats(motion_code)
+        if self.frame_independent:
+            enc_in = rearrange(enc_in, "b l c -> (b l) 1 c")
         enc_out = self.encoder(enc_in)
         _, motion_code_idx, _ = self.quantize(enc_out)
+        if self.frame_independent:
+            motion_code_idx = rearrange(motion_code_idx, "(b l) 1 d -> b l d", b=motion_code.shape[0])
         return motion_code_idx
 
     @torch.no_grad()
     def vqidx_to_motion(self, motion_code_idx):
+        batch_size = motion_code_idx.shape[0]
+        if self.frame_independent:
+            motion_code_idx = rearrange(motion_code_idx, "b l d -> (b l) 1 d")
         vq_out = self.quantize.vqidx_to_feat(motion_code_idx)
         dec_out = self.decoder(vq_out)
+        if self.frame_independent:
+            dec_out = rearrange(dec_out, "(b l) 1 c -> b l c", b=batch_size)
         motion_code = self.unnorm_with_stats(dec_out)
         return motion_code
 
