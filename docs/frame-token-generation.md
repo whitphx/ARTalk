@@ -89,6 +89,16 @@ frozen-snapshot discipline for any code shared with another session.
 `CausalFrameModel` regression head, 2.64M parameters, 200k iterations at
 batch 32 (~1.56 it/s, 32 h on one A100). Generated-motion metrics on 20
 held-out clips: LVE 8.08 / 8.16 mm, MHD 1.94 / 1.96 mm, FDD 35.9 / 39.3,
-velocity ratio 0.470 / 0.469 at 50k / 80k iterations; the full-split
-endpoint numbers follow when the eval job completes. Its checkpoint
-remains useful as the control row for Phase 2 and as a latency baseline.
+velocity ratio 0.470 / 0.469 at 50k / 80k iterations. Full-split endpoint
+(485 clips, 200k), with the release model under the identical protocol:
+
+| model | LVE mm | MHD mm | FDD | vel_ratio |
+|---|---|---|---|---|
+| frame baseline | 10.10 | 2.35 | 40.8 | 0.43 |
+| release (4 s) | 7.86 | 1.89 | 33.4 | 0.52 |
+
+Protocol note: ground truth here is 108-D and carries eye motion, so a
+106-D model's velocity ratio reads lower than on 106-D ground truth (the
+release measured 0.93 there). The Phase 2 acceptance threshold applies
+to 108-D outputs. The baseline checkpoint remains the control row and a
+latency baseline.
