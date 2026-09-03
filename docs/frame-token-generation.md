@@ -25,12 +25,15 @@ per frame.
 Two stages, mirroring the chunk recipe, both built from pieces that
 already exist in `train_code`.
 
-**Stage A — per-frame codec.** `ARTalkCodec` with `DATASET.CLIP_LENGTH 1`
-and `MODEL.V_PATCH_NUMS [1]`: one 32-bit BSQ token per frame, no
-temporal mixing, so it is causal by construction and needs no mask.
-Verified to build and round-trip `(B, 1, 108) -> bits (B, 1, 32) ->
-(B, 1, 108)`. Losses and evaluation are the codec gate unchanged
-(`eval_codec_reconstruction.py` with `window = 1`). The bit budget is
+**Stage A — per-frame codec.** `ARTalkCodec` with `V_PATCH_NUMS [1]`
+and `FRAME_INDEPENDENT: True` (`configs/artalk_codec_frame.yaml`): every
+frame is encoded, quantized to one 32-bit BSQ token and decoded on its
+own, so the codec is causal by construction and needs no mask. Training
+still reads 25-frame windows, which keeps the loader efficient and lets
+the velocity and smoothness losses penalize frame-to-frame
+reconstruction jitter; a frame reconstructs identically alone or inside
+a window (verified). Evaluation is the codec gate unchanged
+(`eval_codec_reconstruction.py`, whose window follows `patch_nums`). The bit budget is
 32 bits/frame against the 25-frame codec's ~40 bits/frame, so
 reconstruction should land near it; if it falls short, the escalation is
 two tokens per frame (`V_PATCH_NUMS [1, 1]` is not a valid ladder — use
@@ -51,9 +54,10 @@ style follows `ARTalkGen`'s `AUDIO_FREE` / `STYLE_FREE` dropout, since
 guidance is a second liveliness lever at inference.
 
 Everything else — per-frame audio encoder, GRU state, style
-conditioning, the streamer surface — is Phase 0 code. The frame adapter
-in the app needs one branch: decode tokens through the codec before
-returning motion.
+conditioning, the streamer surface — is Phase 0 code. Implemented as
+`core/models/artalk_frame_gen` (`configs/artalk_frame_token.yaml`); the
+app's frame adapter builds token checkpoints through the training
+registry and streams them through the same per-frame step API.
 
 ## Per-frame cost
 
