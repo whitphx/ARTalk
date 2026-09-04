@@ -153,8 +153,11 @@ class ARTalkGen(nn.Module):
         sos_token = self.sos_embed.expand(batch_size * 2, 1, -1)
         audio_uncond = audio_feats[0].new_zeros(audio_feats[0].shape)
         style_uncond = style_motion_code.new_zeros(style_motion_code.shape)
-        prev_uncond = audio.new_zeros(batch_size, patch_len, self.motion_dim)
+        # The unconditional branch mirrors PREV_FREE training: the whole
+        # given context window zeroed, whatever its length.
+        prev_uncond = torch.zeros_like(prev_motion_code)
         prev_motion_code = torch.cat([prev_motion_code, prev_uncond], dim=0)
+        prev_len = prev_motion_code.shape[1]
         audio_feats = [torch.cat([ac, audio_uncond], dim=0) for ac in audio_feats]
         style_motion_code = torch.cat([style_motion_code, style_uncond], dim=0)
         style_feat = self.code_token_embed(self.get_motion_feat(style_motion_code))
@@ -190,7 +193,11 @@ class ARTalkGen(nn.Module):
             patch_motion_bits = torch.cat(patch_motion_bits, dim=1)
             pred_motion_code = self.base_codec.vqidx_to_motion(patch_motion_bits)
             pred_motion_codes.append(pred_motion_code)
-            prev_motion_code = torch.cat([pred_motion_code, pred_motion_code], dim=0)
+            # Roll the context window at its trained length; the unconditional
+            # row stays zero so the previous-context CFG term keeps its
+            # reference, as at the first chunk.
+            step = torch.cat([pred_motion_code, torch.zeros_like(pred_motion_code)], dim=0)
+            prev_motion_code = torch.cat([prev_motion_code, step], dim=1)[:, -prev_len:]
         pred_motion_codes = torch.cat(pred_motion_codes, dim=1)[:, :frame_length]
         results = {"audio": audio, "pred_motion_code": pred_motion_codes}
         if "motion_code" in kwargs:
