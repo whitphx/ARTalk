@@ -76,6 +76,26 @@ The generation gate, same protocol as every model so far:
 - rendered side-by-sides (`render_gen_comparison.py`), because the
   L1-family metrics cannot tell muted from differently alive
 
+## Pilot result
+
+A pilot of this design (generator trained 200k iterations on the 64-bit
+per-frame codec's 50k checkpoint) on the full held-out split, same
+protocol as the baseline table below:
+
+| model | LVE mm | MHD mm | FDD | vel_ratio |
+|---|---|---|---|---|
+| regression baseline | 10.10 | 2.35 | 40.8 | 0.43 |
+| token pilot | 9.98 | 2.29 | 31.2 | 0.898 |
+| release (4 s) | 7.86 | 1.89 | 33.4 | 0.52 |
+
+Sampling restores motion energy at frame level (0.43 -> 0.90, at the
+acceptance line within noise; 0.914 on the 20-clip sample) and brings
+upper-face dynamics below the release's. Lip and mesh error sit at
+1.27x the release: the per-frame codec's ~2 mm lip floor (its gate:
+LVE 2.11 vs the release codec's 0.67, MHD at parity, vel_ratio 0.97 so
+no jitter) plus 40 ms of audio context and zero lookahead. Those are
+the Phase 1 levers and the sliding-window codec, in that order.
+
 ## Sequencing
 
 1. Stage A on the 108-D dataset (`~/data/artalk-108-data`), codec gate.
