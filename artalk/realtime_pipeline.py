@@ -412,6 +412,55 @@ class ARTalkPipeline:
         return self._metrics.snapshot()
 
     @property
+    def output_underrun_policy(self) -> str:
+        return self._output_underrun_policy
+
+    def set_output_underrun_policy(
+        self,
+        policy: str,
+        *,
+        rebuffer_seconds: float | None = None,
+        max_added_latency_seconds: float | None = None,
+    ) -> None:
+        """Switch the playback policy on a live pipeline.
+
+        The callbacks read these each time, so changing them takes effect on
+        the next audio frame and the two policies can be compared by ear
+        within one session instead of across two runs. Rebuilding the pipeline
+        would reload the models and drop the conversation.
+        """
+        if policy not in OUTPUT_UNDERRUN_POLICIES:
+            raise ValueError(
+                "output_underrun_policy must be one of "
+                f"{sorted(OUTPUT_UNDERRUN_POLICIES)}, got {policy!r}"
+            )
+        with self._audio_out_lock:
+            self._output_underrun_policy = policy
+            if rebuffer_seconds is not None:
+                self._output_rebuffer_seconds = max(0.0, float(rebuffer_seconds))
+                self._output_rebuffer_samples = int(
+                    SAMPLE_RATE * self._output_rebuffer_seconds
+                )
+            if max_added_latency_seconds is not None:
+                self._max_added_latency_seconds = max(
+                    0.0, float(max_added_latency_seconds)
+                )
+                self._max_added_latency_samples = int(
+                    SAMPLE_RATE * self._max_added_latency_seconds
+                )
+            # Leaving "rebuffer" while paused would otherwise strand playback:
+            # under "continuous" nothing re-arms it except a fresh prebuffer.
+            if policy == "continuous" and self._has_played:
+                self._playback_started = True
+        metrics = self._metrics
+        metrics.set(
+            "output_underrun_policy_rebuffer", 1 if policy == "rebuffer" else 0
+        )
+        metrics.set("output_rebuffer_seconds", self._output_rebuffer_seconds)
+        metrics.set("output_rebuffer_samples", self._output_rebuffer_samples)
+        metrics.set("max_added_latency_seconds", self._max_added_latency_seconds)
+
+    @property
     def last_served_frame(self) -> np.ndarray:
         """The most recent frame handed to the outbound track, as (H, W, 3)
         uint8. Capturing it alongside diagnostics answers whether the pixels
