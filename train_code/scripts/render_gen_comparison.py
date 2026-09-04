@@ -25,6 +25,8 @@ from core.libs.utils_lmdb import LMDBEngine  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True, type=Path)
+    ap.add_argument("--model-kind", choices=("artalk1s", "frame"), default="artalk1s")
+    ap.add_argument("--frame-package-dir", type=Path, default=None)
     ap.add_argument("--data", required=True, type=Path)
     ap.add_argument("--app-repo", required=True, type=Path)
     ap.add_argument("--release-assets", required=True, type=Path)
@@ -42,10 +44,16 @@ def main() -> None:
     from artalk.streaming import ARTalkStreamer
     from artalk.utils_videos import write_video
 
-    model = load_artalk1s_model(
-        Path(__file__).resolve().parent.parent, args.checkpoint, args.device
-    )
-    new_streamer = ARTalk1sStreamer(model)
+    if args.model_kind == "frame":
+        from artalk_streamlit_realtime.framemodel import FrameModelStreamer, load_frame_model
+
+        model = load_frame_model(args.frame_package_dir, args.checkpoint, args.device)
+        new_streamer = FrameModelStreamer(model, native_layout=True)
+    else:
+        model = load_artalk1s_model(
+            Path(__file__).resolve().parent.parent, args.checkpoint, args.device
+        )
+        new_streamer = ARTalk1sStreamer(model)
     rt = ARTalkRuntime(ARTalkRuntimeConfig(
         assets=ARTalkAssets.resolve(root=str(args.release_assets)),
         device=args.device, flame_scale=1.0,
