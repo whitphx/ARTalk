@@ -42,6 +42,11 @@ def reconstruct_new(codec, motion, window):
 
 
 def reconstruct_release(vae, motion, window=100):
+    if motion.shape[-1] == 108:
+        # The release codec speaks the 106-dim layout: keep exp100 + gpose3
+        # + the primary jaw component, pad the jaw to a rotation vector and
+        # drop the eye channel (which it cannot reconstruct).
+        motion = torch.cat([motion[:, :104], motion.new_zeros(motion.shape[0], 2)], dim=-1)
     wins = [motion[i : i + window] for i in range(0, motion.shape[0], window)]
     out = [None] * len(wins)
     for i in range(len(wins) - 1):
