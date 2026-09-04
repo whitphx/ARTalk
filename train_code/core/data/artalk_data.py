@@ -84,10 +84,14 @@ class ARTalkData(torch.utils.data.Dataset):
         audio_tensor = audio_tensor[:audio_len]
         # motion
         motion_tensor = torch.from_numpy(this_records["motioncode"])
-        motion_tensor = torch.cat(
-            [motion_tensor[:, :104], motion_tensor[:, 106:108], motion_tensor[:, 109:111]],
-            dim=1,
-        )
+        if motion_tensor.shape[1] > 108:
+            # Legacy databases store the full tracked code; slice out the
+            # 108-dim training layout. Databases built from the motion106
+            # manifests already store exactly what the model consumes.
+            motion_tensor = torch.cat(
+                [motion_tensor[:, :104], motion_tensor[:, 106:108], motion_tensor[:, 109:111]],
+                dim=1,
+            )
         assert audio_tensor.dim() == 1, "Audio tensor should be 1D"
         assert motion_tensor.dim() == 2, "Motion tensor should be 2D"
         # style motion
