@@ -62,6 +62,22 @@ AUDIO_OUT_SAMPLES_PER_FRAME = int(SAMPLE_RATE * AUDIO_OUT_PTIME)
 AUDIO_SAMPLES_PER_VIDEO_FRAME = SAMPLE_RATE // FPS
 DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS = 1.00
 DEFAULT_OUTPUT_SEGMENT_SECONDS = 1.00
+# What playback does when the output buffer starves mid-content.
+#
+# "continuous" emits a silent frame per starved callback and resumes the
+# instant one frame's worth of audio exists. Playback stays as close to live
+# as the producer allows, at the cost of thrashing when the producer is
+# marginal: the buffer oscillates around empty, so speech gets repeated short
+# silences and video repeats its last frame across each one.
+#
+# "rebuffer" instead stops playing until the buffer refills to
+# ``output_rebuffer_seconds``, the way a media player does. One pause replaces
+# many, and everything rendered is still shown because the media clock only
+# advances on real audio — the cost is that playback now trails live by the
+# length of the pause, bounded by ``max_added_latency_seconds``.
+OUTPUT_UNDERRUN_POLICIES = frozenset({"continuous", "rebuffer"})
+DEFAULT_OUTPUT_UNDERRUN_POLICY = "continuous"
+DEFAULT_MAX_ADDED_LATENCY_SECONDS = 3.00
 # A new "turn" starts when real (non-filler) audio arrives after this long
 # without any. Matches the silence pump's idle threshold so filler injection
 # and turn boundaries agree.
@@ -167,6 +183,9 @@ class ARTalkPipeline:
         render_batch_size=DEFAULT_RENDER_BATCH_SIZE,
         output_audio_prebuffer_seconds=DEFAULT_OUTPUT_AUDIO_PREBUFFER_SECONDS,
         output_segment_seconds=DEFAULT_OUTPUT_SEGMENT_SECONDS,
+        output_underrun_policy=DEFAULT_OUTPUT_UNDERRUN_POLICY,
+        output_rebuffer_seconds=None,
+        max_added_latency_seconds=DEFAULT_MAX_ADDED_LATENCY_SECONDS,
         renderer_stage_sync=True,
         renderer_output_uint8=False,
         warm_key_extra="",
@@ -280,6 +299,37 @@ class ARTalkPipeline:
         self._output_audio_prebuffer_samples = int(
             SAMPLE_RATE * self._output_audio_prebuffer_seconds
         )
+        if output_underrun_policy not in OUTPUT_UNDERRUN_POLICIES:
+            raise ValueError(
+                "output_underrun_policy must be one of "
+                f"{sorted(OUTPUT_UNDERRUN_POLICIES)}, got {output_underrun_policy!r}"
+            )
+        self._output_underrun_policy = output_underrun_policy
+        # Refill target after a mid-content underrun; defaults to the initial
+        # prebuffer, the depth already judged enough to start playing.
+        self._output_rebuffer_seconds = max(
+            0.0,
+            float(
+                self._output_audio_prebuffer_seconds
+                if output_rebuffer_seconds is None
+                else output_rebuffer_seconds
+            ),
+        )
+        self._output_rebuffer_samples = int(
+            SAMPLE_RATE * self._output_rebuffer_seconds
+        )
+        # Pausing to refill buys continuity with latency. A jittery producer
+        # pays that once; a producer that is durably slower than realtime would
+        # otherwise keep paying until playback trails live without bound, so
+        # past this ceiling the "rebuffer" policy degrades to "continuous".
+        self._max_added_latency_seconds = max(0.0, float(max_added_latency_seconds))
+        self._max_added_latency_samples = int(
+            SAMPLE_RATE * self._max_added_latency_seconds
+        )
+        self._added_latency_samples = 0
+        # Separates "not started yet" (prebuffer threshold, and silence that is
+        # not an underrun) from "paused mid-stream" (rebuffer threshold).
+        self._has_played = False
         self._output_segment_seconds = max(1 / FPS, float(output_segment_seconds))
         self._output_segment_min_frames = max(
             1,
@@ -306,6 +356,12 @@ class ARTalkPipeline:
             metrics.set(
                 "output_audio_prebuffer_samples",
                 self._output_audio_prebuffer_samples,
+            )
+            metrics.set("output_underrun_policy", self._output_underrun_policy)
+            metrics.set("output_rebuffer_seconds", self._output_rebuffer_seconds)
+            metrics.set("output_rebuffer_samples", self._output_rebuffer_samples)
+            metrics.set(
+                "max_added_latency_seconds", self._max_added_latency_seconds
             )
             metrics.set("output_segment_seconds", self._output_segment_seconds)
             metrics.set("output_segment_min_frames", self._output_segment_min_frames)
@@ -487,13 +543,29 @@ class ARTalkPipeline:
         self._record_callback_timestamp("audio_source", pts, time_base)
         n = AUDIO_OUT_SAMPLES_PER_FRAME
         playback_started_now = False
+        rebuffer_started_now = False
+        # Sampled before the audio lock: it reads the video queue under that
+        # queue's own lock, and the publish path takes the two locks in the
+        # opposite order.
+        content_in_flight = self._content_in_flight()
         with self._audio_out_lock:
             available = self._audio_out_buffer.size
-            if (
-                not self._playback_started
-                and available >= self._output_audio_prebuffer_samples
-            ):
+            budget_spent = (
+                self._added_latency_samples >= self._max_added_latency_samples
+            )
+            if budget_spent:
+                # Out of latency budget: resume on the first complete frame and
+                # keep doing so, which is exactly the "continuous" policy. This
+                # also bounds a pause already in progress, so the budget caps
+                # total added latency rather than only the decision to pause.
+                start_threshold = n
+            elif self._has_played:
+                start_threshold = self._output_rebuffer_samples
+            else:
+                start_threshold = self._output_audio_prebuffer_samples
+            if not self._playback_started and available >= start_threshold:
                 self._playback_started = True
+                self._has_played = True
                 playback_started_now = True
             # Do not emit partial audio padded with zeros. That made chunk
             # boundaries audible as clicks/stutters. If the buffer cannot
@@ -506,44 +578,63 @@ class ARTalkPipeline:
             else:
                 samples = np.zeros(n, dtype=np.int16)
                 underrun = n
+                if (
+                    self._playback_started
+                    and self._output_underrun_policy == "rebuffer"
+                    and content_in_flight
+                    and self._added_latency_samples
+                    < self._max_added_latency_samples
+                ):
+                    self._playback_started = False
+                    rebuffer_started_now = True
+            if (
+                self._has_played
+                and not self._playback_started
+                and available >= n
+            ):
+                # Only silence emitted while a complete frame was available is
+                # latency this policy chose to add; starving with an empty
+                # buffer would have played silence under either policy.
+                self._added_latency_samples += n
             real_samples = n - underrun
             if real_samples:
                 self._synced_audio_samples_served += real_samples
             synced_audio_samples = self._synced_audio_samples_served
             buffered = self._audio_out_buffer.size
+            playing = self._playback_started
+            has_played = self._has_played
+            added_latency_samples = self._added_latency_samples
         metrics.inc("audio_frames_served")
         if playback_started_now:
             metrics.inc("audio_playback_starts")
+        if rebuffer_started_now:
+            metrics.inc("audio_rebuffer_events")
         if underrun:
-            if not self._playback_started:
+            if not has_played:
                 metrics.inc("audio_preplayback_silence_frames")
                 metrics.inc("audio_preplayback_silence_samples", underrun)
+            elif not playing:
+                # Paused to refill. Counted apart from the underrun family so
+                # the two policies stay comparable: "continuous" spends its
+                # starvation in underrun frames, "rebuffer" in these.
+                metrics.inc("audio_rebuffer_frames")
+                metrics.inc("audio_rebuffer_samples", underrun)
             elif available > 0:
                 metrics.inc("audio_short_buffer_frames")
                 metrics.inc("audio_short_buffer_samples", underrun)
-            else:
+            elif content_in_flight:
                 # Since the silence pump stopped topping up the buffer during
                 # idle, an empty buffer usually means idle, not starvation.
                 # Count an underrun only while content is still in flight so
                 # the counter keeps meaning "playback starved mid-content".
-                last_real = self._last_real_accepted_at
-                content_in_flight = (
-                    self._audio_in_queue.qsize() > 0
-                    or self._worker_busy
-                    or self._video_queue_depth() > 0
-                    or (
-                        last_real is not None
-                        and time.perf_counter() - last_real
-                        < self._streamer.patch_audio_length / SAMPLE_RATE
-                    )
-                )
-                if content_in_flight:
-                    metrics.inc("audio_playback_underrun_frames")
-                    metrics.inc("audio_playback_underrun_samples", underrun)
-                else:
-                    metrics.inc("audio_idle_silence_frames")
-                    metrics.inc("audio_idle_silence_samples", underrun)
-        metrics.set("audio_playback_started", 1 if self._playback_started else 0)
+                metrics.inc("audio_playback_underrun_frames")
+                metrics.inc("audio_playback_underrun_samples", underrun)
+            else:
+                metrics.inc("audio_idle_silence_frames")
+                metrics.inc("audio_idle_silence_samples", underrun)
+        metrics.set("added_latency_samples", added_latency_samples)
+        metrics.set("added_latency_seconds", added_latency_samples / SAMPLE_RATE)
+        metrics.set("audio_playback_started", 1 if playing else 0)
         metrics.set("synced_audio_samples_served", synced_audio_samples)
         metrics.set(
             "synced_audio_frame_index",
@@ -567,6 +658,21 @@ class ARTalkPipeline:
         frame.pts = pts
         frame.time_base = time_base
         return frame
+
+    def _content_in_flight(self) -> bool:
+        """Whether more output audio is still expected, so an empty buffer
+        means playback starved rather than the session being idle."""
+        last_real = self._last_real_accepted_at
+        return (
+            self._audio_in_queue.qsize() > 0
+            or self._worker_busy
+            or self._video_queue_depth() > 0
+            or (
+                last_real is not None
+                and time.perf_counter() - last_real
+                < self._streamer.patch_audio_length / SAMPLE_RATE
+            )
+        )
 
     def _media_clock_frame_index(self) -> int:
         with self._audio_out_lock:
@@ -708,6 +814,8 @@ class ARTalkPipeline:
             self._audio_out_buffer = np.zeros(0, dtype=np.int16)
             self._synced_audio_samples_served = 0
             self._playback_started = False
+            self._has_played = False
+            self._added_latency_samples = 0
         self._pending_audio_for_output = []
         # Drain both transit queues. The worker may still write up to
         # one more chunk between its stop_event check and the queue
@@ -754,6 +862,9 @@ class ARTalkPipeline:
             self._audio_out_buffer = np.zeros(0, dtype=np.int16)
             self._synced_audio_samples_served += flushed_samples
             synced_audio_samples = self._synced_audio_samples_served
+            # Dropping the backlog puts playback back at live, so the latency
+            # the rebuffer policy had accumulated is gone with it.
+            self._added_latency_samples = 0
         with self._video_queue_lock:
             flushed_frames = len(self._video_queue)
             self._video_queue.clear()
