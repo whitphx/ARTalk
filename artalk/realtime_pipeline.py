@@ -357,7 +357,12 @@ class ARTalkPipeline:
                 "output_audio_prebuffer_samples",
                 self._output_audio_prebuffer_samples,
             )
-            metrics.set("output_underrun_policy", self._output_underrun_policy)
+            # Numeric: the metrics table is rendered as a numeric dataframe,
+            # and a string value breaks its Arrow conversion.
+            metrics.set(
+                "output_underrun_policy_rebuffer",
+                1 if self._output_underrun_policy == "rebuffer" else 0,
+            )
             metrics.set("output_rebuffer_seconds", self._output_rebuffer_seconds)
             metrics.set("output_rebuffer_samples", self._output_rebuffer_samples)
             metrics.set(
