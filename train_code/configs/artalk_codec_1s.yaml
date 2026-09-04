@@ -1,0 +1,63 @@
+# Stage 1 of the 1 s chunk experiment (docs/chunk-size-retraining.md):
+# the released 4 s recipe with the chunk shortened to 25 frames and the
+# scale ladder cut to the release ladder's [1, 5, 25] prefix. Data comes
+# from a motion106 database built by scripts/build_artalk_lmdb.py.
+PIPELINE: 'vae_trainer.VAETrainer'
+WANDB_ENTITY: null
+WANDB_PROJECT: 'ARTalk-1s'
+DUMP_DIR: './outputs'
+
+
+DATASET:
+  NAME: 'ARTalk'
+  LOADER: 'artalk_data.ARTalkData'
+  CLIP_LENGTH: 25
+  PREV_LENGTH: 75
+  STYLE_LENGTH: 100
+  MOTION_FPS: 25
+  AUDIO_SAMPLE_RATE: 16000
+  DATA_PATH: '/path/to/artalk-1s-data/data_lmdb'
+  META_PATH: '/path/to/artalk-1s-data/metadata.json'
+
+
+MODEL:
+  NAME: 'ARTalkCodec'
+  LOADER: 'artalk_codec.ARTalkCodec'
+  MOTION_DIM: 106
+  V_CODE_DIM: 32
+  V_PATCH_NUMS: [1, 5, 25]
+  T_DEPTH: 8
+  T_NUM_HEADS: 8
+  T_HIDDEN_DIM: 512
+  STATS_PATH: '/path/to/artalk-1s-data/metadata_stats.json'
+
+
+TRAINER:
+  # TRAIN LOOP
+  BATCH_SIZE: 64
+  TRAIN_ITER: 200000
+  CHECK_INTERVAL: 50000
+
+  # OPTIMIZER
+  NAME: 'Adam'
+  WARMUP_ITER: 1000
+  LR_DECAY_RATE: 0.1
+  LR_DECAY_ITER: 200000
+  LEARNING_RATE: 1.0e-4
+
+  # EMA
+  USING_EMA: True
+  EMA_DECAY: 0.9999
+  EMA_UPDATE_FREQ: 1
+
+
+LOSS_KWARGS:
+  VQ_WEIGHT: 1.0
+  EXP_WEIGHT: 1.0
+  POSE_WEIGHT: 8.0
+  HEAD_VEL_WEIGHT: 5.0
+  HEAD_SMOOTH_WEIGHT: 0.5
+  MESH_WEIGHT: 2.0
+  LIPS_WEIGHT: 0.1
+  MESH_VEL_WEIGHT: 10000000.0
+  MESH_SMOOTH_WEIGHT: 100000.0
