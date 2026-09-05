@@ -116,6 +116,36 @@ LVE 2.11 vs the release codec's 0.67, MHD at parity, vel_ratio 0.97 so
 no jitter) plus 40 ms of audio context and zero lookahead. Those are
 the Phase 1 levers and the sliding-window codec, in that order.
 
+## Codec selection: the reconstruction gate is the wrong gate
+
+A second generator trained on the 64-bit codec's 200k endpoint (half
+the pilot codec's reconstruction error) generates *worse* motion at
+every sampling temperature, 20 clips:
+
+| generator | tau | LVE mm | MHD mm | FDD | vel_ratio |
+|---|---|---|---|---|---|
+| pilot (codec at 50k) | 1.0 | 9.77 | 2.30 | 26.2 | 0.91 |
+| pilot | 0.85 | 10.04 | 2.34 | 32.3 | 0.51 |
+| final (codec at 200k) | 1.0 | 11.71 | 2.74 | 32.0 | 2.12 |
+| final | 0.85 | 12.86 | 3.01 | 44.6 | 1.85 |
+| final | 0.7 | 14.43 | 3.30 | 40.7 | 1.13 |
+
+The sharper decoder turns sampling error into vertex jumps (velocity
+ratio above one until the temperature is low enough to mute the model),
+and its tokens are harder to predict. Temperature moves motion energy
+monotonically but buys no accuracy on either generator. Conclusions:
+
+- The model of record is the pilot: `ARTalkFrameToken` on the 64-bit
+  codec's 50k checkpoint, tau 1.0.
+- Choose a Stage B codec by the generation gate on a short generator
+  run, not by reconstruction; a mid-training codec's residual blur
+  acts as regularization against sampling noise.
+- The principled fix, so a sharper codec can be used: train the
+  generator with bit-flip noise on the tokens it conditions on, as the
+  chunk recipe's `FLIP_QUANT` does. Not yet implemented for the frame
+  generator; a Phase 1 item alongside the audio context window and
+  lookahead.
+
 ## Sequencing
 
 1. Stage A on the 108-D dataset (`~/data/artalk-108-data`), codec gate.
