@@ -30,6 +30,8 @@ def main() -> None:
     ap.add_argument("--model-kind", choices=("artalk1s", "frame"), default="artalk1s")
     ap.add_argument("--frame-package-dir", type=Path, default=None,
                     help="artalk_frame package location for --model-kind frame")
+    ap.add_argument("--tau", type=float, default=1.0, help="sampling temperature (token frame models)")
+    ap.add_argument("--top-p", type=float, default=0.97, help="nucleus threshold (token frame models)")
     ap.add_argument("--data", required=True, type=Path)
     ap.add_argument("--app-repo", required=True, type=Path,
                     help="artalk-streamlit-realtime checkout (provides the adapter)")
@@ -48,7 +50,8 @@ def main() -> None:
         model = load_frame_model(args.frame_package_dir, args.checkpoint, args.device)
         # Native layout: a 108-trained model is scored against 108 ground
         # truth with its eye channel intact.
-        new_streamer = FrameModelStreamer(model, native_layout=True)
+        sampling = {"tau": args.tau, "top_p": args.top_p} if hasattr(model, "bits_head") else {}
+        new_streamer = FrameModelStreamer(model, native_layout=True, **sampling)
     else:
         from artalk_streamlit_realtime.artalk1s import ARTalk1sStreamer, load_artalk1s_model
 
