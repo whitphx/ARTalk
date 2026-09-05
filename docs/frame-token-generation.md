@@ -76,6 +76,26 @@ The generation gate, same protocol as every model so far:
 - rendered side-by-sides (`render_gen_comparison.py`), because the
   L1-family metrics cannot tell muted from differently alive
 
+## Stage A result
+
+Both per-frame codecs trained to 200k on the 108-D data. The 64-bit
+variant is the codec of record (100 held-out clips, release codec under
+the same protocol):
+
+| codec | exp L1 | jaw L1 | LVE mm | MHD mm | FDD | vel_ratio |
+|---|---|---|---|---|---|---|
+| 32-bit (val slice) | | | 1.93 | 0.55 | 11.0 | |
+| 64-bit | 0.093 | 0.015 | 1.14 | 0.331 | 5.86 | 1.08 |
+| release | 0.037 | 0.048 | 0.667 | 0.641 | 1.58 | 0.79 |
+
+Whole-head error at half the release's and jaw three times better;
+lips at 1.7x, the per-frame budget's remaining cost. The velocity ratio
+slightly above one flags mild high-frequency excess in reconstruction
+(0.97 at 50k), worth re-checking on generated motion. Most of the
+improvement came in the learning-rate decay phase: the 64-bit codec
+halved its errors between 100k and 200k, so codec runs should not be
+judged before their endpoint.
+
 ## Pilot result
 
 A pilot of this design (generator trained 200k iterations on the 64-bit
