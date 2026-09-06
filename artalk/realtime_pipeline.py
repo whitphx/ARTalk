@@ -392,10 +392,7 @@ class ARTalkPipeline:
             self._render_batch_size,
             str(warm_key_extra),
         )
-        if warm_key not in _WARMED_CONFIGS:
-            with self.metrics_context():
-                self._warm_up_pipeline()
-            _WARMED_CONFIGS.add(warm_key)
+        self._warm_key = warm_key
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="ARTalkPipelineWorker",
@@ -1434,6 +1431,20 @@ class ARTalkPipeline:
 
     def _worker_loop(self):
         with self.metrics_context():
+            # Warm up on this thread, before any audio is consumed:
+            # first-use costs stay off the live path, and compiled or
+            # graph-captured modules record their CUDA graphs on the
+            # thread that will replay them (torch.compile's cudagraphs
+            # fall back to a slow path when replayed cross-thread).
+            if self._warm_key not in _WARMED_CONFIGS:
+                try:
+                    self._warm_up_pipeline()
+                except Exception:
+                    # A failed warm-up only forfeits the precomputation;
+                    # a genuinely broken pipeline surfaces identically on
+                    # the first live chunk, with per-item error handling.
+                    logger.exception("pipeline warm-up failed")
+                _WARMED_CONFIGS.add(self._warm_key)
             while not self._stop_event.is_set():
                 self._sample_gpu_status()
                 try:
