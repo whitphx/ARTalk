@@ -883,6 +883,21 @@ class ARTalkPipeline:
             self._last_video_frame_index_served = -1
         metrics = current_pipeline_metrics()
         metrics.set("video_queue_depth", 0)
+        # Wait for the worker to exit before returning: callers replace the
+        # pipeline right after stop(), and the new constructor renders on the
+        # calling thread. The worker may be mid-CUDA-graph capture, which
+        # registers the process-global RNG generator, so any RNG op on
+        # another thread during that window (the photoreal renderer draws
+        # noise per frame) raises "Offset increment outside graph capture".
+        if (
+            self._worker_thread.is_alive()
+            and threading.current_thread() is not self._worker_thread
+        ):
+            self._worker_thread.join(timeout=10.0)
+            if self._worker_thread.is_alive():
+                logger.warning(
+                    "[ARTalkPipeline] worker thread still alive 10 s after stop()"
+                )
 
     @staticmethod
     def _drain_queue(q: queue.Queue):
