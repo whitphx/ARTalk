@@ -23,6 +23,9 @@ class ARTalkData(torch.utils.data.Dataset):
         self._clip_length = data_cfg.CLIP_LENGTH
         self._prev_length = data_cfg.PREV_LENGTH
         self._style_length = data_cfg.STYLE_LENGTH
+        self._static_prev_aug = float(data_cfg.get("STATIC_PREV_AUG", 0.0))
+        self._silent_audio_aug = float(data_cfg.get("SILENT_AUDIO_AUG", 0.0))
+        self._silent_audio_rms = float(data_cfg.get("SILENT_AUDIO_RMS", 0.005))
         self._motion_fps = data_cfg.MOTION_FPS
         self._audio_sample_rate = data_cfg.AUDIO_SAMPLE_RATE
         self._audio_frames_rate = self._audio_sample_rate / self._motion_fps
@@ -116,6 +119,19 @@ class ARTalkData(torch.utils.data.Dataset):
             assert curr_audio.shape[0] == self._clip_audio_length
             assert curr_motion.shape[0] == self._clip_length
             assert prev_motion.shape[0] == self._prev_length
+            if self._static_prev_aug and random.random() < self._static_prev_aug:
+                # One held pose tiled across the context window is what a
+                # deployed idle loop feeds the model after long silence;
+                # without such pairs a motionless context acts as an
+                # attractor that speech frequently fails to escape.
+                hold_frame = motion_tensor[random.randint(0, seq_len - 1)]
+                prev_motion = hold_frame[None].expand(self._prev_length, -1).clone()
+            if self._silent_audio_aug and random.random() < self._silent_audio_aug:
+                if curr_audio.float().pow(2).mean().sqrt() < self._silent_audio_rms:
+                    # Map digital-zero audio onto real pauses: the target
+                    # stays the pause's own calm face, so pure silence
+                    # decodes to a defined idle expression.
+                    curr_audio = torch.zeros_like(curr_audio)
             one_record["audio"] = curr_audio.float()
             one_record["motion_code"] = curr_motion.float()
             one_record["prev_motion_code"] = prev_motion.float()
