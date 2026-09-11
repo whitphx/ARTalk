@@ -1729,6 +1729,14 @@ class ARTalkPipeline:
             ):
                 self._turn_start_accepted_at = accepted_at
                 current_pipeline_metrics().inc("turns_started")
+                # Idle filler between turns saturates the streamer's motion
+                # context with the model's near-static silence face, an
+                # attractor that speech frequently fails to escape. Zeroed
+                # context is in-distribution (context dropout during
+                # training), so start every turn from it. This runs on the
+                # worker thread, which owns the streamer state.
+                self._streamer.reset()
+                current_pipeline_metrics().inc("streamer_context_resets")
             self._last_real_accepted_at = accepted_at
         self._pending_audio_for_output.append(
             PendingAudioChunk(
