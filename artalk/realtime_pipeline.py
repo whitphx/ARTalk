@@ -88,6 +88,23 @@ TURN_GAP_S = 1.00
 # enough; pipelines recreated on settings changes skip it.
 _WARMED_CONFIGS: set[tuple] = set()
 
+_LINALG_INIT_LOCK = threading.Lock()
+_LINALG_INITIALIZED: set[str] = set()
+
+
+def _init_torch_linalg(device) -> None:
+    """torch initializes its linalg backend lazily on the first call, and
+    that initialization is not thread-safe: two threads making the first
+    ``torch.inverse`` concurrently raise "lazy wrapper should be called at
+    most once". The mesh renderer's camera math calls it from whichever
+    thread renders first, and pipeline constructions can overlap across
+    Streamlit script runs, so make the first call here under a lock."""
+    key = str(device)
+    with _LINALG_INIT_LOCK:
+        if key not in _LINALG_INITIALIZED:
+            torch.inverse(torch.eye(3, device=device))
+            _LINALG_INITIALIZED.add(key)
+
 
 @dataclass
 class QueuedAudioFrame:
@@ -374,6 +391,7 @@ class ARTalkPipeline:
             metrics.set("render_batch_size", self._render_batch_size)
             metrics.set("renderer_stage_sync", 1 if self._renderer_stage_sync else 0)
             metrics.set("profiler_enabled", 1 if self._profile_run_dir else 0)
+        _init_torch_linalg(self._device)
         # The outbound track needs a frame long before any audio has been
         # rendered. Showing the avatar at rest rather than black means it is
         # on screen as soon as the pipeline is ready, instead of appearing
