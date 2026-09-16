@@ -90,11 +90,14 @@ The app listens on port 8960, or on `GRADIO_SERVER_PORT` when that is set.
 
 #### Hosting the Gradio demo on Hugging Face ZeroGPU
 
-`inference.py` runs as a [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) Space: when the `spaces` package is importable, generation runs under `@spaces.GPU`, and the engine is constructed once in the main process, with the models on `cuda`, as ZeroGPU requires. A Space needs an `app.py` that starts the app after the assets are in place (`artalk-assets download --root assets --include-optional`, plus `FLAME_with_eye.pt` under its own license):
+`inference.py` runs as a [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) Space: when the `spaces` package is importable, generation runs under `@spaces.GPU`, and the engine is constructed once in the main process, with the models on `cuda`, as ZeroGPU requires. A Space needs an `app.py` that starts the app after the assets are in place (`artalk-assets download --root assets --include-optional`, plus `FLAME_with_eye.pt` under its own license), on the port Spaces expect:
 
 ```python
+import os
+
 from inference import ARTAvatarInferEngine, run_gradio_app
 
+os.environ.setdefault("GRADIO_SERVER_PORT", "7860")
 run_gradio_app(ARTAvatarInferEngine(load_gaga=True))
 ```
 
