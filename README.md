@@ -90,7 +90,7 @@ The app listens on port 8960, or on `GRADIO_SERVER_PORT` when that is set.
 
 #### Hosting the Gradio demo on Hugging Face ZeroGPU
 
-`inference.py` works as a [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) Space: when the `spaces` package is importable, the request handler runs under `@spaces.GPU`, and the engine stays in the process so the models are placed on `cuda` once at startup as ZeroGPU expects. A Space needs an `app.py` that prepares the assets and starts the app:
+`inference.py` runs as a [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) Space: when the `spaces` package is importable, generation runs under `@spaces.GPU`, and the engine is constructed once in the main process, with the models on `cuda`, as ZeroGPU requires. A Space needs an `app.py` that starts the app after the assets are in place (`artalk-assets download --root assets --include-optional`, plus `FLAME_with_eye.pt` under its own license):
 
 ```python
 from inference import ARTAvatarInferEngine, run_gradio_app
@@ -98,7 +98,7 @@ from inference import ARTAvatarInferEngine, run_gradio_app
 run_gradio_app(ARTAvatarInferEngine(load_gaga=True))
 ```
 
-ZeroGPU runs PyTorch 2.8 or newer, so the `requirements.txt` of such a Space differs from `environment.yml`: `torch==2.8.0` (CUDA 12.8), a matching `pytorch3d` wheel (for example from [torch_packages_builder](https://github.com/MiroPsota/torch_packages_builder)), `soundfile` for `torchaudio` 2.8, and a build of `diff-gaussian-rasterization` for the Space's GPU architecture (`TORCH_CUDA_ARCH_LIST` including `12.0` for Blackwell). Spaces install `requirements.txt` before copying the repository, so a wheel kept in the repository has to be installed from `app.py`. Download the assets with `artalk-assets download --root assets --include-optional` and provide `FLAME_with_eye.pt` according to its license.
+ZeroGPU ships a newer PyTorch than `environment.yml` (2.8 at the time of writing), so such a Space needs its own `requirements.txt`, with `pytorch3d` and `diff-gaussian-rasterization` built against that torch and for the Space's GPU, and `soundfile` as the audio backend of that `torchaudio`.
 
 ### Command Line Usage
 
@@ -130,7 +130,7 @@ The training code has been released for reference. This code is also similar to 
 
 ## huggingface DockerFile 
 
-To use The DockerFile on huggingface, you have to change the Gradio port 
+The Dockerfile sets `GRADIO_SERVER_PORT=7860`, the port a Hugging Face Docker Space expects, and the app honours it.
 
 
 ## Acknowledgements
