@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Parity checks for the streaming inference / post-processing pieces.
+"""Parity checks for the streaming inference / post-processing / rendering pieces.
 
 Loads the released ARTalk wav2vec checkpoint and runs:
 
@@ -13,6 +13,12 @@ Loads the released ARTalk wav2vec checkpoint and runs:
      ``CausalSavgolSmoother`` (streaming) to the same motion sequence,
      and asserts the outputs match within ``--atol``.
 
+  3. **Streaming mesh rendering** — renders motion frames via
+     ``StreamingRenderer`` (per-frame and batched) and via the inline
+     mesh branch of ``ARTAvatarInferEngine.rendering``, and asserts
+     the RGB outputs match within an image-level tolerance. Skipped if
+     ``assets/FLAME_with_eye.pt`` is not present.
+
 Run on a GPU host where the model and ``./assets`` are available:
 
     python -m scripts.check_streaming_parity [-a demo/eng1.wav] [--device cuda]
@@ -22,13 +28,17 @@ Run on a GPU host where the model and ``./assets`` are available:
 
 import argparse
 import json
+import os
 
 import torch
 import torchaudio
 from scipy.signal import savgol_filter
 
 from artalk import BitwiseARModel
+from artalk.rendering import StreamingRenderer
 from artalk.streaming import ARTalkStreamer, CausalSavgolSmoother
+
+FLAME_ASSET_PATH = "./assets/FLAME_with_eye.pt"
 
 
 def smooth_motion_savgol_reference(motion_codes):
@@ -65,6 +75,19 @@ def run_smoother(smoother, motion, feed_chunk_frames):
     return torch.cat(pieces, dim=0) if pieces else None
 
 
+def render_mesh_oneshot_reference(motion, basic_vae, flame_model, mesh_renderer):
+    """One-shot reference: mesh branch of ``ARTAvatarInferEngine.rendering``."""
+    shape_code = motion.new_zeros(1, 300).expand(motion.shape[0], -1)
+    verts = basic_vae.get_flame_verts(
+        flame_model, shape_code, motion, with_global=True
+    )
+    pred_images = []
+    for v in verts:
+        rgb = mesh_renderer(v[None])[0]
+        pred_images.append(rgb.cpu()[0] / 255.0)
+    return torch.stack(pred_images, dim=0)
+
+
 def assert_match(reference, streamed, atol, label):
     print(f"[{label}] one_shot: {tuple(reference.shape)}, streamed: {tuple(streamed.shape)}")
     assert reference.shape == streamed.shape, f"[{label}] shape mismatch"
@@ -74,6 +97,55 @@ def assert_match(reference, streamed, atol, label):
     if not torch.allclose(reference, streamed, atol=atol):
         raise SystemExit(f"[{label}] diverges beyond atol={atol}")
     print(f"[{label}] OK")
+
+
+def assert_match_render(
+    reference,
+    streamed,
+    label,
+    mean_atol=1e-5,
+    sparse_pixel_atol=1e-2,
+    sparse_pixel_max_fraction=1e-3,
+):
+    """Image-tolerant parity check for mesh rendering.
+
+    Mesh rendering is not bit-exact between one-shot (FLAME LBS over
+    a batch of T) and streaming (T calls over batch 1): float32 add
+    non-associativity at ~1e-7 in vertex coordinates feeds discrete
+    rasterizer coverage decisions, flipping a 1-2 pixel silhouette
+    outline. The mean is expected to be near zero; a small fraction
+    of silhouette pixels may diverge significantly. See
+    ``docs/realtime.md``.
+    """
+    print(f"[{label}] one_shot: {tuple(reference.shape)}, streamed: {tuple(streamed.shape)}")
+    assert reference.shape == streamed.shape, f"[{label}] shape mismatch"
+    diff = (reference - streamed).abs()
+    mean_diff = diff.mean().item()
+    max_diff = diff.max().item()
+    print(f"[{label}] max abs diff:  {max_diff:.3e}")
+    print(f"[{label}] mean abs diff: {mean_diff:.3e}")
+
+    n_total = diff.numel()
+    n_sparse = int((diff > sparse_pixel_atol).sum().item())
+    sparse_fraction = n_sparse / n_total
+    print(
+        f"[{label}] pixels with diff > {sparse_pixel_atol:.0e}: "
+        f"{n_sparse}/{n_total} ({sparse_fraction*100:.4f}%)"
+    )
+
+    if mean_diff > mean_atol:
+        raise SystemExit(
+            f"[{label}] mean diff {mean_diff:.3e} exceeds {mean_atol:.0e}"
+        )
+    if sparse_fraction > sparse_pixel_max_fraction:
+        raise SystemExit(
+            f"[{label}] {sparse_fraction*100:.4f}% of pixels diverge beyond "
+            f"{sparse_pixel_atol:.0e}, exceeds {sparse_pixel_max_fraction*100:.4f}%"
+        )
+    print(
+        f"[{label}] OK (mean<{mean_atol:.0e}, "
+        f"sparse pixel divergence within tolerance)"
+    )
 
 
 def main():
@@ -95,6 +167,12 @@ def main():
              "Choose a small odd number to exercise sub-window feeds.",
     )
     parser.add_argument("--atol", type=float, default=1e-5)
+    parser.add_argument(
+        "--render-batch-size",
+        type=int,
+        default=8,
+        help="frames per render_batch call in the batched mesh check.",
+    )
     parser.add_argument(
         "--audio-encoder", default="wav2vec", type=str,
         help="ARTalk audio encoder architecture name.",
@@ -150,6 +228,47 @@ def main():
     )
     assert streamed_smoothed is not None, "smoother produced no output"
     assert_match(one_shot_smoothed, streamed_smoothed, args.atol, "streaming smoother")
+
+    # Streaming mesh rendering parity (skipped if FLAME unavailable).
+    if not os.path.exists(FLAME_ASSET_PATH):
+        print(
+            f"[streaming mesh rendering] {FLAME_ASSET_PATH} not found; skipping. "
+            "FLAME has separate access and license terms; see the README."
+        )
+        return
+    from artalk.flame_model import FLAMEModel, RenderMesh
+
+    flame_model = FLAMEModel(
+        n_shape=300, n_exp=100, scale=1.0, no_lmks=True
+    ).to(device)
+    mesh_renderer = RenderMesh(
+        image_size=512, faces=flame_model.get_faces(), scale=1.0
+    )
+
+    one_shot_frames = render_mesh_oneshot_reference(
+        one_shot_motion, model.basic_vae, flame_model, mesh_renderer
+    )
+    renderer = StreamingRenderer(
+        mode="mesh",
+        basic_vae=model.basic_vae,
+        flame_model=flame_model,
+        mesh_renderer=mesh_renderer,
+        device=device,
+    )
+    streamed_frames = torch.stack(list(renderer.feed(one_shot_motion)), dim=0)
+    assert_match_render(
+        one_shot_frames, streamed_frames, "streaming mesh rendering"
+    )
+    batched_frames = torch.cat(
+        [
+            renderer.render_batch(one_shot_motion[i : i + args.render_batch_size])
+            for i in range(0, one_shot_motion.shape[0], args.render_batch_size)
+        ],
+        dim=0,
+    )
+    assert_match_render(
+        one_shot_frames, batched_frames, "batched mesh rendering"
+    )
 
 
 if __name__ == "__main__":
