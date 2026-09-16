@@ -8,7 +8,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "ARTalk_wav2vec.pt"
       },
       "size": 1959150898,
@@ -22,7 +22,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "config.json"
       },
       "size": 303,
@@ -45,7 +45,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/GAGAvatar",
-        "revision": "main",
+        "revision": "ddee3d79db9e783aa5496a2027b0a4b458eaf78b",
         "filename": "assets/GAGAvatar.pt"
       },
       "size": 747434426,
@@ -59,11 +59,11 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "GAGAvatar/tracked.pt"
       },
-      "size": 183503648,
-      "sha256": "9b716493929ca0a19a50ce87c291627ff15d81980cad572f75b8d023dc3770fd",
+      "size": 166604488,
+      "sha256": "3e9e4f3f1bf09f2b68960bc8efd97c47ffa842b647119570a53d388de9012c73",
       "license_note": "Example tracked avatars from upstream ARTalk. Do not replace this with private tracked avatars for redistribution."
     },
     {
@@ -73,7 +73,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/angry_0.pt"
       },
       "size": 2365843,
@@ -86,7 +86,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/curious_0.pt"
       },
       "size": 680437,
@@ -99,7 +99,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/doubtful_0.pt"
       },
       "size": 2333193,
@@ -112,7 +112,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/doubtful_1.pt"
       },
       "size": 1062478,
@@ -125,7 +125,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/happy_0.pt"
       },
       "size": 2386200,
@@ -138,7 +138,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/happy_1.pt"
       },
       "size": 531573,
@@ -151,7 +151,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/happy_2.pt"
       },
       "size": 638005,
@@ -164,7 +164,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_0.pt"
       },
       "size": 3129038,
@@ -177,7 +177,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_1.pt"
       },
       "size": 696565,
@@ -190,7 +190,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_2.pt"
       },
       "size": 1327054,
@@ -203,7 +203,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_3.pt"
       },
       "size": 1433043,
@@ -216,7 +216,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_4.pt"
       },
       "size": 2811460,
@@ -229,7 +229,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_5.pt"
       },
       "size": 391285,
@@ -242,7 +242,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_6.pt"
       },
       "size": 716469,
@@ -255,7 +255,7 @@
       "source": {
         "type": "huggingface",
         "repo_id": "xg-chu/ARTalk",
-        "revision": "main",
+        "revision": "6fbead6606ecd147865a9f7e1bc3f02940fdd78c",
         "filename": "style_motion/natural_7.pt"
       },
       "size": 620213,
