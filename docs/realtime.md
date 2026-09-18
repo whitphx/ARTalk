@@ -63,12 +63,13 @@ retraining work since it would not be bit-exact regardless.
 
 ### Phase 3 — Per-frame rendering
 
-`StreamingRenderer` in `app/rendering.py` mirrors the mesh /
-GAGAvatar branches of `ARTAvatarInferEngine.rendering` as a per-frame
+`StreamingRenderer` in `artalk/rendering.py` mirrors the mesh /
+GAGAvatar branches of `ARTAvatarInferEngine.rendering` as a streaming
 API: `render_frame(motion_frame) → (3, H, W)` RGB tensor on CPU in
-[0, 1] range. Audio/video muxing is no longer the renderer's
-responsibility — it moves to the transport layer (Phase 4 WebRTC
-sink).
+[0, 1] range, plus `render_batch(motion_frames)` for rendering several
+frames per model invocation. Audio/video muxing is no longer the
+renderer's responsibility — it moves to the transport layer (Phase 4
+WebRTC sink).
 
 #### Design decisions
 
@@ -76,8 +77,8 @@ sink).
   Mirrors the existing one-shot `rendering()`'s `shape_id`-based
   dispatch and lets config-driven callers (Phase 4) construct
   uniformly.
-- **New file `app/rendering.py`**, not a subsection of
-  `app/streaming.py`. Streaming-specific motion logic
+- **New file `artalk/rendering.py`**, not a subsection of
+  `artalk/streaming.py`. Streaming-specific motion logic
   (`ARTalkStreamer`, `CausalSavgolSmoother`) stays focused there;
   rendering is a separate concern with different dependencies (FLAME
   / GAGAvatar) and was getting unwieldy to colocate.
@@ -96,9 +97,9 @@ sink).
   loaded; tests can construct the FLAME pieces directly without
   spinning up a full engine.
 
-`scripts/check_streaming_parity.py` adds a Phase 3 mesh-mode parity
-check (skipped automatically if `assets/FLAME_with_eye.pt` is not
-present). The GAGAvatar path is not covered by automated parity
+`scripts/check_streaming_parity.py` adds Phase 3 mesh-mode parity
+checks for both the per-frame and batched paths (skipped automatically
+if `assets/FLAME_with_eye.pt` is not present). The GAGAvatar path is not covered by automated parity
 because of the asset-download cost; verify it with a smoke test if
 needed.
 

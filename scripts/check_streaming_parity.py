@@ -3,20 +3,20 @@
 
 Loads the released ARTalk wav2vec checkpoint and runs:
 
-  1. **Streaming inference (Phase 1)** — feeds the same audio to
+  1. **Streaming inference** — feeds the same audio to
      ``BitwiseARModel.inference`` (one-shot) and to ``ARTalkStreamer``
      (chunked, arbitrary feed sizes), and asserts the motion outputs
      match within ``--atol``.
 
-  2. **Streaming smoother (Phase 2)** — applies
+  2. **Streaming smoother** — applies
      ``ARTAvatarInferEngine.smooth_motion_savgol`` (one-shot) and
      ``CausalSavgolSmoother`` (streaming) to the same motion sequence,
      and asserts the outputs match within ``--atol``.
 
-  3. **Streaming mesh rendering (Phase 3)** — renders motion frames
-     via ``StreamingRenderer`` (per-frame) and via the inline mesh
-     branch of ``ARTAvatarInferEngine.rendering`` (batched), and
-     asserts the RGB outputs match within ``--atol``. Skipped if
+  3. **Streaming mesh rendering** — renders motion frames via
+     ``StreamingRenderer`` (per-frame and batched) and via the inline
+     mesh branch of ``ARTAvatarInferEngine.rendering``, and asserts
+     the RGB outputs match within an image-level tolerance. Skipped if
      ``assets/FLAME_with_eye.pt`` is not present.
 
 Run on a GPU host where the model and ``./assets`` are available:
@@ -115,7 +115,7 @@ def assert_match_render(
     rasterizer coverage decisions, flipping a 1-2 pixel silhouette
     outline. The mean is expected to be near zero; a small fraction
     of silhouette pixels may diverge significantly. See
-    ``docs/realtime.md`` Phase 3.
+    ``docs/realtime.md``.
     """
     print(f"[{label}] one_shot: {tuple(reference.shape)}, streamed: {tuple(streamed.shape)}")
     assert reference.shape == streamed.shape, f"[{label}] shape mismatch"
@@ -168,6 +168,12 @@ def main():
     )
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument(
+        "--render-batch-size",
+        type=int,
+        default=8,
+        help="frames per render_batch call in the batched mesh check.",
+    )
+    parser.add_argument(
         "--audio-encoder", default="wav2vec", type=str,
         help="ARTalk audio encoder architecture name.",
     )
@@ -208,13 +214,13 @@ def main():
         batch["style_motion"] = style_motion[None].to(device)
     one_shot_motion = model.inference(batch)[0]
 
-    # Phase 1: streaming inference parity.
+    # Streaming inference parity.
     streamer = ARTalkStreamer(model, style_motion=style_motion)
     streamed_motion = run_streamer(streamer, audio, args.feed_chunk_samples)
     assert streamed_motion is not None, "streamer produced no output"
     assert_match(one_shot_motion, streamed_motion, args.atol, "streaming inference")
 
-    # Phase 2: streaming smoother parity (against one-shot smoother).
+    # Streaming smoother parity (against one-shot smoother).
     one_shot_smoothed = smooth_motion_savgol_reference(one_shot_motion)
     smoother = CausalSavgolSmoother()
     streamed_smoothed = run_smoother(
@@ -223,36 +229,46 @@ def main():
     assert streamed_smoothed is not None, "smoother produced no output"
     assert_match(one_shot_smoothed, streamed_smoothed, args.atol, "streaming smoother")
 
-    # Phase 3: streaming mesh rendering parity (skipped if FLAME unavailable).
+    # Streaming mesh rendering parity (skipped if FLAME unavailable).
     if not os.path.exists(FLAME_ASSET_PATH):
         print(
-            f"[streaming mesh rendering] {FLAME_ASSET_PATH} not found; "
-            "skipping. Run ./build_resources.sh to download FLAME assets."
+            f"[streaming mesh rendering] {FLAME_ASSET_PATH} not found; skipping. "
+            "FLAME has separate access and license terms; see the README."
         )
-    else:
-        from artalk.flame_model import FLAMEModel, RenderMesh
+        return
+    from artalk.flame_model import FLAMEModel, RenderMesh
 
-        flame_model = FLAMEModel(
-            n_shape=300, n_exp=100, scale=1.0, no_lmks=True
-        ).to(device)
-        mesh_renderer = RenderMesh(
-            image_size=512, faces=flame_model.get_faces(), scale=1.0
-        )
+    flame_model = FLAMEModel(
+        n_shape=300, n_exp=100, scale=1.0, no_lmks=True
+    ).to(device)
+    mesh_renderer = RenderMesh(
+        image_size=512, faces=flame_model.get_faces(), scale=1.0
+    )
 
-        one_shot_frames = render_mesh_oneshot_reference(
-            one_shot_motion, model.basic_vae, flame_model, mesh_renderer
-        )
-        renderer = StreamingRenderer(
-            mode="mesh",
-            basic_vae=model.basic_vae,
-            flame_model=flame_model,
-            mesh_renderer=mesh_renderer,
-            device=device,
-        )
-        streamed_frames = torch.stack(list(renderer.feed(one_shot_motion)), dim=0)
-        assert_match_render(
-            one_shot_frames, streamed_frames, "streaming mesh rendering"
-        )
+    one_shot_frames = render_mesh_oneshot_reference(
+        one_shot_motion, model.basic_vae, flame_model, mesh_renderer
+    )
+    renderer = StreamingRenderer(
+        mode="mesh",
+        basic_vae=model.basic_vae,
+        flame_model=flame_model,
+        mesh_renderer=mesh_renderer,
+        device=device,
+    )
+    streamed_frames = torch.stack(list(renderer.feed(one_shot_motion)), dim=0)
+    assert_match_render(
+        one_shot_frames, streamed_frames, "streaming mesh rendering"
+    )
+    batched_frames = torch.cat(
+        [
+            renderer.render_batch(one_shot_motion[i : i + args.render_batch_size])
+            for i in range(0, one_shot_motion.shape[0], args.render_batch_size)
+        ],
+        dim=0,
+    )
+    assert_match_render(
+        one_shot_frames, batched_frames, "batched mesh rendering"
+    )
 
 
 if __name__ == "__main__":
