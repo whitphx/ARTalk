@@ -180,6 +180,58 @@ def with_pipeline_metrics(method):
     return wrapper
 
 
+
+class SilentMouthGate:
+    """Suppress mouth motion while the incoming audio is silent.
+
+    The corpus behind the streaming models has no still-mouthed frames even
+    in real pauses, so models trained on it keep the lips moving through
+    silence. This gate freezes only the mouth-dominant motion dimensions
+    while silent audio is being decoded and leaves blinking, brows and head
+    untouched. The held pose ramps in over ``attack_frames``, releases within
+    ``release_frames`` of speech resuming, and once fully held settles
+    gently toward the neutral closed mouth instead of freezing whatever
+    pose speech ended on.
+    """
+
+    # Ranked by rendering each dimension's per-std perturbation through
+    # FLAME: kept when mean lip-vertex displacement exceeds 0.25 mm and
+    # 1.5x the rest of the face. Matches train_code's MOUTH_DIMS.
+    MOUTH_DIMS = (0, 1, 2, 3, 5, 6, 9, 10, 11, 103, 104, 105)
+
+    def __init__(self, attack_frames=8, release_frames=2, settle=0.98):
+        self._dims = torch.tensor(self.MOUTH_DIMS)
+        self._attack = 1.0 / attack_frames
+        self._release = 1.0 / release_frames
+        self._settle = settle
+        self.reset()
+
+    def reset(self):
+        self._blend = 0.0
+        self._held = None
+
+    @torch.no_grad()
+    def process(self, motion, silent):
+        """Gate a (T, motion_dim) chunk; ``silent`` covers the whole chunk."""
+        if motion.shape[0] == 0 or (not silent and self._blend == 0.0):
+            return motion
+        dims = self._dims.to(motion.device)
+        out = motion.clone()
+        for i in range(out.shape[0]):
+            frame = out[i, dims]
+            if silent:
+                self._blend = min(1.0, self._blend + self._attack)
+            else:
+                self._blend = max(0.0, self._blend - self._release)
+            if self._held is None or self._blend == 0.0:
+                self._held = frame.clone()
+            elif silent and self._blend >= 1.0:
+                self._held = self._held * self._settle
+            if self._blend > 0.0:
+                out[i, dims] = self._held * self._blend + frame * (1.0 - self._blend)
+        return out
+
+
 class ARTalkPipeline:
     """Per-session pipeline holding the streaming model state."""
 
@@ -205,6 +257,7 @@ class ARTalkPipeline:
         max_added_latency_seconds=DEFAULT_MAX_ADDED_LATENCY_SECONDS,
         renderer_stage_sync=True,
         renderer_output_uint8=False,
+        silence_mouth_gate=True,
         warm_key_extra="",
         profile_trace_dir=None,
         profile_skip_chunks=1,
@@ -220,6 +273,7 @@ class ARTalkPipeline:
             streamer = ARTalkStreamer(model, style_motion=style_motion)
         self._streamer = streamer
         self._smoother = CausalSavgolSmoother()
+        self._mouth_gate = SilentMouthGate() if silence_mouth_gate else None
         self._renderer = StreamingRenderer(
             mode=renderer_mode,
             basic_vae=model.basic_vae if model is not None else None,
@@ -1411,6 +1465,8 @@ class ARTalkPipeline:
                         self._rgb_batch_to_arrays(rgb_batch)
         self._streamer.reset()
         self._smoother.reset()
+        if self._mouth_gate is not None:
+            self._mouth_gate.reset()
 
     @torch.no_grad()
     def _render_resting_frame(self) -> np.ndarray:
@@ -1781,6 +1837,12 @@ class ARTalkPipeline:
         streamer_t0 = time.perf_counter()
         with torch.profiler.record_function("artalk.streamer_feed"):
             motion = self._streamer.feed(samples_t)
+        if self._mouth_gate is not None:
+            # A flush-padded chunk reads as silence but its published frames
+            # are the buffered speech tail, so it never engages the gate.
+            rms = float(np.sqrt(np.mean((samples_int16.astype(np.float32) / 32768.0) ** 2)))
+            silent = rms < 0.005 and turn_end_frames is None
+            motion = self._mouth_gate.process(motion, silent)
         streamer_elapsed_s = time.perf_counter() - streamer_t0
         if turn_end_frames is not None:
             motion = motion[:turn_end_frames]
