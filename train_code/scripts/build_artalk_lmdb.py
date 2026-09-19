@@ -74,7 +74,25 @@ def assign_split(identity: str, val_pct: float, test_pct: float) -> str:
     return "train"
 
 
-def load_motion(pkl_path: str, motion_dim: int) -> np.ndarray:
+def recover_gpose(transforms: np.ndarray) -> np.ndarray:
+    """Head rotation from the per-frame tracking transform.
+
+    The tracker zeroes ``posecode``'s global rotation and folds the head
+    pose into ``transform_matrix``. That transform's rotation is
+    ``transform_emoca_to_p3d(gpose)`` (GAGAvatar runtime), which inverts
+    exactly: gpose = flip02(matrix_to_axis_angle(R^T @ diag(-1, 1, -1))).
+    """
+    import torch
+    from pytorch3d.transforms import matrix_to_axis_angle
+
+    R = torch.from_numpy(np.ascontiguousarray(transforms[:, :, :3])).float()
+    D = torch.tensor([[-1.0, 0, 0], [0, 1, 0], [0, 0, -1]])
+    aa = matrix_to_axis_angle(R.transpose(-1, -2) @ D)
+    aa[:, [0, 2]] *= -1
+    return aa.numpy().astype(np.float32)
+
+
+def load_motion(pkl_path: str, motion_dim: int, recover_headpose: bool = False) -> np.ndarray:
     with open(pkl_path, "rb") as fh:
         frames = pickle.load(fh)
     # Frame keys end in _<index>; numeric order, not lexicographic.
@@ -91,6 +109,11 @@ def load_motion(pkl_path: str, motion_dim: int) -> np.ndarray:
             # Per-eye pitch/yaw; the FLAME helper re-expands 4 -> 6 by
             # zeroing each eye's third rotation component.
             out[i, 104:108] = f["eyecode"][[0, 1, 3, 4]]
+    if recover_headpose:
+        transforms = np.stack(
+            [np.asarray(frames[k]["transform_matrix"], dtype=np.float64) for k in keys]
+        )
+        out[:, 100:103] = recover_gpose(transforms)
     return out
 
 
@@ -111,6 +134,12 @@ def main() -> None:
     ap.add_argument("--val-pct", default=0.02, type=float)
     ap.add_argument("--test-pct", default=0.02, type=float)
     ap.add_argument("--layout", type=int, choices=(106, 108), default=106)
+    ap.add_argument(
+        "--recover-headpose",
+        action="store_true",
+        help="Fill gpose (dims 100:103) from each frame's tracking transform "
+        "instead of the zeroed posecode values.",
+    )
     ap.add_argument("--limit", type=int, default=None, help="First N rows only (smoke runs).")
     args = ap.parse_args()
 
@@ -135,7 +164,10 @@ def main() -> None:
         identity = identity_key(r["dataset"], r["sample_id"])
         split = assign_split(identity, args.val_pct, args.test_pct)
         try:
-            motion = load_motion(r["gt_smoothed_pkl_path"], args.layout)
+            motion = load_motion(
+                r["gt_smoothed_pkl_path"], args.layout,
+                recover_headpose=args.recover_headpose,
+            )
             audio = load_audio(r["audio_path"])
         except (OSError, ValueError, KeyError) as exc:
             skipped[f"load error ({type(exc).__name__})"] += 1
