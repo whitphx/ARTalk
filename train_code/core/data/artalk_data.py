@@ -11,6 +11,13 @@ import torch.nn.functional as F
 from core.libs.utils_lmdb import LMDBEngine
 
 
+# Motion dimensions whose displacement concentrates on the lips: ranked by
+# rendering each dimension's per-std perturbation through FLAME and comparing
+# mean lip-vertex displacement against the rest of the face (kept when the
+# lip effect exceeds 0.25 mm and 1.5x the rest).
+MOUTH_DIMS = [0, 1, 2, 3, 5, 6, 9, 10, 11, 103, 104, 105]
+
+
 class ARTalkData(torch.utils.data.Dataset):
     def __init__(self, data_cfg, split, debug=False):
         super().__init__()
@@ -128,10 +135,18 @@ class ARTalkData(torch.utils.data.Dataset):
                 prev_motion = hold_frame[None].expand(self._prev_length, -1).clone()
             if self._silent_audio_aug and random.random() < self._silent_audio_aug:
                 if curr_audio.float().pow(2).mean().sqrt() < self._silent_audio_rms:
-                    # Map digital-zero audio onto real pauses: the target
-                    # stays the pause's own calm face, so pure silence
-                    # decodes to a defined idle expression.
+                    # Map digital-zero audio onto real pauses. The pause's own
+                    # eyes and brows stay as the target, but its mouth cannot:
+                    # measured over the corpus, the mouth in real pauses still
+                    # moves at ~2/3 of its speech rate (no window is still), so
+                    # an unedited target teaches silence to flap the lips.
+                    # Hold the window's median mouth pose across all frames
+                    # instead: silence then decodes to a motionless mouth on a
+                    # lively face.
                     curr_audio = torch.zeros_like(curr_audio)
+                    curr_motion = curr_motion.clone()
+                    mouth = torch.tensor(MOUTH_DIMS)
+                    curr_motion[:, mouth] = curr_motion[:, mouth].median(dim=0).values
             one_record["audio"] = curr_audio.float()
             one_record["motion_code"] = curr_motion.float()
             one_record["prev_motion_code"] = prev_motion.float()
