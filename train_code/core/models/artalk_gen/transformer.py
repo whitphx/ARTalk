@@ -44,7 +44,7 @@ class MixedARTalkDecoder(nn.Module):
         self.register_buffer("attn_rope_pos", attn_rope_pos, persistent=False)
         self.register_buffer("lvl_idx", lvl_idx, persistent=False)
 
-    def forward(self, feat, audio_feat, prev_feat, style_feat):
+    def forward(self, feat, audio_feat, prev_feat, style_feat, audio_past_patches=0, audio_mask=None):
         batch, curr_seq_len, _ = feat.shape
         assert prev_feat.shape[1] % self.one_patch_len == 0
         assert style_feat.shape[1] % self.one_patch_len == 0
@@ -53,7 +53,7 @@ class MixedARTalkDecoder(nn.Module):
         cond_num = prev_num + style_num
         full_curr_len = cond_num * self.one_patch_len + curr_seq_len
         self_attn_bias, attn_rope_pos = self.expand_attn_mask(cond_num)
-        audio_rope_pos = [max(self.patch_nums), cond_num * self.one_patch_len]
+        audio_rope_pos = [max(self.patch_nums), cond_num * self.one_patch_len, audio_past_patches]
 
         feat = feat + self.lvl_embed(self.lvl_idx)[:, :curr_seq_len]
         prev_feat = prev_feat + self.prev_pos
@@ -69,6 +69,7 @@ class MixedARTalkDecoder(nn.Module):
                 attn_rope_pos=attn_rope_pos,
                 audio_rope_pos=audio_rope_pos,
                 self_attn_bias=self_attn_bias,
+                audio_mask=audio_mask,
             )
         curr_feat = attn_feat[:, -curr_seq_len:, :]
         return curr_feat
@@ -119,9 +120,11 @@ class SelfCrossAttn(nn.Module):
             nn.Linear(hidden_features, embed_dim),
         )
 
-    def forward(self, feat, audio_feat, attn_rope_pos, audio_rope_pos, self_attn_bias):
+    def forward(self, feat, audio_feat, attn_rope_pos, audio_rope_pos, self_attn_bias, audio_mask=None):
         feat = feat + self.drop_path(self.self_attn(feat, attn_rope_pos, self_attn_bias))
-        feat = feat + self.drop_path(self.audio_attn(feat, audio_feat, attn_rope_pos, audio_rope_pos))
+        feat = feat + self.drop_path(
+            self.audio_attn(feat, audio_feat, attn_rope_pos, audio_rope_pos, context_mask=audio_mask)
+        )
         feat = feat + self.drop_path(self.ffn(feat))
         return feat
 
@@ -175,11 +178,17 @@ class CrossAttention(nn.Module):
         self.self_norm = nn.LayerNorm(embed_dim, elementwise_affine=True, eps=1e-6)
         self.context_norm = nn.LayerNorm(context_embed_dim, elementwise_affine=True, eps=1e-6)
 
-    def forward(self, x, context, rope_pos, context_rope_pos):
+    def forward(self, x, context, rope_pos, context_rope_pos, context_mask=None):
         _, curr_len, _ = x.shape
         x, context = self.self_norm(x), self.context_norm(context)
-        patch_len, patch_offsets = context_rope_pos
-        context_rope_pos = torch.linspace(0, patch_len, steps=(context.shape[1] + 1))[:-1].long() + patch_offsets
+        patch_len, patch_offsets, past_patches = context_rope_pos
+        # The context spans the chunk being generated plus whatever past
+        # chunks precede it, so its positions run from before the chunk's
+        # own offset up to the end of the chunk. With no past chunks this
+        # is the chunk's own span.
+        span = patch_len * (1 + past_patches)
+        start = patch_offsets - patch_len * past_patches
+        context_rope_pos = torch.linspace(0, span, steps=(context.shape[1] + 1))[:-1].long() + start
         q = self.rearrange_qkv(self.q_proj(x))
         k = self.rearrange_qkv(self.k_proj(context))
         v = self.rearrange_qkv(self.v_proj(context))
@@ -188,7 +197,9 @@ class CrossAttention(nn.Module):
         v = self.rearrange_rope(v)
 
         # scaled_dot_product_attention inputs shape (B, Hq, L, c)
-        out = torch.nn.functional.scaled_dot_product_attention(query=q, key=k, value=v)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query=q, key=k, value=v, attn_mask=context_mask
+        )
         out = self.rearrange_out(out)
         out = self.out_proj(out)
         return out

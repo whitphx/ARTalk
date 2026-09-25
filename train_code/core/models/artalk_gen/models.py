@@ -74,6 +74,11 @@ class ARTalkGen(nn.Module):
         self.prev_free_ratio = model_cfg.PREV_FREE
         self.style_free_ratio = model_cfg.STYLE_FREE
         self.audio_free_ratio = model_cfg.AUDIO_FREE
+        # Chunks of audio preceding the one being generated that the decoder
+        # may attend to. Each is encoded on its own, exactly as a streaming
+        # caller encodes it once when it arrives, so the context costs
+        # attention but no extra audio-encoder work.
+        self.audio_context_patches = int(model_cfg.get("AUDIO_CONTEXT_PATCHES", 0))
 
         # learnable embeddings
         self.sos_embed = nn.Parameter(torch.zeros(1, 1, self.attn_dim))
@@ -106,6 +111,26 @@ class ARTalkGen(nn.Module):
         style_motion_code = batch["style_motion_code"]
 
         audio_feat = self.audio_encoder(audio, self._sample_rate)
+        audio_mask = None
+        if self.audio_context_patches:
+            past_audio = batch["past_audio"]
+            n_past = past_audio.shape[1]
+            past_feat = self.audio_encoder(
+                past_audio.reshape(batch_size * n_past, -1), self._sample_rate
+            )
+            tokens_per_patch = past_feat.shape[1]
+            past_feat = past_feat.reshape(batch_size, n_past * tokens_per_patch, -1)
+            # Contexts shorter than the full window are the normal case for
+            # the first seconds of a stream, so training covers every length
+            # and masks the chunks that would not exist yet.
+            valid = batch["past_valid"].to(self.device).view(batch_size, 1)
+            patch_idx = torch.arange(n_past, device=self.device).view(1, n_past)
+            keep_patch = patch_idx >= (n_past - valid)
+            keep = keep_patch.repeat_interleave(tokens_per_patch, dim=1)
+            past_feat = torch.where(keep[..., None], past_feat, torch.zeros_like(past_feat))
+            audio_feat = torch.cat([past_feat, audio_feat], dim=1)
+            curr_keep = keep.new_ones(batch_size, audio_feat.shape[1] - keep.shape[1])
+            audio_mask = torch.cat([keep, curr_keep], dim=1)[:, None, None, :]
 
         # mask conditions for classifier-free training
         m_audio = torch.rand(batch_size, 1, 1).to(self.device) < self.audio_free_ratio
@@ -127,13 +152,40 @@ class ARTalkGen(nn.Module):
             motion_code, self.flip_quant_ratio, "accum_next"
         )
         attn_feat = torch.cat([sos_token, self.code_token_embed(next_vqfeat)], dim=1)
-        attn_feat = self.attn_blocks(attn_feat, audio_feat, prev_feat, style_feat)
+        attn_feat = self.attn_blocks(
+            attn_feat, audio_feat, prev_feat, style_feat,
+            audio_past_patches=self.audio_context_patches, audio_mask=audio_mask,
+        )
         pred_motion_logits = self.logits_head(attn_feat)
 
         return {
             "pred_motion_logits": pred_motion_logits,
             "gt_motion_bits": this_code_bits,
         }
+
+    def _audio_context(self, audio_feats, chunk_idx):
+        """Audio features the chunk at ``chunk_idx`` attends to, plus its mask.
+
+        Chunks before the start of the stream have no features to supply, so
+        they are attended as zeros and masked out, matching how training
+        covers short contexts.
+        """
+        curr = audio_feats[chunk_idx]
+        if not self.audio_context_patches:
+            return curr, None
+        n_past = self.audio_context_patches
+        first = chunk_idx - n_past
+        past = [
+            audio_feats[i] if i >= 0 else torch.zeros_like(curr)
+            for i in range(first, chunk_idx)
+        ]
+        feats = torch.cat(past + [curr], dim=1)
+        keep = torch.ones(
+            feats.shape[0], feats.shape[1], dtype=torch.bool, device=feats.device
+        )
+        missing = max(0, -first)
+        keep[:, : missing * curr.shape[1]] = False
+        return feats, keep[:, None, None, :]
 
     @torch.inference_mode()
     def inference(self, audio, style_motion_code=None, prev_motion_code=None, tau=1.0, cfg=2.0, **kwargs):
@@ -171,13 +223,14 @@ class ARTalkGen(nn.Module):
         pred_motion_codes = []
         for chunk_idx in range(len(audio_feats)):
             next_ar_vqfeat = sos_token
-            curr_audio_feat = audio_feats[chunk_idx]
+            curr_audio_feat, audio_mask = self._audio_context(audio_feats, chunk_idx)
             prev_feat = self.code_token_embed(self.get_motion_feat(prev_motion_code))
 
             patch_motion_bits = []
             for pidx, pn in enumerate(self.patch_nums):
                 attn_feat = self.attn_blocks(
-                    next_ar_vqfeat, curr_audio_feat, prev_feat, style_feat
+                    next_ar_vqfeat, curr_audio_feat, prev_feat, style_feat,
+                    audio_past_patches=self.audio_context_patches, audio_mask=audio_mask,
                 )
                 motion_logits = self.logits_head(attn_feat)
                 motion_logits = motion_logits[:, sum(self.patch_nums[:pidx]) :]

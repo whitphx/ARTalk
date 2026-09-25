@@ -33,6 +33,7 @@ class ARTalkData(torch.utils.data.Dataset):
         self._static_prev_aug = float(data_cfg.get("STATIC_PREV_AUG", 0.0))
         self._silent_audio_aug = float(data_cfg.get("SILENT_AUDIO_AUG", 0.0))
         self._silent_audio_rms = float(data_cfg.get("SILENT_AUDIO_RMS", 0.005))
+        self._audio_context_patches = int(data_cfg.get("AUDIO_CONTEXT_PATCHES", 0))
         self._motion_fps = data_cfg.MOTION_FPS
         self._audio_sample_rate = data_cfg.AUDIO_SAMPLE_RATE
         self._audio_frames_rate = self._audio_sample_rate / self._motion_fps
@@ -147,6 +148,8 @@ class ARTalkData(torch.utils.data.Dataset):
                     curr_motion = curr_motion.clone()
                     mouth = torch.tensor(MOUTH_DIMS)
                     curr_motion[:, mouth] = curr_motion[:, mouth].median(dim=0).values
+            if self._audio_context_patches:
+                one_record.update(self._past_audio(audio_tensor, start_wave))
             one_record["audio"] = curr_audio.float()
             one_record["motion_code"] = curr_motion.float()
             one_record["prev_motion_code"] = prev_motion.float()
@@ -155,6 +158,26 @@ class ARTalkData(torch.utils.data.Dataset):
             one_record["audio"] = curr_audio.float()
             one_record["motion_code"] = motion_tensor.float()
         return one_record
+
+    def _past_audio(self, audio_tensor, start_wave):
+        """The audio chunks preceding the one being predicted.
+
+        A stream only has as much history as it has played, so the number
+        of chunks is drawn per sample and the rest are zero-filled for the
+        model to mask. The augmentation that maps a real pause onto digital
+        silence deliberately leaves the history audible: a talker falling
+        silent is exactly that case, and the target mouth is already held
+        still for it.
+        """
+        n = self._audio_context_patches
+        chunk = self._clip_audio_length
+        valid = random.randint(0, n) if self._split == "train" else n
+        available = min(valid, start_wave // chunk)
+        past = torch.zeros(n, chunk, dtype=audio_tensor.dtype)
+        for i in range(available):
+            end = start_wave - i * chunk
+            past[n - 1 - i] = audio_tensor[end - chunk : end]
+        return {"past_audio": past.float(), "past_valid": torch.tensor(available)}
 
     def close(self):
         if hasattr(self, "_lmdb_engine"):
