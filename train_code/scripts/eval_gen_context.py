@@ -43,6 +43,10 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, type=Path, action="append",
                     help="repeatable; each is scored as its own row")
     ap.add_argument("--label", action="append", default=None)
+    ap.add_argument("--force-context", action="append", type=int, default=None,
+                    help="repeatable, per checkpoint: override how many past chunks it "
+                         "attends to. Scoring a context model at 0 says whether the "
+                         "context is doing anything, rather than merely being supplied.")
     ap.add_argument("--data", required=True, type=Path)
     ap.add_argument("--split", default="test")
     ap.add_argument("--max-clips", type=int, default=None)
@@ -62,8 +66,12 @@ def main() -> None:
     engine = LMDBEngine(str(args.data / "data_lmdb"), write=False)
     sums: dict[str, list] = {}
     contexts = {}
-    for label, ckpt in zip(labels, args.checkpoint):
+    forced = args.force_context or [None] * len(args.checkpoint)
+    for label, ckpt, force in zip(labels, args.checkpoint, forced):
         model, ctx = load(ckpt, args.device)
+        if force is not None:
+            model.audio_context_patches = force
+            ctx = force
         contexts[label] = ctx
         n = 0
         for key, length in meta:

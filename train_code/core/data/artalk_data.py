@@ -34,6 +34,7 @@ class ARTalkData(torch.utils.data.Dataset):
         self._silent_audio_aug = float(data_cfg.get("SILENT_AUDIO_AUG", 0.0))
         self._silent_audio_rms = float(data_cfg.get("SILENT_AUDIO_RMS", 0.005))
         self._audio_context_patches = int(data_cfg.get("AUDIO_CONTEXT_PATCHES", 0))
+        self._audio_context_variable = bool(data_cfg.get("AUDIO_CONTEXT_VARIABLE", True))
         self._motion_fps = data_cfg.MOTION_FPS
         self._audio_sample_rate = data_cfg.AUDIO_SAMPLE_RATE
         self._audio_frames_rate = self._audio_sample_rate / self._motion_fps
@@ -162,16 +163,19 @@ class ARTalkData(torch.utils.data.Dataset):
     def _past_audio(self, audio_tensor, start_wave):
         """The audio chunks preceding the one being predicted.
 
-        A stream only has as much history as it has played, so the number
-        of chunks is drawn per sample and the rest are zero-filled for the
-        model to mask. The augmentation that maps a real pause onto digital
+        A stream only has as much history as it has played, so by default
+        the number of chunks is drawn per sample and the rest are
+        zero-filled for the model to mask. AUDIO_CONTEXT_VARIABLE False
+        always asks for the full context instead, which isolates whether
+        training across lengths is what costs quality. The augmentation that maps a real pause onto digital
         silence deliberately leaves the history audible: a talker falling
         silent is exactly that case, and the target mouth is already held
         still for it.
         """
         n = self._audio_context_patches
         chunk = self._clip_audio_length
-        valid = random.randint(0, n) if self._split == "train" else n
+        variable = self._audio_context_variable and self._split == "train"
+        valid = random.randint(0, n) if variable else n
         available = min(valid, start_wave // chunk)
         past = torch.zeros(n, chunk, dtype=audio_tensor.dtype)
         for i in range(available):
