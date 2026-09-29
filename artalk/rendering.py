@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
-"""Streaming per-frame renderer for motion → RGB.
+"""Streaming renderer for motion → RGB.
 
 Streaming counterpart to ``ARTAvatarInferEngine.rendering``. The
 one-shot path collects all frames in a list and muxes them with audio
-into an MP4; this class renders a single motion frame at a time and
-returns the RGB tensor. Audio/video muxing is left to the transport
-layer (e.g. a WebRTC sink in Phase 4).
+into an MP4; this class renders motion frames as they arrive and
+returns RGB tensors. Audio/video muxing is left to the caller's
+transport layer.
 
 Two modes mirror the one-shot paths:
 
@@ -20,11 +20,11 @@ arguments rather than loading them itself, so callers can share an
 ``ARTAvatarInferEngine``'s already-loaded modules without paying the
 init cost twice.
 
-See ``docs/realtime.md`` (Phase 3) for the design rationale, including
-why the existing one-shot ``rendering()`` is kept untouched and why
-"raw motion params output" is not a renderer mode (callers that want
-to skip server-side rendering simply consume motion frames before
-this stage).
+See ``docs/realtime.md`` for the design rationale, including why the
+existing one-shot ``rendering()`` is kept untouched and why "raw
+motion params output" is not a renderer mode (callers that want to
+skip server-side rendering simply consume motion frames before this
+stage).
 """
 
 import time
@@ -36,6 +36,17 @@ from .metrics import (
     observe_pipeline_duration_if_active,
     pipeline_metrics_scope_if_active,
 )
+
+
+def _module_device(module):
+    # FLAMEModel holds only registered buffers, no trainable parameters.
+    for tensor in module.parameters():
+        return tensor.device
+    for tensor in module.buffers():
+        return tensor.device
+    raise ValueError(
+        f"cannot infer device from {type(module).__name__}; pass device="
+    )
 
 
 class StreamingRenderer:
@@ -60,7 +71,7 @@ class StreamingRenderer:
                     "mode='mesh' requires basic_vae, flame_model, mesh_renderer"
                 )
             if device is None:
-                device = next(flame_model.parameters()).device
+                device = _module_device(flame_model)
             if shape_code is None:
                 shape_code = torch.zeros(1, 300, device=device)
             else:
@@ -70,6 +81,7 @@ class StreamingRenderer:
                     )
                 shape_code = shape_code.to(device)
             self._render = self._render_mesh
+            self._render_batch = self._render_mesh_batch
             self._mesh_basic_vae = basic_vae
             self._mesh_flame = flame_model
             self._mesh_renderer = mesh_renderer
@@ -80,9 +92,10 @@ class StreamingRenderer:
                     "mode='gagavatar' requires gagavatar, gagavatar_flame, shape_id"
                 )
             if device is None:
-                device = next(gagavatar_flame.parameters()).device
+                device = _module_device(gagavatar_flame)
             gagavatar.set_avatar_id(shape_id)
             self._render = self._render_gagavatar
+            self._render_batch = self._render_gagavatar_batch
             self._gaga = gagavatar
             self._gaga_flame = gagavatar_flame
         else:
@@ -129,6 +142,26 @@ class StreamingRenderer:
                 f"motion_frame must be 1-D, got shape {tuple(motion_frame.shape)}"
             )
         return self._render(motion_frame.to(self._device))
+
+    @torch.no_grad()
+    def render_batch(self, motion_frames):
+        """Render a motion batch in one model invocation.
+
+        ``motion_frames``: 2-D tensor of shape (T, motion_dim). Returns
+        a (T, 3, H, W) ``torch.float32`` tensor on CPU with values in
+        [0, 1], or (T, H, W, 3) ``torch.uint8`` with ``output_uint8``.
+
+        In ``'gagavatar'`` mode this requires a batch-capable
+        ``gagavatar`` implementation (the packaged ``gagavatar``
+        runtime); the copy vendored under ``artalk/GAGAvatar`` builds
+        forward batches one frame at a time — use ``render_frame`` /
+        ``feed`` with it.
+        """
+        if motion_frames.dim() != 2:
+            raise ValueError(
+                f"motion_frames must be 2-D, got shape {tuple(motion_frames.shape)}"
+            )
+        return self._render_batch(motion_frames.to(self._device))
 
     @torch.no_grad()
     def render_frame_profile(self, motion_frame):
@@ -189,6 +222,17 @@ class StreamingRenderer:
         rgb = self._mesh_renderer(verts)[0]
         return rgb.cpu()[0] / 255.0
 
+    def _render_mesh_batch(self, motion_frames):
+        shape_code = self._mesh_shape_code.expand(motion_frames.shape[0], -1)
+        verts = self._mesh_basic_vae.get_flame_verts(
+            self._mesh_flame,
+            shape_code,
+            motion_frames,
+            with_global=True,
+        )
+        rgb = self._mesh_renderer(verts)[0] / 255.0
+        return self._batch_to_output(rgb)
+
     def _render_mesh_profile(self, motion_frame):
         with pipeline_metrics_scope_if_active("mesh"):
             timings = {}
@@ -248,6 +292,11 @@ class StreamingRenderer:
         batch = self._gaga.build_forward_batch(motion_frame[None], self._gaga_flame)
         rgb = self._gaga.forward_expression(batch)
         return rgb.cpu()[0]
+
+    def _render_gagavatar_batch(self, motion_frames):
+        batch = self._gaga.build_forward_batch(motion_frames, self._gaga_flame)
+        rgb = self._gaga.forward_expression(batch)
+        return self._batch_to_output(rgb)
 
     def _render_gagavatar_profile(self, motion_frame):
         with pipeline_metrics_scope_if_active("gagavatar"):

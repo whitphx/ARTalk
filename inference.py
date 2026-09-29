@@ -15,6 +15,12 @@ from artalk import BitwiseARModel
 from artalk.flame_model import FLAMEModel, RenderMesh
 from artalk.utils_videos import write_video
 
+try:
+    from spaces import GPU as zerogpu  # Hugging Face ZeroGPU
+except ImportError:
+    def zerogpu(**kwargs):
+        return lambda fn: fn
+
 class ARTAvatarInferEngine:
     def __init__(self, load_gaga=False, fix_pose=False, clip_length=750, device='cuda'):
         self.device = device
@@ -95,34 +101,53 @@ class ARTAvatarInferEngine:
         return torch.tensor(motion_np_smoothed).type_as(motion_codes)
 
 
+# The engine the Gradio handler renders with. It is a module global rather
+# than a closure variable so that ZeroGPU, which runs the decorated function
+# in a worker process, does not have to pickle the models with every call.
+_engine = None
+
+
+# 120 s covers the default 30 s clip (clip_length 750) with the GAGAvatar
+# renderer; a Space serving longer clips needs a larger duration.
+@zerogpu(duration=120)
+def generate(audio_input, shape_id, style_id):
+    # load audio
+    audio, sr = torchaudio.load(audio_input)
+    audio = torchaudio.transforms.Resample(sr, 16000)(audio).mean(dim=0)
+    # inference
+    if style_id == "default":
+        _engine.style_motion = None
+    else:
+        _engine.set_style_motion(style_id)
+    pred_motions = _engine.inference(audio)
+    # render
+    save_name = f'{audio_input.split("/")[-1].split(".")[0]}_{style_id.replace(".", "_")}_{shape_id.replace(".", "_")}'
+    _engine.rendering(audio, pred_motions, shape_id=shape_id, save_name=save_name)
+    # save pred_motions
+    torch.save(pred_motions.float().cpu(), os.path.join(_engine.output_dir, '{}_motions.pt'.format(save_name)))
+    return os.path.join(_engine.output_dir, '{}.mp4'.format(save_name)), os.path.join(_engine.output_dir, '{}_motions.pt'.format(save_name))
+
+
+def process_audio(input_type, audio_input, text_input, text_language, shape_id, style_id):
+    # Validation and text-to-speech stay outside generate() so that a request
+    # that produces no video never occupies a GPU.
+    if input_type == "Audio" and audio_input is None:
+        gr.Warning("Please upload an audio file")
+        return None
+    if input_type == "Text" and (text_input is None or len(text_input.strip()) == 0):
+        gr.Warning("Please input text content") 
+        return None
+    if input_type == "Text":
+        gtts_lang = {"English": "en", "中文": "zh", "日本語": "ja", "Deutsch": "de", "Français": "fr", "Español": "es"}
+        tts = gTTS(text=text_input, lang=gtts_lang[text_language])
+        tts.save("./render_results/tts_output.wav")
+        audio_input = "./render_results/tts_output.wav"
+    return generate(audio_input, shape_id, style_id)
+
+
 def run_gradio_app(engine):
-    def process_audio(input_type, audio_input, text_input, text_language, shape_id, style_id):
-        if input_type == "Audio" and audio_input is None:
-            gr.Warning("Please upload an audio file")
-            return None
-        if input_type == "Text" and (text_input is None or len(text_input.strip()) == 0):
-            gr.Warning("Please input text content") 
-            return None
-        if input_type == "Text":
-            gtts_lang = {"English": "en", "中文": "zh", "日本語": "ja", "Deutsch": "de", "Français": "fr", "Español": "es"}
-            tts = gTTS(text=text_input, lang=gtts_lang[text_language])
-            tts.save("./render_results/tts_output.wav")
-            audio_input = "./render_results/tts_output.wav"
-        # load audio
-        audio, sr = torchaudio.load(audio_input)
-        audio = torchaudio.transforms.Resample(sr, 16000)(audio).mean(dim=0)
-        # inference
-        if style_id == "default":
-            engine.style_motion = None
-        else:
-            engine.set_style_motion(style_id)
-        pred_motions = engine.inference(audio)
-        # render
-        save_name = f'{audio_input.split("/")[-1].split(".")[0]}_{style_id.replace(".", "_")}_{shape_id.replace(".", "_")}'
-        engine.rendering(audio, pred_motions, shape_id=shape_id, save_name=save_name)
-        # save pred_motions
-        torch.save(pred_motions.float().cpu(), os.path.join(engine.output_dir, '{}_motions.pt'.format(save_name)))
-        return os.path.join(engine.output_dir, '{}.mp4'.format(save_name)), os.path.join(engine.output_dir, '{}_motions.pt'.format(save_name))
+    global _engine
+    _engine = engine
 
     # create the gradio app
     if hasattr(engine, 'GAGAvatar'):
@@ -207,7 +232,7 @@ def run_gradio_app(engine):
             fn=toggle_input, inputs=[input_type], outputs=[audio_group, text_group]
         )
 
-    demo.launch(server_name="0.0.0.0", server_port=8960)
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("GRADIO_SERVER_PORT", "8960")))
 
 
 if __name__ == '__main__':
