@@ -187,11 +187,16 @@ class SilentMouthGate:
     The corpus behind the streaming models has no still-mouthed frames even
     in real pauses, so models trained on it keep the lips moving through
     silence. This gate freezes only the mouth-dominant motion dimensions
-    while silent audio is being decoded and leaves blinking, brows and head
-    untouched. The held pose ramps in over ``attack_frames``, releases within
+    while silent audio is being decoded and leaves brows and head untouched.
+    The held pose ramps in over ``attack_frames``, releases within
     ``release_frames`` of speech resuming, and once fully held settles
     gently toward the neutral closed mouth instead of freezing whatever
     pose speech ended on.
+
+    Blinks do not survive it intact: in tracked blinks about 28% of the
+    eyelid closure is carried by ``MOUTH_DIMS``, so while the gate holds
+    them most blinks become too shallow to read. ``BlinkInjector`` runs
+    after the gate for that reason.
     """
 
     # Ranked by rendering each dimension's per-std perturbation through
@@ -232,6 +237,205 @@ class SilentMouthGate:
         return out
 
 
+class BlinkInjector:
+    """Overlay stochastic eye blinks on generated motion.
+
+    The streaming models almost never blink, and not at all through
+    silence, so this adds blinks at a human rate on top of what the model
+    emits. A blink moves the expression along ``BLINK_DIRECTION`` but only
+    in the expression dimensions outside ``SilentMouthGate.MOUTH_DIMS``.
+    Those mouth dimensions (and the pose dimensions) are never written and
+    stay bit-identical. The lips are not perfectly still: FLAME couples lid
+    closure to the mouth region, so a blink still shifts the lip vertices
+    by about a millimetre at its peak.
+
+    Interval and duration are drawn per blink. Some models blink on their
+    own (the 4 s model with a style does, at a near-human rate during
+    speech), so each model blink banks one skipped injection (up to
+    ``MAX_CREDITS``), no blink starts while the model's is under way, and an
+    injected blink that meets a closing model lid is held back so the two
+    together close no further than an injected blink alone closes an open
+    eye.
+    """
+
+    # Mean expression change from the open eye to the aperture minimum over
+    # 2247 tracked blinks in ARTalk's test split. About 28% of that closure
+    # lies in MOUTH_DIMS, and the mean tracked blink only half closes the
+    # eye, so ``scale`` defaults to 2: the lids then render shut on the mesh
+    # and on GAGAvatar.
+    BLINK_DIRECTION = (
+        0.5398, 0.1468, 0.0754, 0.4281, -1.1659, -1.0859, 0.3631, -1.3667, 0.8335, 0.6887,
+        -0.7940, 0.8561, 0.1111, -0.3659, 0.3933, -0.7550, -1.0227, -0.2595, -0.5936, 0.7419,
+        0.0347, -0.5583, 0.6605, -0.0689, -0.2301, 0.2776, -0.0306, 0.2051, -0.1955, -0.1454,
+        0.0303, -0.1508, 0.0710, -0.1161, 0.2551, 0.0254, 0.2801, -0.1077, -0.0311, 0.1190,
+        0.0310, -0.0243, 0.0855, 0.0975, -0.1245, 0.2151, -0.0234, -0.2153, -0.0546, 0.0701,
+        0.0261, -0.0797, -0.0078, 0.0580, -0.2018, -0.0972, -0.1271, 0.0039, -0.0205, 0.0469,
+        0.0302, -0.0449, -0.1207, 0.0041, 0.0641, 0.0827, -0.0768, 0.0233, -0.0048, 0.0303,
+        0.0399, -0.0036, 0.0574, 0.0227, -0.0435, -0.0590, -0.0676, -0.0351, 0.1042, 0.0560,
+        -0.0341, -0.0020, -0.0800, 0.0229, -0.0695, 0.0734, 0.0347, 0.0331, -0.0048, -0.0075,
+        0.0254, 0.0375, 0.0149, 0.0148, -0.0572, 0.0539, 0.0116, -0.0383, -0.0142, 0.0139,
+    )
+    # Upper/lower eyelid vertices of both eyes: where FLAME's eye landmark
+    # reselection (inherited from DECA) puts 68-point landmarks 37/41,
+    # 38/40, 43/47 and 44/46.
+    EYELID_PAIRS = ((2452, 2360), (2471, 2276), (1292, 827), (1217, 999))
+    # Timing measured on the same tracked blinks. The interval is a
+    # log-normal fit with right censoring (the gap after a clip's last blink,
+    # and clips without any blink, only bound the interval from below); its
+    # mean sets the rate. Blink length is the width at half depth, doubled.
+    # Its spread is taken from the lower half of the distribution only,
+    # because slow lid drift inflates the upper tail.
+    RATE_PER_MIN = 16.6
+    INTERVAL_LOG_SIGMA = 1.22
+    DURATION_MEDIAN_FRAMES = 11.7
+    DURATION_LOG_SIGMA = 0.40
+    DURATION_RANGE_FRAMES = (5, 23)
+    CLOSE_SHARE = 0.38
+    # The model's own blinks, judged on the aperture relative to its recent
+    # open level (a rolling 90th percentile): a dip below
+    # MODEL_DIP_RATIO blocks injection, and one that ends within
+    # MAX_MODEL_BLINK_FRAMES after reaching MODEL_BLINK_DEPTH counts as a
+    # blink. Longer dips are squints or downward looks.
+    OPEN_LEVEL_FRAMES = 2 * FPS
+    MODEL_DIP_RATIO = 0.75
+    MODEL_BLINK_DEPTH = 0.6
+    MAX_MODEL_BLINK_FRAMES = 12
+    # Each model blink earns one skipped injection. The cap bounds how long
+    # the injector stays quiet once the model stops blinking, e.g. when a
+    # turn ends and the model's eyes freeze in silence.
+    MAX_CREDITS = 2
+
+    def __init__(self, eyelid_offset, eyelid_basis, scale=2.0, seed=None):
+        """``eyelid_offset`` (P, 3) is upper minus lower eyelid vertex of each
+        ``EYELID_PAIRS`` entry on the template, ``eyelid_basis`` (P, 3, E) the
+        same difference of FLAME's expression blendshapes."""
+        n_exp = len(self.BLINK_DIRECTION)
+        mouth = set(SilentMouthGate.MOUTH_DIMS)
+        self._dims = torch.tensor([d for d in range(n_exp) if d not in mouth])
+        self._direction = scale * torch.tensor(self.BLINK_DIRECTION)[self._dims]
+        self._offset = torch.as_tensor(eyelid_offset, dtype=torch.float32)
+        self._basis = torch.as_tensor(eyelid_basis, dtype=torch.float32)[..., :n_exp]
+        # Lid-vector change of a full-weight blink, for the overlap limit.
+        self._lid_step = (self._basis[..., self._dims] @ self._direction).numpy()
+        frames_per_blink = 60.0 * FPS / self.RATE_PER_MIN
+        self._interval_log_mu = math.log(frames_per_blink) - self.INTERVAL_LOG_SIGMA**2 / 2
+        # A private generator keeps the timing reproducible under ``seed``
+        # and leaves the global RNG streams, which CUDA graph capture
+        # registers, untouched.
+        self._rng = np.random.default_rng(seed)
+        self._device = self._offset.device
+        self._recent = deque(maxlen=self.OPEN_LEVEL_FRAMES)
+        self._dip_frames = 0
+        self._dip_min = 1.0
+        self._credits = 0
+        self._profile = None
+        self._profile_frame = 0
+        self._countdown = self._draw_interval()
+
+    def _to_device(self, device):
+        if device != self._device:
+            self._dims = self._dims.to(device)
+            self._direction = self._direction.to(device)
+            self._offset = self._offset.to(device)
+            self._basis = self._basis.to(device)
+            self._device = device
+
+    @classmethod
+    def from_flame(cls, flame_model, **kwargs):
+        upper = [u for u, _ in cls.EYELID_PAIRS]
+        lower = [lo for _, lo in cls.EYELID_PAIRS]
+        template = flame_model.v_template.detach().float().cpu()
+        # FLAMEModel stacks the shape blendshapes before the expression ones.
+        expr = flame_model.shapedirs[:, :, -len(cls.BLINK_DIRECTION):].detach().float().cpu()
+        return cls(template[upper] - template[lower], expr[upper] - expr[lower], **kwargs)
+
+    def _draw_interval(self):
+        frames = self._rng.lognormal(self._interval_log_mu, self.INTERVAL_LOG_SIGMA)
+        return max(1, round(frames))
+
+    def _draw_profile(self):
+        """Per-frame closure weight: a fast raised-cosine close to 1, then a
+        slower reopening that ends at 0."""
+        lo, hi = self.DURATION_RANGE_FRAMES
+        length = self._rng.lognormal(math.log(self.DURATION_MEDIAN_FRAMES), self.DURATION_LOG_SIGMA)
+        length = round(min(max(length, lo), hi))
+        closing = max(1, round(length * self.CLOSE_SHARE))
+        opening = length - closing
+        t_close = np.arange(1, closing + 1) / closing
+        t_open = np.arange(1, opening + 1) / opening
+        return np.concatenate(
+            [0.5 - 0.5 * np.cos(np.pi * t_close), 0.5 + 0.5 * np.cos(np.pi * t_open)]
+        )
+
+    @torch.no_grad()
+    def _lids(self, motion):
+        """Upper-minus-lower eyelid vectors (T, P, 3), linear in the
+        expression dims (head and jaw pose are ignored)."""
+        self._to_device(motion.device)
+        exp = motion[:, : self._basis.shape[-1]].float()
+        return self._offset + torch.einsum("pck,tk->tpc", self._basis, exp)
+
+    def aperture(self, motion):
+        """Mean eyelid opening per frame."""
+        return self._lids(motion).norm(dim=-1).mean(-1)
+
+    def _track_model_blink(self, ratio):
+        if ratio < self.MODEL_DIP_RATIO:
+            self._dip_frames += 1
+            self._dip_min = min(self._dip_min, ratio)
+            return
+        if 0 < self._dip_frames <= self.MAX_MODEL_BLINK_FRAMES and self._dip_min < self.MODEL_BLINK_DEPTH:
+            self._credits = min(self._credits + 1, self.MAX_CREDITS)
+        self._dip_frames = 0
+        self._dip_min = 1.0
+
+    def _limit_overlap(self, lids, open_level, weight):
+        """The largest weight up to ``weight`` that keeps the lids from closing
+        further than an injected blink at its peak closes an open eye. Past
+        that the lids cross and the opening grows again, so the search is
+        over a grid rather than solving for the crossing."""
+        open_lids = lids * (open_level / np.linalg.norm(lids, axis=-1).mean())
+        shut = np.linalg.norm(open_lids + self._lid_step, axis=-1).mean()
+        if np.linalg.norm(lids + weight * self._lid_step, axis=-1).mean() >= shut - 1e-6:
+            return weight
+        candidates = weight * np.linspace(1.0, 0.0, 21)
+        opening = np.linalg.norm(lids[None] + candidates[:, None, None] * self._lid_step, axis=-1).mean(-1)
+        ok = np.flatnonzero(opening >= shut - 1e-6)
+        return float(candidates[ok[0]]) if ok.size else 0.0
+
+    @torch.no_grad()
+    def process(self, motion):
+        if motion.shape[0] == 0:
+            return motion
+        lids = self._lids(motion).cpu().numpy()
+        openings = np.linalg.norm(lids, axis=-1).mean(-1)
+        weights = np.zeros(motion.shape[0], dtype=np.float32)
+        for i, opening in enumerate(openings):
+            self._recent.append(opening)
+            open_level = np.percentile(self._recent, 90)
+            self._track_model_blink(opening / open_level)
+            model_blinking = 0 < self._dip_frames <= self.MAX_MODEL_BLINK_FRAMES
+            if self._profile is None and self._countdown <= 0 and not model_blinking:
+                self._countdown = self._draw_interval()
+                if self._credits:
+                    self._credits -= 1
+                else:
+                    self._profile = self._draw_profile()
+                    self._profile_frame = 0
+            if self._profile is not None:
+                weights[i] = self._limit_overlap(lids[i], open_level, self._profile[self._profile_frame])
+                self._profile_frame += 1
+                if self._profile_frame == len(self._profile):
+                    self._profile = None
+            self._countdown -= 1
+        if not weights.any():
+            return motion
+        w = torch.from_numpy(weights).to(device=motion.device, dtype=motion.dtype)
+        out = motion.clone()
+        out[:, self._dims] += w[:, None] * self._direction.to(motion.dtype)
+        return out
+
+
 class ARTalkPipeline:
     """Per-session pipeline holding the streaming model state."""
 
@@ -258,6 +462,9 @@ class ARTalkPipeline:
         renderer_stage_sync=True,
         renderer_output_uint8=False,
         silence_mouth_gate=True,
+        blink_injector=False,
+        blink_scale=2.0,
+        blink_seed=None,
         warm_key_extra="",
         profile_trace_dir=None,
         profile_skip_chunks=1,
@@ -274,6 +481,11 @@ class ARTalkPipeline:
         self._streamer = streamer
         self._smoother = CausalSavgolSmoother()
         self._mouth_gate = SilentMouthGate() if silence_mouth_gate else None
+        self._blink_injector = (
+            BlinkInjector.from_flame(flame_model, scale=blink_scale, seed=blink_seed)
+            if blink_injector
+            else None
+        )
         self._renderer = StreamingRenderer(
             mode=renderer_mode,
             basic_vae=model.basic_vae if model is not None else None,
@@ -1906,6 +2118,9 @@ class ARTalkPipeline:
         metrics.set("last_smoothed_frames", smoothed.shape[0])
         if smoothed.shape[0] == 0:
             return
+        if self._blink_injector is not None:
+            # After the gate and the smoother, so neither damps the blink.
+            smoothed = self._blink_injector.process(smoothed)
         # Couple output audio with frames that will actually be rendered. The
         # smoother can emit fewer frames than the raw model chunk, so using
         # smoothed.shape rather than motion.shape avoids releasing audio for
