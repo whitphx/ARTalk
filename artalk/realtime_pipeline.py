@@ -250,6 +250,9 @@ class BlinkInjector:
     close the lids alike. The mean one shifts the lip vertices by about a
     millimetre at the blink peak; the lip-cancelling one needs larger
     coefficients, further from the tracked blinks' per-dimension range.
+    Even with the mesh lips nearly still, GAGAvatar still moves the
+    rendered mouth slightly during a blink (about 0.4 to 1.3 px at 512 px),
+    since it responds to the expression as a whole.
 
     Interval and duration are drawn per blink. Some models blink on their
     own (the 4 s model with a style does, at a near-human rate during
@@ -282,11 +285,13 @@ class BlinkInjector:
     # the dimensions outside MOUTH_DIMS pulls the lips down by about 1 mm at
     # scale 2. This direction moves every EYELID_PAIRS vector exactly like
     # MEAN_BLINK_DIRECTION, so the lids close to the same aperture at any
-    # scale, while the lip landmarks move by only about 0.25 mm. It is the
-    # most likely such direction under the tracked blinks' distribution,
-    # widened by a 0.2 isotropic term: inside the span of tracked blinks lip
-    # and lid motion are tied, so cancelling the lips has to leave it
-    # slightly. The mouth dimensions are never written and are left at 0.
+    # scale, while the lip landmarks move by only about 0.25 mm. It is a
+    # regularized solution: the posterior mean under a prior fitted to the
+    # tracked blinks' expression changes, widened by an isotropic term with
+    # std 0.2, given those lid vectors and a soft penalty on lip motion.
+    # Inside the span of tracked blinks lip and lid motion are tied, so
+    # about 40% of its norm lies outside that span. The mouth
+    # dimensions are never written and are left at 0.
     LIP_CANCELLING_BLINK_DIRECTION = (
         0.0, 0.0, 0.0, 0.0, -0.4515, 0.0, 0.0, -0.8704, 0.7040, 0.0,
         0.0, 0.0, 0.1094, 0.2725, 0.7314, -0.9717, -1.2486, -0.0639, -1.0610, 1.0376,
