@@ -20,18 +20,22 @@ from artalk.realtime_pipeline import ARTalkPipeline, BlinkInjector, SilentMouthG
 
 FPS = 25
 MOUTH = list(SilentMouthGate.MOUTH_DIMS)
+# The fake FLAME's eyelids move along the largest non-mouth component of the
+# default blink direction only.
+_direction = np.abs(BlinkInjector.LIP_CANCELLING_BLINK_DIRECTION)
+_direction[[d for d in MOUTH if d < len(_direction)]] = 0
+LID_DIM = int(_direction.argmax())
 
 
 def fake_flame():
-    """A FLAME stand-in whose eyelids open 8 mm and close along expression
-    dim 4, the largest non-mouth component of the blink direction."""
+    """A FLAME stand-in whose eyelids open 8 mm and close along ``LID_DIM``."""
     v_template = torch.zeros(5023, 3)
     shapedirs = torch.zeros(5023, 3, 400)
     for upper, lower in BlinkInjector.EYELID_PAIRS:
         v_template[upper, 1] = 0.004
         v_template[lower, 1] = -0.004
-        shapedirs[upper, 1, 304] = 0.002
-        shapedirs[lower, 1, 304] = -0.002
+        shapedirs[upper, 1, 300 + LID_DIM] = 0.002
+        shapedirs[lower, 1, 300 + LID_DIM] = -0.002
     return types.SimpleNamespace(v_template=v_template, shapedirs=shapedirs)
 
 
@@ -98,7 +102,7 @@ class BlinkInjectorTest(unittest.TestCase):
         motion = torch.zeros(10 * 60 * FPS, 106)
         dips = []
         for start in range(FPS, motion.shape[0], FPS):
-            motion[start : start + 6, 4] = -1.5
+            motion[start : start + 6, LID_DIM] = -1.5
             dips.extend(range(start, start + 6))
         out = run(BlinkInjector.from_flame(self.flame, seed=9), motion, 25)
         self.assertFalse(set(onsets(out, motion)) & set(dips))
@@ -106,7 +110,7 @@ class BlinkInjectorTest(unittest.TestCase):
     def model_blinks_every(self, seconds, minutes):
         motion = torch.zeros(minutes * 60 * FPS, 106)
         for start in range(round(seconds * FPS), motion.shape[0], round(seconds * FPS)):
-            motion[start : start + 6, 4] = -1.5
+            motion[start : start + 6, LID_DIM] = -1.5
         out = run(BlinkInjector.from_flame(self.flame, seed=12), motion, 25)
         return len(onsets(out, motion)) / minutes
 
@@ -125,7 +129,7 @@ class BlinkInjectorTest(unittest.TestCase):
         motion = torch.zeros(150 * FPS, 106)
         lo, hi = (0, 90 * FPS) if model_blinking_first else (90 * FPS, 150 * FPS)
         for start in range(lo + 3 * FPS, hi, 3 * FPS):
-            motion[start : start + 6, 4] = -1.5
+            motion[start : start + 6, LID_DIM] = -1.5
         count = 0
         for seed in seeds:
             out = run(BlinkInjector.from_flame(self.flame, seed=seed), motion, 25)
@@ -163,7 +167,7 @@ class BlinkInjectorTest(unittest.TestCase):
         flame = FLAMEModel(n_shape=300, n_exp=100, no_lmks=True,
                            model_path=os.environ["ARTALK_FLAME_MODEL"])
         injector = BlinkInjector.from_flame(flame)
-        direction = torch.tensor(BlinkInjector.BLINK_DIRECTION)
+        direction = torch.tensor(BlinkInjector.MEAN_BLINK_DIRECTION)
         open_frame = torch.zeros(1, 106)
         open_mm = injector.aperture(open_frame).item()
         step = torch.zeros(1, 106)
@@ -191,6 +195,27 @@ class BlinkInjectorTest(unittest.TestCase):
         aperture = injector.aperture(run(injector, motion, 25)).numpy()
         # Full closure on the mesh reads at about 0.4 of the open aperture.
         self.assertLess(aperture.min() / aperture.max(), 0.55)
+
+    @unittest.skipUnless(os.environ.get("ARTALK_FLAME_MODEL"), "ARTALK_FLAME_MODEL not set")
+    def test_lip_cancelling_direction_on_flame(self):
+        from artalk.flame_model.FLAME import FLAMEModel
+
+        flame = FLAMEModel(n_shape=300, n_exp=100, model_path=os.environ["ARTALK_FLAME_MODEL"])
+        open_frame = torch.zeros(1, 106)
+        lip_motion, shut_mm = {}, {}
+        for lip_cancel in (True, False):
+            injector = BlinkInjector.from_flame(flame, lip_cancel=lip_cancel)
+            peak = open_frame.clone()
+            peak[0, injector._dims] = injector._direction
+            shut_mm[lip_cancel] = injector._lids(peak).norm(dim=-1).numpy() * 1000
+            frames = torch.cat([open_frame, peak])
+            _, lmks = flame(shape_params=torch.zeros(2, 300), expression_params=frames[:, :100],
+                            pose_params=torch.zeros(2, 6))
+            lips = lmks[:, 48:68] * 1000
+            lip_motion[lip_cancel] = (lips[1] - lips[0]).norm(dim=-1).mean().item()
+        # Every eyelid pair closes alike, up to the tables' 4-decimal rounding.
+        np.testing.assert_allclose(shut_mm[True], shut_mm[False], atol=1e-3)
+        self.assertLess(lip_motion[True], 0.4 * lip_motion[False], lip_motion)
 
 
 class RecordingRenderer:
@@ -265,6 +290,22 @@ class PipelineWiringTest(unittest.TestCase):
             self.assertTrue(torch.equal(on[:, MOUTH], off[:, MOUTH]), frames_per_chunk)
             self.assertTrue(torch.equal(on[:, 100:], off[:, 100:]), frames_per_chunk)
             self.assertFalse(torch.equal(on, off), frames_per_chunk)
+
+    def test_lip_cancel_flag_selects_direction(self):
+        directions = {}
+        for lip_cancel in (True, False):
+            with mock.patch.object(realtime_pipeline, "StreamingRenderer", RecordingRenderer):
+                pipeline = ARTalkPipeline(
+                    streamer=StubStreamer(25), flame_model=fake_flame(), mesh_renderer=None,
+                    device="cpu", renderer_stage_sync=False, blink_injector=True,
+                    blink_lip_cancel=lip_cancel,
+                )
+            pipeline.stop()
+            directions[lip_cancel] = pipeline._blink_injector._direction
+        dims = [d for d in range(100) if d not in MOUTH]
+        for lip_cancel, table in ((True, BlinkInjector.LIP_CANCELLING_BLINK_DIRECTION),
+                                  (False, BlinkInjector.MEAN_BLINK_DIRECTION)):
+            self.assertTrue(torch.equal(directions[lip_cancel], 2.0 * torch.tensor(table)[dims]))
 
     def test_flag_off_builds_no_injector(self):
         with mock.patch.object(realtime_pipeline, "StreamingRenderer", RecordingRenderer):

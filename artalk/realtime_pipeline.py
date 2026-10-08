@@ -242,12 +242,14 @@ class BlinkInjector:
 
     The streaming models almost never blink, and not at all through
     silence, so this adds blinks at a human rate on top of what the model
-    emits. A blink moves the expression along ``BLINK_DIRECTION`` but only
-    in the expression dimensions outside ``SilentMouthGate.MOUTH_DIMS``.
-    Those mouth dimensions (and the pose dimensions) are never written and
-    stay bit-identical. The lips are not perfectly still: FLAME couples lid
-    closure to the mouth region, so a blink still shifts the lip vertices
-    by about a millimetre at its peak.
+    emits. A blink moves the expression along
+    ``LIP_CANCELLING_BLINK_DIRECTION``, or ``MEAN_BLINK_DIRECTION`` with
+    ``lip_cancel=False``, but only in the expression dimensions outside
+    ``SilentMouthGate.MOUTH_DIMS``. Those mouth dimensions (and the pose
+    dimensions) are never written and stay bit-identical. Both directions
+    close the lids alike. The mean one shifts the lip vertices by about a
+    millimetre at the blink peak; the lip-cancelling one needs larger
+    coefficients, further from the tracked blinks' per-dimension range.
 
     Interval and duration are drawn per blink. Some models blink on their
     own (the 4 s model with a style does, at a near-human rate during
@@ -263,7 +265,7 @@ class BlinkInjector:
     # lies in MOUTH_DIMS, and the mean tracked blink only half closes the
     # eye, so ``scale`` defaults to 2: the lids then render shut on the mesh
     # and on GAGAvatar.
-    BLINK_DIRECTION = (
+    MEAN_BLINK_DIRECTION = (
         0.5398, 0.1468, 0.0754, 0.4281, -1.1659, -1.0859, 0.3631, -1.3667, 0.8335, 0.6887,
         -0.7940, 0.8561, 0.1111, -0.3659, 0.3933, -0.7550, -1.0227, -0.2595, -0.5936, 0.7419,
         0.0347, -0.5583, 0.6605, -0.0689, -0.2301, 0.2776, -0.0306, 0.2051, -0.1955, -0.1454,
@@ -274,6 +276,28 @@ class BlinkInjector:
         0.0399, -0.0036, 0.0574, 0.0227, -0.0435, -0.0590, -0.0676, -0.0351, 0.1042, 0.0560,
         -0.0341, -0.0020, -0.0800, 0.0229, -0.0695, 0.0734, 0.0347, 0.0331, -0.0048, -0.0075,
         0.0254, 0.0375, 0.0149, 0.0148, -0.0572, 0.0539, 0.0116, -0.0383, -0.0142, 0.0139,
+    )
+    # FLAME couples the eyelids to the mouth. In tracked blinks the mouth
+    # dimensions offset part of that coupling, so the mean blink cut down to
+    # the dimensions outside MOUTH_DIMS pulls the lips down by about 1 mm at
+    # scale 2. This direction moves every EYELID_PAIRS vector exactly like
+    # MEAN_BLINK_DIRECTION, so the lids close to the same aperture at any
+    # scale, while the lip landmarks move by only about 0.25 mm. It is the
+    # most likely such direction under the tracked blinks' distribution,
+    # widened by a 0.2 isotropic term: inside the span of tracked blinks lip
+    # and lid motion are tied, so cancelling the lips has to leave it
+    # slightly. The mouth dimensions are never written and are left at 0.
+    LIP_CANCELLING_BLINK_DIRECTION = (
+        0.0, 0.0, 0.0, 0.0, -0.4515, 0.0, 0.0, -0.8704, 0.7040, 0.0,
+        0.0, 0.0, 0.1094, 0.2725, 0.7314, -0.9717, -1.2486, -0.0639, -1.0610, 1.0376,
+        0.0416, -0.4685, 0.8433, 0.0244, -0.6431, 0.5267, -0.3914, 0.8342, -0.4800, -0.4030,
+        -0.2565, -0.2049, 0.4608, -0.6416, 0.7937, -0.0519, 0.1582, 0.0179, -0.1105, 0.2654,
+        0.0672, -0.1997, 0.1853, 0.4137, -0.2121, 0.2388, 0.2929, -0.4091, -0.3866, 0.3355,
+        0.1482, 0.0850, 0.1221, -0.0557, -0.1220, -0.3260, -0.0954, 0.0211, 0.3221, -0.1937,
+        0.3464, 0.0864, -0.2661, -0.1751, -0.1520, 0.3361, -0.0023, -0.0789, -0.1598, -0.1416,
+        0.0847, -0.0107, 0.0111, -0.2950, -0.2162, -0.0180, -0.0311, 0.0325, 0.2222, -0.0029,
+        0.1286, -0.1012, -0.1298, -0.1535, -0.0033, 0.2909, 0.2152, -0.0188, 0.0802, 0.0689,
+        -0.0213, 0.0877, 0.1806, -0.0024, -0.1536, -0.2894, -0.0632, -0.2261, -0.1002, 0.2247,
     )
     # Upper/lower eyelid vertices of both eyes: where FLAME's eye landmark
     # reselection (inherited from DECA) puts 68-point landmarks 37/41,
@@ -305,14 +329,15 @@ class BlinkInjector:
     # turn ends and the model's eyes freeze in silence.
     MAX_CREDITS = 2
 
-    def __init__(self, eyelid_offset, eyelid_basis, scale=2.0, seed=None):
+    def __init__(self, eyelid_offset, eyelid_basis, scale=2.0, seed=None, lip_cancel=True):
         """``eyelid_offset`` (P, 3) is upper minus lower eyelid vertex of each
         ``EYELID_PAIRS`` entry on the template, ``eyelid_basis`` (P, 3, E) the
         same difference of FLAME's expression blendshapes."""
-        n_exp = len(self.BLINK_DIRECTION)
+        direction = self.LIP_CANCELLING_BLINK_DIRECTION if lip_cancel else self.MEAN_BLINK_DIRECTION
+        n_exp = len(direction)
         mouth = set(SilentMouthGate.MOUTH_DIMS)
         self._dims = torch.tensor([d for d in range(n_exp) if d not in mouth])
-        self._direction = scale * torch.tensor(self.BLINK_DIRECTION)[self._dims]
+        self._direction = scale * torch.tensor(direction)[self._dims]
         self._offset = torch.as_tensor(eyelid_offset, dtype=torch.float32)
         self._basis = torch.as_tensor(eyelid_basis, dtype=torch.float32)[..., :n_exp]
         # Lid-vector change of a full-weight blink, for the overlap limit.
@@ -346,7 +371,7 @@ class BlinkInjector:
         lower = [lo for _, lo in cls.EYELID_PAIRS]
         template = flame_model.v_template.detach().float().cpu()
         # FLAMEModel stacks the shape blendshapes before the expression ones.
-        expr = flame_model.shapedirs[:, :, -len(cls.BLINK_DIRECTION):].detach().float().cpu()
+        expr = flame_model.shapedirs[:, :, -len(cls.MEAN_BLINK_DIRECTION):].detach().float().cpu()
         return cls(template[upper] - template[lower], expr[upper] - expr[lower], **kwargs)
 
     def _draw_interval(self):
@@ -465,6 +490,7 @@ class ARTalkPipeline:
         blink_injector=False,
         blink_scale=2.0,
         blink_seed=None,
+        blink_lip_cancel=True,
         warm_key_extra="",
         profile_trace_dir=None,
         profile_skip_chunks=1,
@@ -482,7 +508,9 @@ class ARTalkPipeline:
         self._smoother = CausalSavgolSmoother()
         self._mouth_gate = SilentMouthGate() if silence_mouth_gate else None
         self._blink_injector = (
-            BlinkInjector.from_flame(flame_model, scale=blink_scale, seed=blink_seed)
+            BlinkInjector.from_flame(
+                flame_model, scale=blink_scale, seed=blink_seed, lip_cancel=blink_lip_cancel
+            )
             if blink_injector
             else None
         )
