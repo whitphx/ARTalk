@@ -110,6 +110,7 @@ def _init_torch_linalg(device) -> None:
 class QueuedAudioFrame:
     frame: av.AudioFrame
     accepted_at: float
+    generation: int = 0
 
 
 @dataclass
@@ -117,6 +118,7 @@ class QueuedAudioSamples:
     samples: np.ndarray
     accepted_at: float
     is_filler: bool = False
+    generation: int = 0
 
 
 @dataclass
@@ -132,6 +134,7 @@ class ChunkFlushRequest:
     """
 
     requested_at: float
+    generation: int = 0
 
 
 @dataclass
@@ -604,6 +607,10 @@ class ARTalkPipeline:
         self._turn_start_accepted_at: float | None = None
         self._stop_event = threading.Event()
         self._worker_busy = False
+        # flush_output(discard_in_flight=True) bumps the output generation;
+        # the worker stops rendering an item queued under an older one.
+        self._output_generation = 0
+        self._processing_generation = 0
         self._dbg_calls = 0
         self._last_motion_streamer_elapsed_s = 0.0
         self._render_res = int(render_res)
@@ -790,7 +797,13 @@ class ARTalkPipeline:
         metrics.set_once("first_audio_push_s", accepted_at)
         metrics.inc("audio_frames_pushed")
         self._record_frame_timestamp("input_audio", frame)
-        self._audio_in_queue.put(QueuedAudioFrame(frame=frame, accepted_at=accepted_at))
+        self._audio_in_queue.put(
+            QueuedAudioFrame(
+                frame=frame,
+                accepted_at=accepted_at,
+                generation=self._output_generation,
+            )
+        )
         depth = self._audio_in_queue.qsize()
         metrics.set("audio_in_queue_depth", depth)
 
@@ -821,6 +834,7 @@ class ARTalkPipeline:
                 samples=samples.copy(),
                 accepted_at=accepted_at,
                 is_filler=is_filler,
+                generation=self._output_generation,
             )
         )
         depth = self._audio_in_queue.qsize()
@@ -839,7 +853,12 @@ class ARTalkPipeline:
         """Ask the worker to pad the in-progress partial chunk to the model
         chunk boundary with silence, so its trailing audio renders now."""
         current_pipeline_metrics().inc("chunk_flush_requests")
-        self._audio_in_queue.put(ChunkFlushRequest(requested_at=time.perf_counter()))
+        self._audio_in_queue.put(
+            ChunkFlushRequest(
+                requested_at=time.perf_counter(),
+                generation=self._output_generation,
+            )
+        )
 
     def output_buffer_snapshot(self) -> dict[str, int]:
         with self._audio_out_lock:
@@ -1225,7 +1244,7 @@ class ARTalkPipeline:
                 return
 
     @with_pipeline_metrics
-    def flush_output(self):
+    def flush_output(self, discard_in_flight: bool = False):
         """Drop queued-but-unplayed output and skip the media clock past it.
 
         For barge-in: when the user interrupts, already-published response
@@ -1237,8 +1256,28 @@ class ARTalkPipeline:
         thread; audio already inside the worker (streamer buffer plus the
         chunk currently rendering) still publishes, bounded by one model
         chunk of stale content.
+
+        ``discard_in_flight`` also stops the item the worker is on: it
+        publishes nothing more of it and moves on to the next queued item.
+        The streamer feed cannot be interrupted, so a flush that lands
+        during inference still waits for the whole feed of that item's audio
+        (one model step when pushes are kept to at most one model chunk),
+        and one that lands while rendering waits for the render batch in
+        progress. Audio pushed after the flush then renders next.
+
+        An item carries the generation read when it was pushed. A push from
+        another thread that races the flush can read it before the bump and
+        reach the queue after the drain, and is then discarded too; audio
+        that must survive should be pushed after this call returns.
         """
         metrics = current_pipeline_metrics()
+        if discard_in_flight:
+            # Bumped before anything is cleared, under the lock the publish
+            # check takes, so a segment the worker publishes concurrently is
+            # either cleared below or refused.
+            with self._video_queue_lock:
+                self._output_generation += 1
+            metrics.inc("output_flushes_discarding_in_flight")
         self._drain_queue(self._audio_in_queue)
         with self._audio_out_lock:
             flushed_samples = int(self._audio_out_buffer.size)
@@ -1392,6 +1431,9 @@ class ARTalkPipeline:
         audio = audio_slice.samples
         if not frames and audio.size == 0:
             return
+        if self._in_flight_discarded():
+            current_pipeline_metrics().inc("discarded_in_flight_frames", len(frames))
+            return
         published_at = time.perf_counter()
         # Keep callback locks short. Video is queued before audio, but video
         # display is driven by the real-audio clock, so those frames remain
@@ -1415,6 +1457,9 @@ class ARTalkPipeline:
                     break
         publish_video_t0 = time.perf_counter()
         with self._video_queue_lock:
+            if self._in_flight_discarded():
+                metrics.inc("discarded_in_flight_frames", len(frames))
+                return
             for frame in frames:
                 frame_index = self._next_video_frame_index
                 self._next_video_frame_index += 1
@@ -1454,6 +1499,12 @@ class ARTalkPipeline:
                 )
         publish_audio_t0 = time.perf_counter()
         with self._audio_out_lock:
+            if self._in_flight_discarded():
+                # The flush that bumped the generation clears the frames
+                # queued above. Credit their audio to the clock as the flush
+                # would have, or the next frame indices stay out of its reach.
+                self._synced_audio_samples_served += int(audio.size)
+                audio = audio[:0]
             if audio.size:
                 self._audio_out_buffer = np.concatenate(
                     [self._audio_out_buffer, audio]
@@ -1812,6 +1863,9 @@ class ARTalkPipeline:
                 metrics.set(
                     "audio_in_queue_depth",
                     self._audio_in_queue.qsize(),
+                )
+                self._processing_generation = getattr(
+                    item, "generation", self._output_generation
                 )
                 self._worker_busy = True
                 metrics.set("worker_busy", 1)
@@ -2315,6 +2369,12 @@ class ARTalkPipeline:
                 )
             if self._stop_event.is_set():
                 return
+            if self._in_flight_discarded():
+                metrics.inc(
+                    "discarded_in_flight_frames",
+                    len(segment_frames) + smoothed.shape[0] - start,
+                )
+                return
             motion_batch = smoothed[start : start + self._render_batch_size]
             render_t0 = time.perf_counter()
             if segment_render_started_at is None:
@@ -2396,6 +2456,9 @@ class ARTalkPipeline:
             self._video_queue_depth(),
             self._audio_out_buffer.size,
         )
+
+    def _in_flight_discarded(self) -> bool:
+        return self._processing_generation != self._output_generation
 
     def _video_queue_depth(self) -> int:
         with self._video_queue_lock:
