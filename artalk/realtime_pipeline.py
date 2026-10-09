@@ -1287,6 +1287,29 @@ class ARTalkPipeline:
         metrics.set("pending_audio_for_output_samples", pending_samples)
         return emitted
 
+    def _drop_pending_audio_tail(self, n_samples: int) -> None:
+        # The newest staged samples are the ones still in the streamer
+        # buffer. When the streamer discards them, no frame will ever pair
+        # with them, and left staged they would play ahead of the next turn's
+        # audio and push it out of sync with its video for the rest of the
+        # session.
+        remaining = max(0, n_samples)
+        while remaining and self._pending_audio_for_output:
+            chunk = self._pending_audio_for_output[-1]
+            if chunk.samples.size <= remaining:
+                self._pending_audio_for_output.pop()
+                remaining -= chunk.samples.size
+                continue
+            head, _ = chunk.split(chunk.samples.size - remaining)
+            self._pending_audio_for_output[-1] = head
+            remaining = 0
+        metrics = current_pipeline_metrics()
+        metrics.inc("pending_audio_dropped_at_reset_samples", max(0, n_samples) - remaining)
+        metrics.set(
+            "pending_audio_for_output_samples",
+            sum(chunk.samples.size for chunk in self._pending_audio_for_output),
+        )
+
     @staticmethod
     def _chunk_timestamp_at(chunk: PendingAudioChunk, sample_offset: int) -> float:
         return chunk.accepted_at + sample_offset / SAMPLE_RATE
@@ -2054,6 +2077,7 @@ class ARTalkPipeline:
                 # context is in-distribution (context dropout during
                 # training), so start every turn from it. This runs on the
                 # worker thread, which owns the streamer state.
+                self._drop_pending_audio_tail(int(self._streamer._audio_buffer.shape[0]))
                 self._streamer.reset()
                 current_pipeline_metrics().inc("streamer_context_resets")
             self._last_real_accepted_at = accepted_at
