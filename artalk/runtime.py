@@ -310,7 +310,10 @@ def load_audio(audio_path: str | Path) -> tuple[torch.Tensor, int]:
     path = Path(audio_path)
     try:
         return torchaudio.load(str(path))
-    except RuntimeError as exc:
+    # From torchaudio 2.9, load and save raise ImportError when the separate
+    # torchcodec package is missing, where older releases raised RuntimeError
+    # for a missing backend.
+    except (RuntimeError, ImportError) as exc:
         if path.suffix.lower() != ".wav":
             raise RuntimeError(
                 "Could not decode audio with torchaudio. Install an audio backend "
@@ -341,7 +344,7 @@ def save_audio(audio_path: str | Path, audio: torch.Tensor, sample_rate: int):
     try:
         torchaudio.save(str(path), audio, sample_rate)
         return
-    except RuntimeError as exc:
+    except (RuntimeError, ImportError) as exc:
         if path.suffix.lower() != ".wav":
             raise exc
     audio_np = audio.detach().cpu().numpy()
