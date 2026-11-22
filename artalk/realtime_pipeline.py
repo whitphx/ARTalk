@@ -852,8 +852,15 @@ class ARTalkPipeline:
         target = self._playout_reserve_samples
         history = self._reserve_history
         history.append((available, self._reserve_steered_samples))
+        last_real = self._last_real_accepted_at
         if (
             target is None
+            # Only a stream of real input keeps the depth. Idle filler is
+            # topped up to its own lead whenever it runs low, so trimming it
+            # would only render frames nobody sees and speed up the idle face.
+            or last_real is None
+            or time.perf_counter() - last_real
+            > self._streamer.patch_audio_length / SAMPLE_RATE
             or len(history) < history.maxlen
             or self._audio_callback_count - self._reserve_last_steer_call
             < PLAYOUT_RESERVE_STEER_EVERY

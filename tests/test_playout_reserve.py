@@ -4,6 +4,7 @@ Run with ``python -m unittest tests.test_playout_reserve`` from the repo root.
 """
 
 import fractions
+import time
 import unittest
 
 import numpy as np
@@ -24,9 +25,10 @@ class RealtimeProducer:
     """Feeds the output buffer one frame per callback, the way a producer
     streaming at realtime pace keeps the depth it started with."""
 
-    def __init__(self, pipeline, source):
+    def __init__(self, pipeline, source, real=True):
         self.pipeline = pipeline
         self.source = source
+        self.real = real
         self.pos = 0
         self.played = []
         self.depths = []
@@ -34,6 +36,9 @@ class RealtimeProducer:
     def push(self, n_samples):
         chunk = self.source[self.pos : self.pos + n_samples]
         self.pos += chunk.size
+        if self.real:
+            # What the worker records for each piece of real input.
+            self.pipeline._last_real_accepted_at = time.perf_counter()
         with self.pipeline._audio_out_lock:
             self.pipeline._audio_out_buffer = np.concatenate(
                 [self.pipeline._audio_out_buffer, chunk]
@@ -67,9 +72,9 @@ def speech(n_samples, seed=0):
 
 
 class PlayoutReserveTest(unittest.TestCase):
-    def run_silence(self, start_depth_s, reserve_s, seconds=20):
+    def run_silence(self, start_depth_s, reserve_s, seconds=20, real=True):
         pipeline = playing_pipeline(reserve_s)
-        producer = RealtimeProducer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16))
+        producer = RealtimeProducer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16), real)
         try:
             with pipeline.metrics_context():
                 producer.push(int(SAMPLE_RATE * start_depth_s))
@@ -104,6 +109,10 @@ class PlayoutReserveTest(unittest.TestCase):
         finally:
             pipeline.stop()
         self.assertEqual(producer.depths[-1], int(0.3 * SAMPLE_RATE))
+
+    def test_idle_filler_keeps_the_depth(self):
+        producer, _, _ = self.run_silence(1.5, 0.6, real=False)
+        self.assertEqual(producer.reserve(), int(1.5 * SAMPLE_RATE))
 
     def test_no_target_keeps_the_depth(self):
         producer, _, _ = self.run_silence(1.5, None)
