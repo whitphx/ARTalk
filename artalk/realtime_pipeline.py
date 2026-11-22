@@ -78,6 +78,34 @@ DEFAULT_OUTPUT_SEGMENT_SECONDS = 1.00
 OUTPUT_UNDERRUN_POLICIES = frozenset({"continuous", "rebuffer"})
 DEFAULT_OUTPUT_UNDERRUN_POLICY = "continuous"
 DEFAULT_MAX_ADDED_LATENCY_SECONDS = 3.00
+# A producer that streams at realtime pace, its silences included, never
+# lets the output buffer drain or overfill. The depth it had when playback
+# started is kept for the whole session, and every late delivery lowers it
+# for good. Neither refill policy can change that depth without an underrun.
+# The playout reserve steers it instead, by dropping or repeating 20 ms
+# frames inside silence, where neither is audible.
+#
+# One frame per this many callbacks, so playback runs at most this much
+# faster or slower while it steers.
+PLAYOUT_RESERVE_STEER_EVERY = 5
+# Steering waits this far into a silence, so that it never stretches or cuts
+# the pause between two words.
+PLAYOUT_RESERVE_SILENCE_BEFORE_S = 0.30
+PLAYOUT_RESERVE_SILENCE_AHEAD_FRAMES = 3
+# Resampling leaves a faint tail after speech ends, so silence is not exact
+# zeros.
+PLAYOUT_RESERVE_SILENCE_PEAK = 8
+PLAYOUT_RESERVE_TOLERANCE_S = 0.06
+
+
+def _is_silent(samples: np.ndarray) -> bool:
+    # Not np.abs: in int16 it maps -32768, a clipped peak, to itself.
+    return bool(
+        samples.min() >= -PLAYOUT_RESERVE_SILENCE_PEAK
+        and samples.max() <= PLAYOUT_RESERVE_SILENCE_PEAK
+    )
+
+
 # A new "turn" starts when real (non-filler) audio arrives after this long
 # without any. Matches the silence pump's idle threshold so filler injection
 # and turn boundaries agree.
@@ -492,6 +520,7 @@ class ARTalkPipeline:
         output_underrun_policy=DEFAULT_OUTPUT_UNDERRUN_POLICY,
         output_rebuffer_seconds=None,
         max_added_latency_seconds=DEFAULT_MAX_ADDED_LATENCY_SECONDS,
+        output_playout_reserve_seconds=None,
         renderer_stage_sync=True,
         renderer_output_uint8=False,
         silence_mouth_gate=True,
@@ -653,6 +682,21 @@ class ARTalkPipeline:
         # Separates "not started yet" (prebuffer threshold, and silence that is
         # not an underrun) from "paused mid-stream" (rebuffer threshold).
         self._has_played = False
+        self._playout_reserve_samples: int | None = None
+        # Output arrives a model chunk at a time, so the buffer is a sawtooth
+        # with the chunk as its period. Its low point is the reserve, so the
+        # window spans one chunk.
+        self._reserve_history: deque[tuple[int, int]] = deque(
+            maxlen=max(
+                1, math.ceil(self._streamer.patch_audio_length / AUDIO_OUT_SAMPLES_PER_FRAME)
+            )
+        )
+        # Net samples steering has added to the buffer depth: repeats count
+        # up, drops count down.
+        self._reserve_steered_samples = 0
+        self._reserve_last_steer_call = 0
+        self._audio_callback_count = 0
+        self._silent_frames_served = 0
         self._output_segment_seconds = max(1 / FPS, float(output_segment_seconds))
         self._output_segment_min_frames = max(
             1,
@@ -697,6 +741,7 @@ class ARTalkPipeline:
             metrics.set("render_batch_size", self._render_batch_size)
             metrics.set("renderer_stage_sync", 1 if self._renderer_stage_sync else 0)
             metrics.set("profiler_enabled", 1 if self._profile_run_dir else 0)
+        self.set_output_playout_reserve(output_playout_reserve_seconds)
         _init_torch_linalg(self._device)
         # The outbound track needs a frame long before any audio has been
         # rendered. Showing the avatar at rest rather than black means it is
@@ -780,6 +825,62 @@ class ARTalkPipeline:
         metrics.set("output_rebuffer_seconds", self._output_rebuffer_seconds)
         metrics.set("output_rebuffer_samples", self._output_rebuffer_samples)
         metrics.set("max_added_latency_seconds", self._max_added_latency_seconds)
+
+    def set_output_playout_reserve(self, seconds: float | None) -> None:
+        """Steer the output buffer's low point toward ``seconds`` inside
+        silences; ``None`` turns steering off.
+
+        The reserve is what absorbs a late delivery without an underrun, and
+        every second of it is a second of reply latency. Like the underrun
+        policy, it applies from the next audio frame.
+        """
+        with self._audio_out_lock:
+            self._playout_reserve_samples = (
+                None if seconds is None else int(SAMPLE_RATE * max(0.0, float(seconds)))
+            )
+            self._reserve_history.clear()
+        # Numeric for the metrics table, as with the policy flag.
+        self._metrics.set(
+            "output_playout_reserve_seconds", -1.0 if seconds is None else float(seconds)
+        )
+
+    def _steer_playout_reserve(self, available: int) -> int:
+        """Called under the audio lock while playing. Returns -1 to drop the
+        frame at the head of the buffer, +1 to repeat silence instead of
+        consuming it, or 0."""
+        n = AUDIO_OUT_SAMPLES_PER_FRAME
+        target = self._playout_reserve_samples
+        history = self._reserve_history
+        history.append((available, self._reserve_steered_samples))
+        if (
+            target is None
+            or len(history) < history.maxlen
+            or self._audio_callback_count - self._reserve_last_steer_call
+            < PLAYOUT_RESERVE_STEER_EVERY
+            or self._silent_frames_served * AUDIO_OUT_PTIME
+            < PLAYOUT_RESERVE_SILENCE_BEFORE_S
+        ):
+            return 0
+        ahead = PLAYOUT_RESERVE_SILENCE_AHEAD_FRAMES * n
+        # One frame more than the lookahead, so that a drop still leaves a
+        # whole frame to play after it.
+        if available < ahead + n:
+            return 0
+        if not _is_silent(self._audio_out_buffer[:ahead]):
+            return 0
+        # Each past depth, corrected by what steering has added or removed
+        # since, is the depth that moment would have now.
+        steered = self._reserve_steered_samples
+        reserve = min(depth + steered - then for depth, then in history)
+        tolerance = int(SAMPLE_RATE * PLAYOUT_RESERVE_TOLERANCE_S)
+        if reserve > target + tolerance:
+            return -1
+        if (
+            reserve < target - tolerance
+            and self._added_latency_samples < self._max_added_latency_samples
+        ):
+            return 1
+        return 0
 
     @property
     def last_served_frame(self) -> np.ndarray:
@@ -954,11 +1055,30 @@ class ARTalkPipeline:
                 self._playback_started = True
                 self._has_played = True
                 playback_started_now = True
+            self._audio_callback_count += 1
+            steer = 0
+            if self._playback_started and available >= n:
+                steer = self._steer_playout_reserve(available)
+            if steer:
+                self._reserve_last_steer_call = self._audio_callback_count
+                self._reserve_steered_samples += steer * n
+                self._added_latency_samples = max(
+                    0, self._added_latency_samples + steer * n
+                )
+            if steer < 0:
+                # The dropped silence still advances the media clock, or the
+                # video would fall behind the audio by the same amount.
+                self._audio_out_buffer = self._audio_out_buffer[n:]
+                self._synced_audio_samples_served += n
+                available -= n
             # Do not emit partial audio padded with zeros. That made chunk
             # boundaries audible as clicks/stutters. If the buffer cannot
             # satisfy a complete WebRTC audio frame, emit silence and keep the
             # real-audio media clock stationary until a complete frame is ready.
-            if self._playback_started and available >= n:
+            if steer > 0:
+                samples = np.zeros(n, dtype=np.int16)
+                underrun = n
+            elif self._playback_started and available >= n:
                 samples = self._audio_out_buffer[:n].copy()
                 self._audio_out_buffer = self._audio_out_buffer[n:]
                 underrun = 0
@@ -974,6 +1094,14 @@ class ARTalkPipeline:
                 ):
                     self._playback_started = False
                     rebuffer_started_now = True
+                    # The refill raises the depth at once, so the depths
+                    # before it say nothing about the reserve after it.
+                    self._reserve_history.clear()
+            if steer > 0 or not underrun:
+                if _is_silent(samples):
+                    self._silent_frames_served += 1
+                else:
+                    self._silent_frames_served = 0
             if (
                 self._has_played
                 and not self._playback_started
@@ -996,7 +1124,11 @@ class ARTalkPipeline:
             metrics.inc("audio_playback_starts")
         if rebuffer_started_now:
             metrics.inc("audio_rebuffer_events")
-        if underrun:
+        if steer < 0:
+            metrics.inc("audio_reserve_dropped_frames")
+        if steer > 0:
+            metrics.inc("audio_reserve_repeated_frames")
+        elif underrun:
             if not has_played:
                 metrics.inc("audio_preplayback_silence_frames")
                 metrics.inc("audio_preplayback_silence_samples", underrun)
@@ -1203,6 +1335,7 @@ class ARTalkPipeline:
             self._playback_started = False
             self._has_played = False
             self._added_latency_samples = 0
+            self._reserve_history.clear()
         self._pending_audio_for_output = []
         # Drain both transit queues. The worker may still write up to
         # one more chunk between its stop_event check and the queue
@@ -1287,6 +1420,7 @@ class ARTalkPipeline:
             # Dropping the backlog puts playback back at live, so the latency
             # the rebuffer policy had accumulated is gone with it.
             self._added_latency_samples = 0
+            self._reserve_history.clear()
         with self._video_queue_lock:
             flushed_frames = len(self._video_queue)
             self._video_queue.clear()
