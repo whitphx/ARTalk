@@ -6,10 +6,13 @@ Run with ``python -m unittest tests.test_playout_reserve`` from the repo root.
 import fractions
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from artalk import realtime_pipeline
 from artalk.realtime_pipeline import (
+    AUDIO_OUT_PTIME,
     AUDIO_OUT_SAMPLES_PER_FRAME,
     PLAYOUT_RESERVE_TOLERANCE_S,
     SAMPLE_RATE,
@@ -22,32 +25,52 @@ TOLERANCE = int(SAMPLE_RATE * PLAYOUT_RESERVE_TOLERANCE_S)
 
 
 class RealtimeProducer:
-    """Feeds the output buffer one frame per callback, the way a producer
-    streaming at realtime pace keeps the depth it started with."""
+    """Pushes input at realtime pace, one frame per playback callback, on a
+    simulated clock. It also stands in for the worker: queued input moves to
+    the output buffer while the buffer is below ``max_depth``, the way
+    rendering waits at the video queue's high-water mark."""
 
-    def __init__(self, pipeline, source, real=True):
+    def __init__(self, pipeline, source, real=True, max_depth=None):
         self.pipeline = pipeline
         self.source = source
         self.real = real
+        self.max_depth = max_depth
         self.pos = 0
+        self.now = 1000.0
         self.played = []
         self.depths = []
 
-    def push(self, n_samples):
+    def arrive(self, n_samples):
         chunk = self.source[self.pos : self.pos + n_samples]
         self.pos += chunk.size
-        if self.real:
-            # What the worker records for each piece of real input.
-            self.pipeline._last_real_accepted_at = time.perf_counter()
-        with self.pipeline._audio_out_lock:
-            self.pipeline._audio_out_buffer = np.concatenate(
-                [self.pipeline._audio_out_buffer, chunk]
-            )
+        self.pipeline.push_audio_samples(chunk, is_filler=not self.real)
 
-    def run(self, n_callbacks):
-        for i in range(n_callbacks):
-            self.push(N)
-            frame = self.pipeline.audio_source_callback(i * N, TIME_BASE)
+    def deliver(self):
+        pipeline = self.pipeline
+        while not pipeline._audio_in_queue.empty() and (
+            self.max_depth is None or pipeline._audio_out_buffer.size < self.max_depth
+        ):
+            item = pipeline._audio_in_queue.get_nowait()
+            if not item.is_filler:
+                # What the worker records for each piece of real input.
+                pipeline._last_real_accepted_at = item.accepted_at
+            with pipeline._audio_out_lock:
+                pipeline._audio_out_buffer = np.concatenate(
+                    [pipeline._audio_out_buffer, item.samples]
+                )
+
+    def push(self, n_samples):
+        self.arrive(n_samples)
+        self.deliver()
+
+    def run(self, n_callbacks, arriving=True):
+        for _ in range(n_callbacks):
+            if arriving:
+                self.arrive(N)
+            self.deliver()
+            pts = len(self.played) * N
+            frame = self.pipeline.audio_source_callback(pts, TIME_BASE)
+            self.now += AUDIO_OUT_PTIME
             self.played.append(frame.to_ndarray().reshape(-1))
             self.depths.append(self.pipeline._audio_out_buffer.size)
         return np.concatenate(self.played)
@@ -56,6 +79,10 @@ class RealtimeProducer:
         """The buffer's low point over the last model chunk."""
         return min(self.depths[-CHUNK_SAMPLES // N :])
 
+    def backlog(self):
+        queued = sum(item.samples.size for item in self.pipeline._audio_in_queue.queue)
+        return self.pipeline._audio_out_buffer.size + queued
+
 
 def playing_pipeline(reserve_seconds):
     pipeline = make_pipeline(
@@ -63,6 +90,11 @@ def playing_pipeline(reserve_seconds):
         output_playout_reserve_seconds=reserve_seconds,
     )
     pipeline._video_queue_high_water = 1 << 30
+    # RealtimeProducer does the worker's part, so that input can wait in the
+    # queue.
+    pipeline._stop_event.set()
+    pipeline._worker_thread.join()
+    pipeline._stop_event.clear()
     return pipeline
 
 
@@ -72,9 +104,18 @@ def speech(n_samples, seed=0):
 
 
 class PlayoutReserveTest(unittest.TestCase):
+    def producer(self, pipeline, source, **kwargs):
+        producer = RealtimeProducer(pipeline, source, **kwargs)
+        clock = mock.Mock(wraps=time)
+        clock.perf_counter = lambda: producer.now
+        patcher = mock.patch.object(realtime_pipeline, "time", clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return producer
+
     def run_silence(self, start_depth_s, reserve_s, seconds=20, real=True):
         pipeline = playing_pipeline(reserve_s)
-        producer = RealtimeProducer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16), real)
+        producer = self.producer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16), real=real)
         try:
             with pipeline.metrics_context():
                 producer.push(int(SAMPLE_RATE * start_depth_s))
@@ -101,7 +142,7 @@ class PlayoutReserveTest(unittest.TestCase):
     def test_stretching_stops_at_the_latency_budget(self):
         pipeline = playing_pipeline(0.6)
         pipeline.set_output_underrun_policy("continuous", max_added_latency_seconds=0.1)
-        producer = RealtimeProducer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16))
+        producer = self.producer(pipeline, np.zeros(SAMPLE_RATE * 60, np.int16))
         try:
             with pipeline.metrics_context():
                 producer.push(int(0.2 * SAMPLE_RATE))
@@ -109,6 +150,28 @@ class PlayoutReserveTest(unittest.TestCase):
         finally:
             pipeline.stop()
         self.assertEqual(producer.depths[-1], int(0.3 * SAMPLE_RATE))
+
+    def test_a_backlog_after_a_delivery_gap_is_trimmed(self):
+        # The producer stalls, then sends what it held back all at once,
+        # more than rendering takes in before it waits at the high-water
+        # mark. Playback is then that far behind a stream still arriving at
+        # realtime pace, and the worker is seconds behind in the input queue.
+        pipeline = playing_pipeline(0.6)
+        producer = self.producer(
+            pipeline, np.zeros(SAMPLE_RATE * 150, np.int16), max_depth=6 * SAMPLE_RATE
+        )
+        try:
+            with pipeline.metrics_context():
+                producer.push(int(0.6 * SAMPLE_RATE))
+                producer.run(int(10 / AUDIO_OUT_PTIME))
+                producer.run(int(12 / AUDIO_OUT_PTIME), arriving=False)
+                for _ in range(120):
+                    producer.arrive(SAMPLE_RATE // 10)
+                producer.run(int(80 / AUDIO_OUT_PTIME))
+                backlog = producer.backlog()
+        finally:
+            pipeline.stop()
+        self.assertLessEqual(abs(backlog - int(0.6 * SAMPLE_RATE)), TOLERANCE + N)
 
     def test_idle_filler_keeps_the_depth(self):
         producer, _, _ = self.run_silence(1.5, 0.6, real=False)
@@ -121,7 +184,7 @@ class PlayoutReserveTest(unittest.TestCase):
     def test_speech_is_played_untouched(self):
         pipeline = playing_pipeline(0.2)
         source = speech(SAMPLE_RATE * 30)
-        producer = RealtimeProducer(pipeline, source)
+        producer = self.producer(pipeline, source)
         try:
             with pipeline.metrics_context():
                 producer.push(SAMPLE_RATE)
@@ -137,7 +200,7 @@ class PlayoutReserveTest(unittest.TestCase):
         word, gap = speech(SAMPLE_RATE // 2), np.zeros(SAMPLE_RATE // 4, np.int16)
         source = np.concatenate([word, gap] * 40)
         pipeline = playing_pipeline(0.2)
-        producer = RealtimeProducer(pipeline, source)
+        producer = self.producer(pipeline, source)
         try:
             with pipeline.metrics_context():
                 producer.push(SAMPLE_RATE)
@@ -151,7 +214,7 @@ class PlayoutReserveTest(unittest.TestCase):
             [speech(SAMPLE_RATE * 3), np.zeros(SAMPLE_RATE * 6, np.int16), speech(SAMPLE_RATE * 3, 1)]
         )
         pipeline = playing_pipeline(0.4)
-        producer = RealtimeProducer(pipeline, source)
+        producer = self.producer(pipeline, source)
         try:
             with pipeline.metrics_context():
                 producer.push(int(1.2 * SAMPLE_RATE))

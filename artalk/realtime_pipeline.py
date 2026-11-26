@@ -631,6 +631,7 @@ class ARTalkPipeline:
         # unavailable.
         self._gpu_sampling_ok = torch.device(device).type == "cuda"
         self._last_gpu_sample_s = 0.0
+        self._last_real_pushed_at: float | None = None
         # Worker-thread-only turn tracking (see TURN_GAP_S).
         self._last_real_accepted_at: float | None = None
         self._turn_start_accepted_at: float | None = None
@@ -852,7 +853,11 @@ class ARTalkPipeline:
         target = self._playout_reserve_samples
         history = self._reserve_history
         history.append((available, self._reserve_steered_samples))
-        last_real = self._last_real_accepted_at
+        # Timed from arrival, not from when the worker took the input. A
+        # backlog in the input queue keeps the worker seconds behind a
+        # stream that is still arriving, and it is that stream which keeps
+        # the depth.
+        last_real = self._last_real_pushed_at
         if (
             target is None
             # Only a stream of real input keeps the depth. Idle filler is
@@ -905,6 +910,7 @@ class ARTalkPipeline:
         metrics.set_once("first_audio_push_s", accepted_at)
         metrics.inc("audio_frames_pushed")
         self._record_frame_timestamp("input_audio", frame)
+        self._last_real_pushed_at = accepted_at
         self._audio_in_queue.put(
             QueuedAudioFrame(
                 frame=frame,
@@ -937,6 +943,8 @@ class ARTalkPipeline:
         metrics.set_once("first_audio_push_s", accepted_at)
         metrics.inc("audio_sample_chunks_pushed")
         metrics.inc("audio_samples_pushed", samples.size)
+        if not is_filler:
+            self._last_real_pushed_at = accepted_at
         self._audio_in_queue.put(
             QueuedAudioSamples(
                 samples=samples.copy(),
